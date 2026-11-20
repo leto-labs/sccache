@@ -6,6 +6,43 @@ The default cache size is 10 gigabytes. To change this, set `SCCACHE_CACHE_SIZE`
 
 The local storage only supports a single sccache server at a time. Multiple concurrent servers will race and cause spurious build failures.
 
+## Restarting a shared server safely
+
+On Unix, `SIGTERM`, `SIGINT`, and `sccache --stop-server` close the listener
+and give existing connections and cache writes time to finish. A `SIGTERM`
+received during the drain ends the wait immediately.
+
+For a shared server, put the following settings in the [sccache configuration](Configuration.md)
+that the server and clients read. `SCCACHE_SERVER_AUTOSTART=0` also disables
+autostart for clients on a managed host.
+
+```toml
+[server]
+shutdown_drain_secs = 300
+autostart = false
+connect_wait_secs = 30
+```
+
+Run the server in the foreground under systemd. Use `KillMode=mixed` so
+systemd sends the initial signal only to the server and lets compiler
+children finish during the drain. Set `TimeoutStopSec` to at least the drain
+time plus 30 seconds.
+
+```ini
+[Service]
+Environment=SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1
+ExecStart=%h/.cargo/bin/sccache
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=330s
+```
+
+Swap the sccache binary before adding these keys to the shared configuration.
+Clients are short-lived, usually one process per compile. Give existing
+clients a few minutes to finish, then restart the managed server. The running
+daemon must support signal handling for that restart to drain. New clients
+can compile locally if they lose their connection during the first upgrade.
+
 ## Reflink cache hits
 
 Set `reflink = true` under `[cache.disk]` or set `SCCACHE_DISK_REFLINK=true` before starting the server to enable reflinks for a standalone Linux disk cache. The default is `false`. The server probes the cache directory at startup and uses the usual compressed entries if the probe fails.

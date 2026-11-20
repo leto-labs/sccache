@@ -19,6 +19,7 @@ use crate::util;
 use backon::BlockingRetryable;
 use byteorder::{BigEndian, ByteOrder};
 use std::io::{self, BufReader, BufWriter, Read};
+use std::time::Duration;
 
 /// A connection to an sccache server.
 pub struct ServerConnection {
@@ -95,6 +96,33 @@ pub fn connect_with_retry(addr: &crate::net::SocketAddr) -> io::Result<ServerCon
             format!("Connection to server timed out: {:?}", e),
         )),
     }
+}
+
+pub(crate) fn connect_with_wait(
+    addr: &crate::net::SocketAddr,
+    wait: Duration,
+) -> io::Result<ServerConnection> {
+    if wait.is_zero() {
+        return connect_to_server(addr);
+    }
+
+    util::new_client_runtime()?.block_on(async {
+        let retry = async {
+            loop {
+                match crate::net::connect_async(addr).await {
+                    Ok(stream) => return ServerConnection::new(stream),
+                    Err(err) => trace!("waiting for server at {addr}: {err}"),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        tokio::time::timeout(wait, retry).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("timed out connecting to server at {addr}"),
+            )
+        })?
+    })
 }
 
 #[cfg(test)]
