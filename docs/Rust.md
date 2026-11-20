@@ -35,6 +35,11 @@ environment selects `cache` when the configured mode is `off`.
 - `cache-no-bypass` always looks up eligible invocations and applies the same
   cold-session rule to writes.
 
+Set `SCCACHE_RUST_INCREMENTAL=cache` in the build environment as well as on
+the server to bypass cache traffic before connecting. Keep the client's
+basedirs settings aligned with the server's when using path remapping.
+Warm compiles that bypass in the client do not appear in server statistics.
+
 In either cache mode, sccache runs eligible units with a private session
 directory named `DIR/<crate_name>-sccache-<unit hash>`. Switching from `off`
 to a cache mode starts each unit cold the first time it compiles in its private
@@ -44,6 +49,10 @@ time after each local compile, including bypasses, so mtime-based cleanup can
 recognize active sessions. `cargo clean -p` removes a package's private
 directories along with its other sessions. Cache hits restore the normal rustc
 outputs without creating or modifying session directories.
+Upgrading from `leto-0.19.0-3` or `leto-0.19.0-4` changes the private names.
+The old sessions are left for cleanup, and each unit starts cold the first
+time it compiles in the new directory.
+
 Incremental and non-incremental builds use separate entries, regardless
 of the name of the incremental directory. Cargo forwards variables such as
 `CARGO_INCREMENTAL` and `CARGO_PROFILE_DEV_INCREMENTAL` to registry dependency

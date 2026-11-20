@@ -1045,6 +1045,41 @@ fn test_rust_cargo_incremental_build_ignores_flat_session_then_bypasses() -> Res
 #[test_case(false ; "daemon")]
 #[test_case(true ; "client side")]
 #[serial]
+fn test_rust_cargo_incremental_client_bypass_sends_no_request(client_side: bool) -> Result<()> {
+    let (test, [a, ..]) = incremental_checkouts("cache", client_side)?;
+    let build = || {
+        let mut cargo = incremental_cargo(&test, &a, "build");
+        cargo
+            .env("SCCACHE_RUST_INCREMENTAL", "cache")
+            .env("SCCACHE_BASEDIRS", &a);
+        cargo
+    };
+    build().assert().try_success()?;
+    assert_eq!(incremental_stats(&test, 0, 3)?["cache_writes"], 3);
+    let old = incremental_sessions(&a, "mylib")?;
+    let private = private_incremental_dirs(&a, "mylib")?;
+    run_incremental_bin(&a, 10)?;
+
+    zero_incremental_stats()?;
+    edit_mylib(&a, 1)?;
+    build().assert().try_success()?;
+    let stats = incremental_stats(&test, 0, 0)?;
+    assert_eq!(
+        stats["compile_requests"],
+        u64::from(!client_side),
+        "{stats}"
+    );
+    assert_eq!(stats["requests_executed"], 0);
+    assert_eq!(stats["cache_writes"], 0);
+    assert!(stats["not_cached"]["incremental session"].is_null());
+    assert_eq!(private_incremental_dirs(&a, "mylib")?, private);
+    assert_ne!(incremental_sessions(&a, "mylib")?, old);
+    run_incremental_bin(&a, 11)
+}
+
+#[test_case(false ; "daemon")]
+#[test_case(true ; "client side")]
+#[serial]
 fn test_rust_cargo_incremental_new_checkout_hits_and_replays_warnings(
     client_side: bool,
 ) -> Result<()> {

@@ -386,6 +386,11 @@ fn is_path_null(path: &Path) -> bool {
     stem.eq_ignore_ascii_case("NUL")
 }
 
+pub(crate) struct OpenCacheObject {
+    key: String,
+    file: fs::File,
+}
+
 /// Data to be stored in the compiler cache.
 pub struct CacheWrite {
     zip: ZipWriter<Cursor<Vec<u8>>>,
@@ -408,32 +413,51 @@ impl CacheWrite {
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
+        let objects = pool
+            .spawn_blocking(move || Self::open_objects(objects))
+            .await??;
+        Self::from_open_objects(objects, pool, raw).await
+    }
+
+    pub(crate) fn open_objects(
+        objects: impl IntoIterator<Item = FileObjectSource>,
+    ) -> Result<Vec<OpenCacheObject>> {
+        let mut opened = Vec::new();
+        for FileObjectSource {
+            key,
+            path,
+            optional,
+        } in objects
+        {
+            match fs::File::open(&path) {
+                Ok(file) => opened.push(OpenCacheObject { key, file }),
+                Err(_) if optional => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| format!("failed to open file {path:?}"));
+                }
+            }
+        }
+        Ok(opened)
+    }
+
+    pub(crate) async fn from_open_objects(
+        objects: Vec<OpenCacheObject>,
+        pool: &tokio::runtime::Handle,
+        raw: bool,
+    ) -> Result<CacheWrite> {
         pool.spawn_blocking(move || {
             let mut entry = CacheWrite::new();
-            for FileObjectSource {
-                key,
-                path,
-                optional,
-            } in objects
-            {
-                let f = fs::File::open(&path)
-                    .with_context(|| format!("failed to open file `{:?}`", path));
-                match (f, optional) {
-                    (Ok(mut f), _) => {
-                        let mode = get_file_mode(&f)?;
-                        let result = if raw {
-                            let large = f.metadata()?.len() >= zip::ZIP64_BYTES_THR;
-                            entry.put_raw_object(&key, &mut f, mode, large)
-                        } else {
-                            entry.put_object(&key, &mut f, mode)
-                        };
-                        result.with_context(|| {
-                            format!("failed to put object `{:?}` in cache entry", path)
-                        })?;
-                    }
-                    (Err(e), false) => return Err(e),
-                    (Err(_), true) => continue,
-                }
+            for OpenCacheObject { key, mut file } in objects {
+                let mode = get_file_mode(&file)?;
+                let result = if raw {
+                    let large = file.metadata()?.len() >= zip::ZIP64_BYTES_THR;
+                    entry.put_raw_object(&key, &mut file, mode, large)
+                } else {
+                    entry.put_object(&key, &mut file, mode)
+                };
+                result.with_context(|| {
+                    format!("failed to put object {:?} in cache entry", file.path())
+                })?;
             }
             Ok(entry)
         })
@@ -782,6 +806,42 @@ mod tests {
             end += extent.length;
         }
         assert!(end >= length, "shared only {end} of {length} bytes");
+    }
+
+    #[test_case::test_case(false ; "compressed")]
+    #[test_case::test_case(true ; "raw")]
+    fn cache_entry_keeps_the_open_inode(raw: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output");
+        let replacement = dir.path().join("replacement");
+        fs::write(&path, b"original output").unwrap();
+        let opened = CacheWrite::open_objects([
+            FileObjectSource {
+                key: "output".into(),
+                path: path.clone(),
+                optional: false,
+            },
+            FileObjectSource {
+                key: "optional".into(),
+                path: dir.path().join("absent"),
+                optional: true,
+            },
+        ])
+        .unwrap();
+
+        fs::write(&replacement, b"replacement output").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let entry = runtime
+            .block_on(CacheWrite::from_open_objects(opened, runtime.handle(), raw))
+            .unwrap();
+        let mut entry = CacheRead::from(Cursor::new(entry.finish().unwrap())).unwrap();
+        let mut output = Vec::new();
+        entry.get_object("output", &mut output).unwrap();
+        assert_eq!(output, b"original output");
+        assert!(entry.get_object("optional", &mut Vec::new()).is_err());
     }
 
     #[test]
