@@ -62,6 +62,7 @@ fn config_with_dist_auth(
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        rust_incremental_first_build: Default::default(),
         incremental_prune_days: None,
     }
 }

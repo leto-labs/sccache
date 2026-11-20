@@ -1012,7 +1012,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
 
             let jobserver = Client::from_env_fifo().unwrap_or_else(Client::new);
-            if config.rust_incremental == RustIncremental::Cache
+            if config.rust_incremental.mode == RustIncremental::Cache
                 && compiler::is_rustc_like(&exe)
                 && let Some(local) = compiler::local_incremental_command(
                     Path::new(&exe),

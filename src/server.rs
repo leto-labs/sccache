@@ -22,7 +22,7 @@ use crate::compiler::{
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
-use crate::config::{Config, RustIncremental, default_incremental_prune_days};
+use crate::config::{Config, RustIncrementalSettings, default_incremental_prune_days};
 use crate::dist;
 use crate::jobserver::Client;
 pub use crate::miss_explain::MissExplainStats;
@@ -927,7 +927,7 @@ where
     /// Access mode selected when this service was constructed.
     effective_cache_mode: CacheMode,
 
-    rust_incremental: RustIncremental,
+    rust_incremental: RustIncrementalSettings,
     pub(crate) miss_explain: Option<Arc<MissExplain>>,
     pub(crate) incremental_prune_days: u64,
 
@@ -1157,7 +1157,7 @@ where
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode,
-            rust_incremental: RustIncremental::Off,
+            rust_incremental: RustIncrementalSettings::default(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1170,8 +1170,12 @@ where
         }
     }
 
-    pub(crate) fn with_rust_incremental(mut self, mode: RustIncremental, prune_days: u64) -> Self {
-        self.rust_incremental = mode;
+    pub(crate) fn with_rust_incremental(
+        mut self,
+        settings: RustIncrementalSettings,
+        prune_days: u64,
+    ) -> Self {
+        self.rust_incremental = settings;
         self.incremental_prune_days = prune_days;
         self
     }
@@ -1191,7 +1195,7 @@ where
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
-            rust_incremental: RustIncremental::Off,
+            rust_incremental: RustIncrementalSettings::default(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1233,7 +1237,7 @@ where
             ))),
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
-            rust_incremental: RustIncremental::Off,
+            rust_incremental: RustIncrementalSettings::default(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),

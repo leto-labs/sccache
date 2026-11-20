@@ -760,7 +760,7 @@ fn incremental_checkouts(
     ]))?;
     let tempdir = real_tempdir(&test_info)?;
     let checkouts = ["a", "b", "c", "d"].map(|name| tempdir.join(name));
-    restart_incremental_server(&test_info, &checkouts, mode)?;
+    restart_incremental_server(&test_info, &checkouts, mode, None)?;
 
     for checkout in &checkouts {
         fs::create_dir_all(checkout.join("src"))?;
@@ -783,15 +783,53 @@ fn incremental_checkouts(
     Ok((test_info, checkouts))
 }
 
-fn restart_incremental_server(test: &SccacheTest, checkouts: &[PathBuf], mode: &str) -> Result<()> {
+fn restart_incremental_server(
+    test: &SccacheTest,
+    checkouts: &[PathBuf],
+    mode: &str,
+    first_build: Option<&str>,
+) -> Result<()> {
     let basedirs = std::env::join_paths(checkouts)?.into_string().unwrap();
-    restart_sccache(
-        test,
-        Some(vec![
-            ("SCCACHE_BASEDIRS".into(), basedirs),
-            ("SCCACHE_RUST_INCREMENTAL".into(), mode.into()),
-        ]),
-    )
+    let mut env = vec![
+        ("SCCACHE_BASEDIRS".into(), basedirs),
+        ("SCCACHE_RUST_INCREMENTAL".into(), mode.into()),
+    ];
+    if let Some(first_build) = first_build {
+        env.push((
+            "SCCACHE_RUST_INCREMENTAL_FIRST_BUILD".into(),
+            first_build.into(),
+        ));
+    }
+    restart_sccache(test, Some(env))
+}
+
+fn incremental_chain_checkouts(client_side: bool) -> Result<(SccacheTest<'static>, [PathBuf; 4])> {
+    let (test, checkouts) = incremental_checkouts("cache", client_side)?;
+    for checkout in &checkouts {
+        fs::create_dir_all(checkout.join("lb/src"))?;
+        fs::write(
+            checkout.join("Cargo.toml"),
+            "[package]\nname = \"test-crate\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [workspace]\nresolver = \"2\"\nmembers = [\"la\", \"lb\"]\n\
+             [lib]\nname = \"mylib\"\n\
+             [[bin]]\nname = \"mybin\"\npath = \"src/bin.rs\"\n\
+             [dependencies.lb]\npath = \"lb\"\n",
+        )?;
+        fs::write(
+            checkout.join("lb/Cargo.toml"),
+            "[package]\nname = \"lb\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [dependencies.la]\npath = \"../la\"\n",
+        )?;
+        fs::write(
+            checkout.join("lb/src/lib.rs"),
+            "pub fn answer() -> u32 { la::answer() + 100 }\n",
+        )?;
+        fs::write(
+            checkout.join("src/lib.rs"),
+            "pub fn answer() -> u32 { lb::answer() }\n",
+        )?;
+    }
+    Ok((test, checkouts))
 }
 
 fn edit_la(checkout: &Path, value: u32) -> Result<()> {
@@ -873,7 +911,9 @@ fn private_incremental_dirs(checkout: &Path, name: &str) -> Result<Vec<PathBuf>>
 #[test]
 #[serial]
 fn test_rust_cargo_incremental_prunes_old_session_after_lockfile_change() -> Result<()> {
-    let (test, [a, ..]) = incremental_checkouts("cache-no-bypass", false)?;
+    let (test, checkouts) = incremental_checkouts("cache-no-bypass", false)?;
+    restart_incremental_server(&test, &checkouts, "cache-no-bypass", Some("incremental"))?;
+    let [a, ..] = checkouts;
     incremental_cargo(&test, &a, "build")
         .assert()
         .try_success()?;
@@ -1029,7 +1069,7 @@ fn test_rust_cargo_incremental_build_ignores_flat_session_then_bypasses() -> Res
         entry.file_type().unwrap().is_dir() && name.starts_with("s-") && !name.ends_with("-working")
     }));
 
-    restart_incremental_server(&test, &checkouts, "cache")?;
+    restart_incremental_server(&test, &checkouts, "cache", None)?;
     edit_mylib(a, 1)?;
     incremental_cargo(&test, a, "build")
         .assert()
@@ -1072,7 +1112,9 @@ fn test_rust_cargo_incremental_build_ignores_flat_session_then_bypasses() -> Res
 #[test_case(true ; "client side")]
 #[serial]
 fn test_rust_cargo_incremental_client_bypass_sends_no_request(client_side: bool) -> Result<()> {
-    let (test, [a, ..]) = incremental_checkouts("cache", client_side)?;
+    let (test, checkouts) = incremental_checkouts("cache", client_side)?;
+    restart_incremental_server(&test, &checkouts, "cache", Some("incremental"))?;
+    let [a, ..] = checkouts;
     let build = || {
         let mut cargo = incremental_cargo(&test, &a, "build");
         cargo
@@ -1110,6 +1152,103 @@ fn test_rust_cargo_incremental_client_bypass_sends_no_request(client_side: bool)
     run_incremental_bin(&a, 11)
 }
 
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_plain_first_build_then_rebuild_and_bypass() -> Result<()> {
+    let (test, [a, b, ..]) = incremental_chain_checkouts(false)?;
+    let crates = &["la", "lb", "mylib"];
+    let build = |checkout| {
+        let mut cargo = incremental_cargo(&test, checkout, "build");
+        cargo
+            .arg("--workspace")
+            .env("SCCACHE_RUST_INCREMENTAL", "cache")
+            .env("SCCACHE_BASEDIRS", checkout);
+        cargo
+    };
+
+    build(&a).assert().try_success()?;
+    assert_eq!(incremental_stats(&test, 0, 3)?["cache_writes"], 3);
+    assert_cache_only_sessions(&a, crates)?;
+    run_incremental_bin(&a, 110)?;
+
+    zero_incremental_stats()?;
+    build(&b).assert().try_success()?;
+    assert_eq!(incremental_stats(&test, 3, 0)?["cache_writes"], 0);
+    assert_cache_only_sessions(&b, crates)?;
+    run_incremental_bin(&b, 110)?;
+
+    zero_incremental_stats()?;
+    edit_la(&a, 20)?;
+    build(&a).assert().try_success()?;
+    assert_eq!(incremental_stats(&test, 0, 3)?["cache_writes"], 3);
+    let sessions = crates
+        .iter()
+        .map(|name| incremental_sessions(&a, name))
+        .collect::<Result<Vec<_>>>()?;
+    run_incremental_bin(&a, 120)?;
+
+    zero_incremental_stats()?;
+    edit_la(&a, 30)?;
+    build(&a).assert().try_success()?;
+    let stats = incremental_stats(&test, 0, 0)?;
+    // Only the binary went to the server. All three libraries bypassed locally.
+    assert_eq!(stats["compile_requests"], 1, "{stats}");
+    assert_eq!(stats["requests_executed"], 0, "{stats}");
+    assert_eq!(stats["cache_writes"], 0, "{stats}");
+    assert!(stats["not_cached"]["incremental session"].is_null());
+    for (name, old) in crates.iter().zip(sessions) {
+        assert_ne!(incremental_sessions(&a, name)?, old);
+    }
+    run_incremental_bin(&a, 130)
+}
+
+#[test_case(false ; "legacy cache")]
+#[test_case(true ; "partially mixed cache")]
+#[serial]
+fn test_rust_cargo_incremental_first_build_variants_share_cache(mixed: bool) -> Result<()> {
+    let (test, checkouts) = incremental_chain_checkouts(true)?;
+    let [a, b, c, ..] = &checkouts;
+    let crates = &["la", "lb", "mylib"];
+    restart_incremental_server(&test, &checkouts, "cache", Some("incremental"))?;
+    let build = |checkout| {
+        let mut cargo = incremental_cargo(&test, checkout, "build");
+        cargo.env("SCCACHE_RUST_INCREMENTAL_FIRST_BUILD", "plain");
+        cargo
+    };
+
+    if mixed {
+        build(a).args(["-p", "la"]).assert().try_success()?;
+        assert_eq!(incremental_stats(&test, 0, 1)?["cache_writes"], 1);
+        incremental_sessions(a, "la")?;
+    } else {
+        build(a).arg("--workspace").assert().try_success()?;
+        assert_eq!(incremental_stats(&test, 0, 3)?["cache_writes"], 3);
+        for name in crates {
+            incremental_sessions(a, name)?;
+        }
+        run_incremental_bin(a, 110)?;
+    }
+
+    restart_incremental_server(&test, &checkouts, "cache", None)?;
+    build(b).arg("--workspace").assert().try_success()?;
+    let (hits, misses) = if mixed { (1, 2) } else { (3, 0) };
+    assert_eq!(
+        incremental_stats(&test, hits, misses)?["cache_writes"],
+        misses
+    );
+    assert_cache_only_sessions(b, crates)?;
+    run_incremental_bin(b, 110)?;
+
+    if mixed {
+        zero_incremental_stats()?;
+        build(c).arg("--workspace").assert().try_success()?;
+        assert_eq!(incremental_stats(&test, 3, 0)?["cache_writes"], 0);
+        assert_cache_only_sessions(c, crates)?;
+        run_incremental_bin(c, 110)?;
+    }
+    Ok(())
+}
+
 #[test_case(false ; "daemon")]
 #[test_case(true ; "client side")]
 #[serial]
@@ -1141,7 +1280,9 @@ fn test_rust_cargo_incremental_new_checkout_hits_and_replays_warnings(
 #[test_case("check", "--all-targets" ; "check all targets")]
 #[serial]
 fn test_rust_cargo_incremental_lib_hits_with_test_harness(cmd: &str, flag: &str) -> Result<()> {
-    let (test, [a, b, ..]) = incremental_checkouts("cache", false)?;
+    let (test, checkouts) = incremental_checkouts("cache", false)?;
+    restart_incremental_server(&test, &checkouts, "cache", Some("incremental"))?;
+    let [a, b, ..] = checkouts;
     incremental_cargo(&test, &a, cmd)
         .args([flag, "-j", "4"])
         .assert()
@@ -1226,7 +1367,7 @@ fn test_rust_cargo_incremental_edits_store_only_when_cold() -> Result<()> {
 fn test_rust_cargo_incremental_hit_preserves_session_metadata_inode() -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
-    let (test, [a, b, c, ..]) = incremental_checkouts("cache-no-bypass", false)?;
+    let (test, [a, b, ..]) = incremental_checkouts("cache-no-bypass", false)?;
     incremental_cargo(&test, &a, "build")
         .assert()
         .try_success()?;
@@ -1273,12 +1414,13 @@ fn test_rust_cargo_incremental_hit_preserves_session_metadata_inode() -> Result<
         .try_success()?;
     run_incremental_bin(&a, 11)?;
 
-    edit_mylib(&c, 1)?;
-    incremental_cargo(&test, &c, "build")
+    // B has the original outputs from the cache and can build a cold session.
+    edit_mylib(&b, 1)?;
+    incremental_cargo(&test, &b, "build")
         .env("SCCACHE_NO_CACHE", "1")
         .assert()
         .try_success()?;
-    assert_eq!(fs::read(&output)?, fs::read(incremental_rmeta(&c)?)?);
+    assert_eq!(fs::read(&output)?, fs::read(incremental_rmeta(&b)?)?);
     Ok(())
 }
 
@@ -1327,6 +1469,10 @@ fn test_rust_cargo_incremental_edit_against_cache_served_dependency() -> Result<
     assert_ne!(incremental_sessions(&b, "mylib")?, before);
 
     edit_la(&c, 20)?;
+    // Seed the same dependency outputs before building the cold session in C.
+    incremental_cargo(&test, &c, "build")
+        .assert()
+        .try_success()?;
     edit_mylib(&c, 1)?;
     incremental_cargo(&test, &c, "build")
         .env("SCCACHE_NO_CACHE", "1")
@@ -1342,7 +1488,9 @@ fn test_rust_cargo_incremental_edit_against_cache_served_dependency() -> Result<
 #[test]
 #[serial]
 fn test_rust_cargo_incremental_stale_sessions_survive_hits() -> Result<()> {
-    let (test, [a, b, ..]) = incremental_checkouts("cache-no-bypass", false)?;
+    let (test, checkouts) = incremental_checkouts("cache-no-bypass", false)?;
+    restart_incremental_server(&test, &checkouts, "cache-no-bypass", Some("incremental"))?;
+    let [a, b, ..] = checkouts;
     edit_la(&a, 20)?;
     incremental_cargo(&test, &a, "build")
         .assert()

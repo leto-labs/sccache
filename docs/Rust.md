@@ -39,15 +39,25 @@ the server to bypass cache traffic before connecting. Keep the client's
 basedirs settings aligned with the server's when using path remapping.
 Warm compiles that bypass in the client do not appear in server statistics.
 
-In either cache mode, sccache runs eligible units with a private session
-directory named `DIR/<crate_name>-sccache-<unit hash>`. Switching from `off`
-to a cache mode starts each unit cold the first time it compiles in its private
-directory. Switching back selects Cargo's original session location. Both
-cache modes share the private directory. sccache refreshes its modification
-time after each local compile, including bypasses, so mtime-based cleanup can
-recognize active sessions. `cargo clean -p` removes a package's private
-directories along with its other sessions. Cache hits restore the normal rustc
-outputs without creating or modifying session directories.
+In either cache mode, a cache miss for a Rust library with a known metadata
+output path, no existing `.rmeta` and no finalized session compiles without
+`-C incremental` by default. This avoids cold incremental overhead and defers
+session creation until the first rebuild. Cargo keeps the previous `.rmeta`,
+including metadata-only builds from `cargo check`. A library with existing
+metadata, or whose metadata path cannot be determined, compiles incrementally.
+Set `rust_incremental_first_build = "incremental"` in the server config or
+`SCCACHE_RUST_INCREMENTAL_FIRST_BUILD=incremental` when starting the server
+to use incremental codegen on the first miss as well. The default is `plain`.
+
+Incremental compiles in either cache mode use a private session directory
+named `DIR/<crate_name>-sccache-<unit hash>`. Switching from `off` to a cache
+mode starts each unit cold the first time it compiles in its private directory.
+Switching back selects Cargo's original session location. Both cache modes
+share the private directory. sccache refreshes its modification time after
+each local compile that uses it, including bypasses, so mtime-based cleanup
+can recognize active sessions. `cargo clean -p` removes a package's private
+directories along with its other sessions. Cache hits restore the normal
+rustc outputs without creating or modifying session directories.
 Upgrading from `leto-0.19.0-3` or `leto-0.19.0-4` changes the private names.
 Each unit starts cold the first time it compiles in the new directory.
 
@@ -60,11 +70,16 @@ within the past hour. `incremental_prune_days` (overridden by
 and `0` disables pruning. These rules also apply when the client bypasses
 the daemon and runs rustc directly.
 
-Incremental and non-incremental builds use separate entries, regardless
-of the name of the incremental directory. Cargo forwards variables such as
-`CARGO_INCREMENTAL` and `CARGO_PROFILE_DEV_INCREMENTAL` to registry dependency
-compiles, where their values participate in non-incremental cache keys. Use
-consistent Cargo profile settings to share those entries across builds.
+Invocations with and without `-C incremental` use separate entries,
+regardless of the incremental directory name. An incremental invocation uses
+the same key whether its cold compile runs plain or incremental. Both produce
+complete libraries, and cache hits reuse whichever output was stored.
+Dependents hash the exact metadata they compile against, and rustc validates
+upstream crates by SVH when reusing a dependent's incremental session.
+Cargo forwards variables such as `CARGO_INCREMENTAL` and
+`CARGO_PROFILE_DEV_INCREMENTAL` to registry dependency compiles, where their
+values participate in non-incremental cache keys. Use consistent Cargo
+profile settings to share those entries across builds.
 
 Incremental builds run locally. Invocations with `-C save-temps` enabled or
 with unpacked split debuginfo and debuginfo enabled run uncached. This includes
