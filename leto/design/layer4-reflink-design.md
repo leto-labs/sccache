@@ -121,10 +121,31 @@ mold preallocates its output (`fallocate`, `src/output-file-unix.cc:57` at
 v2.40.4, unconditional for regular files, no option) and writes it through
 `mmap`; btrfs writes into preallocated extents without compression. Measured
 on worker-02: a 7.2 MB test binary stored at 100%, 27% after a plain copy.
-Options under measurement (worker-02, Markets-rs, `d4-link-exp.sh`): mold as
-is, lld, mold with `fallocate` disabled (LD_PRELOAD shim, standing in for a
-patched mold), mold plus `btrfs filesystem defragment -czstd` after linking.
-Results and the recommendation: TODO.
+Measured 2026-11-20 on worker-01 (btrfs RAID1, `zstd:1` folder), Longbow
+`ec92f707d`, `test --workspace --no-run`, no sccache. Full build with mold,
+then executables deleted and relinked with each variant (the relink step also
+recompiles the bin and test crates). One run each, host load 10-15, so times
+are indicative only.
+
+| Variant | Executables, apparent | Executables, on disk | Whole `target/`, on disk | Relink step |
+|---|---|---|---|---|
+| mold (as configured) | 49.7 GB | 43.1 GB (0% compressed) | ~44.8 GB | 163 s |
+| lld | 40.6 GB | 6.4 GB (ratio 0.19) | ~8.1 GB (-82%) | 126 s |
+| mold, `fallocate` disabled (LD_PRELOAD shim) | 49.7 GB | 8.0 GB (ratio 0.19) | ~9.7 GB (-78%) | 145 s |
+| mold, then `btrfs filesystem defragment -czstd` | 49.7 GB | 12.1 GB (ratio 0.28) | ~13.7 GB (-69%) | 163 s + 40 s |
+
+Executables are 88% of this `target/` (Longbow test harnesses with
+`debug = 1`); rlibs compress to 0.17 and rmeta to 0.40 with any linker.
+
+Recommendation: **lld** for the layer 1 linker decision. It needs no patched
+tool, its outputs compress normally on btrfs, they are 18% smaller even
+uncompressed (which also helps ext4 on devbox), and it was not slower here.
+A mold without `fallocate` gives similar disk use but needs a patched mold
+build to maintain. Post-link defragmentation compresses less, writes every
+byte twice and costs a separate pass. Before the switch, the project threads
+should confirm link times in their own edit loop (one candidate run with
+`-C link-arg=-fuse-ld=lld`), because the relink step above includes
+compilation.
 
 ## Tests
 
