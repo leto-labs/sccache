@@ -69,10 +69,14 @@ wrapper and the stats client. The config and cache roots honor
 | `PREWARM_BRANCH` | `main`. Local branch to warm. |
 | `PREWARM_COMMANDS` | `check --workspace --all-targets;test --workspace --no-run`. Semicolon-separated Cargo argument lists, beginning with a subcommand that accepts `-j`. The runner supplies `-j`. |
 | `PREWARM_JOBS` | A quarter of the CPUs in the runner's affinity, rounded down with a minimum of one. |
-| `PREWARM_LOAD_LIMIT` | Half the CPUs in the runner's affinity. Uses the host's one-minute load average. |
-| `PREWARM_POLL_SECONDS` | `5`. Interval between samples while Cargo runs. |
+| `PREWARM_MIN_SPARE_CPUS` | `8`. Minimum host-wide spare logical CPUs after accounting for the runner's own usage. |
+| `PREWARM_PAUSE_AFTER` | `60`. Seconds of sustained CPU shortage before pausing Cargo. |
+| `PREWARM_RESUME_AFTER` | `30`. Seconds of sustained spare CPU while paused before Cargo can resume. |
+| `PREWARM_MIN_MEM_AVAILABLE` | `0.15`. Minimum fraction of host memory available. Resuming requires five percentage points more. |
+| `PREWARM_MAX_CPU_PRESSURE` | `80`. Maximum CPU pressure `some avg60` percentage. Set to `0` to disable this gate. |
+| `PREWARM_POLL_SECONDS` | `5`. CPU sample interval before starting Cargo and while it runs. |
 | `PREWARM_MAX_PAUSE_SECONDS` | `900`. Total pause allowance per attempt, in seconds. |
-| `PREWARM_LOAD_CMD` | Optional test or host override. Bash command printing one load number. |
+| `PREWARM_PROC_ROOT`, `PREWARM_CGROUP_ROOT` | Test overrides for `/proc` and `/sys/fs/cgroup`. |
 | `PREWARM_SCCACHE_BIN` | `sccache` on the configured PATH. Use the project's client binary for stats if the wrapper selects its own. |
 | `SCCACHE_CLIENT_SIDE` | `1`. Set it in the project config to override the pre-warm default. |
 
@@ -97,15 +101,43 @@ project config where appropriate so pre-warm also leaves those slots free.
 
 The runner sets niceness to 19 (the usual `nice -n 19` for a manual run) and
 applies `ionice -c3`. The service also sets `CPUWeight=idle`, `Nice=19`, and
-`IOSchedulingClass=idle`. It defers a build above the load limit, stops the
-active Cargo process group when load rises above it, and continues the group
-when load returns to the limit or below. When the pause allowance expires it
-kills the build group and leaves that tip eligible for retry.
+`IOSchedulingClass=idle`. Lane work keeps scheduling priority. The resource
+gate estimates whether an idle-priority build can make progress and checks
+that the host has memory available for it.
+
+- The one-minute load average on devbox (64 logical CPUs) is often around 90,
+  and on worker-02 (96 logical CPUs) it is often around 170. Load average
+  counts runnable tasks and tasks in uninterruptible sleep. A threshold at
+  half the CPU count can defer pre-warm indefinitely. The runner samples the
+  host-wide CPU counters in `/proc/stat` and treats idle and I/O wait as
+  unused CPU. It subtracts its cgroup's CPU usage, read from `cpu.stat` via
+  `/proc/self/cgroup`. If cgroup usage is unavailable, it sums user and system
+  CPU time from the process tree. This keeps pre-warm's own CPU use from
+  causing a pause.
+- The runner defers a new build below eight spare CPUs. During a build it
+  stops the Cargo process group after 60 seconds below the threshold and
+  requires 30 seconds at or above it before resuming.
+- The runner also defers or pauses when `MemAvailable / MemTotal` drops below
+  15%. After a pause, more than 20% must be available to resume.
+- When `/proc/pressure/cpu` is available, the runner defers or pauses above
+  80% CPU pressure (`some avg60`). The idle-weight pre-warm cgroup's tasks
+  can themselves contribute to CPU pressure while waiting for lanes. Set
+  `PREWARM_MAX_CPU_PRESSURE=0` if this repeatedly stalls pre-warm despite
+  sufficient spare CPU and memory.
+
+Start with eight spare CPUs on both hosts. This is one eighth of devbox and
+one twelfth of worker-02. Set `PREWARM_MIN_SPARE_CPUS` in the host's project
+config to reflect how much CPU the build needs to make useful progress.
+On devbox, account for the pinned CPU partition when interpreting the
+host-wide totals. Adjust `PREWARM_JOBS` for the runner's affinity on either
+host, and raise the memory threshold if lane builds need more headroom.
+The pause allowance still applies across all commands in an attempt. When
+it expires, the runner kills the build group and retries on the next trigger.
 
 Pre-warm enables client-side compilation. Cargo's sccache clients run the
 compiler as their own child process and use the shared daemon as a cache
 gateway. This keeps compiler work inside Cargo's process group and the
-service's cgroup, where the idle settings and load gate apply. Both modes
+service's cgroup, where the idle settings and resource gate apply. Both modes
 use the same cache-key pipeline.
 [Client-side compilation architecture](../../docs/Architecture.md#client-side-mode-sccache_client_side)
 

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import tomllib
+from typing import NamedTuple
 
 
 DEFAULT_COMMANDS = "check --workspace --all-targets;test --workspace --no-run"
@@ -89,13 +90,140 @@ def cargo_env(checkout, settings):
     return env
 
 
-def sample_load(command):
-    if not command:
-        return os.getloadavg()[0]
-    value = float(capture(["bash", "-c", command], timeout=5).strip())
-    if not math.isfinite(value) or value < 0:
-        raise PrewarmError("PREWARM_LOAD_CMD must print a finite, nonnegative load")
-    return value
+class CpuSample(NamedTuple):
+    taken_at: float
+    cpus: int
+    total: int
+    busy: int
+    own_seconds: float
+    from_cgroup: bool
+
+
+def process_tree_ticks(proc):
+    ticks = 0
+    pending = [proc / "self"]
+    seen = set()
+    while pending:
+        process = pending.pop()
+        if process in seen:
+            continue
+        seen.add(process)
+        try:
+            # comm may contain spaces or parentheses. The fields after it start at field 3.
+            fields = (process / "stat").read_bytes().rsplit(b")", 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        # Include reaped children to retain their CPU time after a sample sees them exit.
+        ticks += sum(map(int, fields[11:15]))
+        for children in (process / "task").glob("*/children"):
+            try:
+                pending.extend(proc / pid for pid in children.read_text().split())
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+    return ticks
+
+
+class ResourceGate:
+    def __init__(self, settings):
+        self.proc = Path(settings.get("PREWARM_PROC_ROOT", "/proc"))
+        cgroup_root = Path(settings.get("PREWARM_CGROUP_ROOT", "/sys/fs/cgroup"))
+        self.cpu_stat = None
+        try:
+            for line in (self.proc / "self/cgroup").read_text().splitlines():
+                if line.startswith("0::/") and line != "0::/":
+                    self.cpu_stat = cgroup_root / line[4:] / "cpu.stat"
+                    break
+        except OSError:
+            pass
+        self.clock_ticks = os.sysconf("SC_CLK_TCK")
+        self.min_spare = float(settings.get("PREWARM_MIN_SPARE_CPUS", 8))
+        self.min_mem = float(settings.get("PREWARM_MIN_MEM_AVAILABLE", 0.15))
+        self.max_pressure = float(settings.get("PREWARM_MAX_CPU_PRESSURE", 80))
+        self.pause_after = float(settings.get("PREWARM_PAUSE_AFTER", 60))
+        self.resume_after = float(settings.get("PREWARM_RESUME_AFTER", 30))
+        self.poll = float(settings.get("PREWARM_POLL_SECONDS", 5))
+        if (not all(math.isfinite(value) and value >= 0 for value in
+                    (self.min_spare, self.pause_after, self.resume_after, self.poll))
+                or self.poll == 0 or not 0 <= self.min_mem < 0.95
+                or not 0 <= self.max_pressure <= 100):
+            raise PrewarmError("invalid resource gate thresholds or sample interval")
+
+    def cpu_sample(self):
+        with (self.proc / "stat").open() as stat:
+            # Guest time is already included in user and nice.
+            counters = list(map(int, stat.readline().split()[1:9]))
+            cpus = 0
+            for line in stat:
+                if not line.startswith("cpu"):
+                    break
+                cpus += 1
+        total = sum(counters)
+        busy = total - counters[3] - counters[4]
+        if self.cpu_stat is not None:
+            try:
+                for line in self.cpu_stat.read_text().splitlines():
+                    name, _, value = line.partition(" ")
+                    if name == "usage_usec":
+                        return CpuSample(time.monotonic(), cpus, total, busy, int(value) / 1e6, True)
+            except (OSError, ValueError):
+                pass
+            self.cpu_stat = None
+        own = process_tree_ticks(self.proc) / self.clock_ticks
+        return CpuSample(time.monotonic(), cpus, total, busy, own, False)
+
+    def spare_cpus(self, before, after):
+        total = after.total - before.total
+        if (total <= 0 or after.cpus != before.cpus
+                or after.from_cgroup != before.from_cgroup):
+            return None
+        elapsed = after.taken_at - before.taken_at
+        busy = after.cpus * (after.busy - before.busy) / total
+        own = max(0, after.own_seconds - before.own_seconds) / elapsed
+        return after.cpus - max(0, busy - own)
+
+    def cpu_shortage(self, spare):
+        return f"spare CPU {spare:.2f} < {self.min_spare:g}"
+
+    def memory_or_pressure_blocker(self, resuming=False):
+        mem = {}
+        with (self.proc / "meminfo").open() as meminfo:
+            for line in meminfo:
+                name, _, value = line.partition(":")
+                if name in ("MemTotal", "MemAvailable"):
+                    mem[name] = int(value.split()[0])
+                    if len(mem) == 2:
+                        break
+        available = mem["MemAvailable"] / mem["MemTotal"]
+        limit = self.min_mem + 0.05 if resuming else self.min_mem
+        memory_ok = available > limit if resuming else available >= limit
+        if not memory_ok:
+            return f"available memory {available:.1%}, threshold {limit:.1%}"
+        if self.max_pressure:
+            try:
+                with (self.proc / "pressure/cpu").open() as cpu_pressure:
+                    for line in cpu_pressure:
+                        kind, *averages = line.split()
+                        if kind == "some":
+                            values = dict(field.split("=", 1) for field in averages)
+                            pressure = float(values["avg60"])
+                            if pressure > self.max_pressure:
+                                return f"CPU pressure avg60 {pressure:g} > {self.max_pressure:g}"
+                            break
+            except OSError:
+                pass
+        return None
+
+    def startup_blocker(self, interrupted):
+        interrupted()
+        before = self.cpu_sample()
+        time.sleep(self.poll)
+        interrupted()
+        spare = self.spare_cpus(before, self.cpu_sample())
+        if spare is None:
+            return "CPU usage sample unavailable"
+        if spare < self.min_spare:
+            return self.cpu_shortage(spare)
+        return self.memory_or_pressure_blocker()
 
 
 def signal_group(process, sig):
@@ -105,41 +233,58 @@ def signal_group(process, sig):
         pass
 
 
-def build(checkout, args, env, load, limit, poll, pause_budget, status, log, interrupted):
+def build(checkout, args, env, gate, pause_budget, status, log, interrupted):
     command = [*CARGO, *args]
     log_event(log, f"running {shlex.join(command)}")
     started = time.monotonic()
     paused_at = None
+    cpu_streak_since = None
+    previous = gate.cpu_sample()
     try:
         with subprocess.Popen(command, cwd=checkout, env=env, stdout=log,
                               stderr=subprocess.STDOUT, start_new_session=True) as process:
             try:
                 while True:
                     interrupted()
-                    timeout = poll
+                    timeout = gate.poll
                     if paused_at is not None:
                         remaining = pause_budget - status["paused_seconds"] - (time.monotonic() - paused_at)
                         if remaining <= 0:
                             raise PrewarmError("maximum pause time reached; retrying on the next trigger")
-                        timeout = min(poll, remaining)
+                        timeout = min(gate.poll, remaining)
                     try:
                         code = process.wait(timeout=timeout)
                     except subprocess.TimeoutExpired:
-                        if paused_at is not None and timeout < poll:
+                        if paused_at is not None and timeout < gate.poll:
                             raise PrewarmError("maximum pause time reached; retrying on the next trigger")
-                        current = load()
-                        if current > limit and paused_at is None:
+                        current = gate.cpu_sample()
+                        spare = gate.spare_cpus(previous, current)
+                        paused = paused_at is not None
+                        cpu_ready = spare is not None and spare >= gate.min_spare
+                        tracking_cpu = cpu_ready if paused else spare is not None and not cpu_ready
+                        if not tracking_cpu:
+                            cpu_streak_since = None
+                        elif cpu_streak_since is None:
+                            cpu_streak_since = previous.taken_at
+                        previous = current
+                        streak = current.taken_at - cpu_streak_since if cpu_streak_since is not None else -1
+                        reason = gate.memory_or_pressure_blocker(resuming=paused)
+                        if not paused and reason is None and streak >= gate.pause_after:
+                            reason = gate.cpu_shortage(spare)
+                        if not paused and reason is not None:
                             signal_group(process, signal.SIGSTOP)
                             paused_at = time.monotonic()
-                            log_event(log, f"paused pid={process.pid}: load {current:g} > {limit:g}")
-                        elif current <= limit and paused_at is not None:
+                            cpu_streak_since = None
+                            log_event(log, f"paused pid={process.pid}: {reason}")
+                        elif paused and reason is None and streak >= gate.resume_after:
                             status["paused_seconds"] += time.monotonic() - paused_at
                             if status["paused_seconds"] >= pause_budget:
                                 paused_at = None
                                 raise PrewarmError("maximum pause time reached; retrying on the next trigger")
                             signal_group(process, signal.SIGCONT)
                             paused_at = None
-                            log_event(log, f"resumed pid={process.pid}: load {current:g} <= {limit:g}")
+                            cpu_streak_since = None
+                            log_event(log, f"resumed pid={process.pid}: spare CPU {spare:.2f}")
                         continue
                     interrupted()
                     if code:
@@ -232,23 +377,17 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
 
     cpus = len(os.sched_getaffinity(0))
     jobs = int(settings.get("PREWARM_JOBS", max(1, cpus // 4)))
-    limit = float(settings.get("PREWARM_LOAD_LIMIT", cpus / 2))
-    poll = float(settings.get("PREWARM_POLL_SECONDS", 5))
+    gate = ResourceGate(settings)
     pause_budget = float(settings.get("PREWARM_MAX_PAUSE_SECONDS", 900))
-    if (jobs < 1 or poll <= 0 or limit < 0 or pause_budget < 0
-            or not all(math.isfinite(value) for value in (limit, poll, pause_budget))):
-        raise PrewarmError("jobs and poll interval must be positive, and load and pause limits nonnegative")
+    if jobs < 1 or pause_budget < 0 or not math.isfinite(pause_budget):
+        raise PrewarmError("jobs must be positive and the pause budget must be finite and nonnegative")
     commands = [shlex.split(part) for part in settings.get("PREWARM_COMMANDS", DEFAULT_COMMANDS).split(";")]
     if any(not args or args[0].startswith(("-", "+")) for args in commands):
         raise PrewarmError("PREWARM_COMMANDS must contain Cargo subcommands separated by semicolons")
 
-    def load():
-        return sample_load(settings.get("PREWARM_LOAD_CMD"))
-
-    interrupted()
-    current = load()
-    if current > limit:
-        log_event(log, f"deferred {tip}: load {current:g} > {limit:g}")
+    reason = gate.startup_blocker(interrupted)
+    if reason is not None:
+        log_event(log, f"deferred {tip}: {reason}")
         return "deferred"
 
     tip = prepare_checkout(repo, checkout, ref, log)
@@ -262,14 +401,13 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
     log_event(log, f"warming {tip} with {jobs} private Cargo jobs")
     try:
         for args in commands:
-            interrupted()
-            current = load()
-            if current > limit:
-                log_event(log, f"deferred {tip}: load {current:g} > {limit:g}")
+            reason = gate.startup_blocker(interrupted)
+            if reason is not None:
+                log_event(log, f"deferred {tip}: {reason}")
                 return "deferred"
             job_position = args.index("--") if "--" in args else len(args)
             args[job_position:job_position] = ["-j", str(jobs)]
-            build(checkout, args, env, load, limit, poll, pause_budget, status, log, interrupted)
+            build(checkout, args, env, gate, pause_budget, status, log, interrupted)
         interrupted()
         write_atomic(marker, f"{tip}\n")
         status["last_warmed_commit"] = tip

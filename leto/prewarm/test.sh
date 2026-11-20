@@ -5,11 +5,16 @@ runner=$(realpath -- "$(dirname -- "$0")/prewarm.py")
 rustup_home=${RUSTUP_HOME:-$HOME/.rustup}
 tmp=$(mktemp -d)
 prewarm_pid=
+sampler_pid=
 
 cleanup() {
   if [[ -n "$prewarm_pid" ]]; then
     kill "$prewarm_pid" 2>/dev/null || true
     wait "$prewarm_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$sampler_pid" ]]; then
+    kill "$sampler_pid" 2>/dev/null || true
+    wait "$sampler_pid" 2>/dev/null || true
   fi
   rm -rf -- "$tmp"
 }
@@ -22,6 +27,8 @@ export XDG_CACHE_HOME="$HOME/.cache" XDG_CONFIG_HOME="$HOME/.config"
 export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
 export SCCACHE_SERVER_PORT=4250 SCCACHE_CONF="$tmp/sccache.conf" SCCACHE_DIR="$tmp/sccache-cache"
 export PATH="$tmp/bin:/usr/bin:$PATH" FIXTURE_CONTROL="$tmp/control"
+export PREWARM_PROC_ROOT="$tmp/proc" PREWARM_CGROUP_ROOT="$tmp/cgroup"
+export PREWARM_SCCACHE_BIN="$tmp/bin/sccache"
 unset FIXTURE_EXTRA
 
 repo="$tmp/main-repo"
@@ -29,11 +36,65 @@ state="$XDG_CACHE_HOME/leto-maintenance/prewarm/fixture"
 checkout="$state/checkout"
 config="$XDG_CONFIG_HOME/leto-prewarm/fixture.conf"
 log="$state/prewarm.log"
-mkdir -p -- "$FIXTURE_CONTROL" "$tmp/bin" "$repo/scripts" "$repo/crate/src" "$repo/.cargo" "$(dirname -- "$config")"
+mkdir -p -- "$FIXTURE_CONTROL" "$tmp/bin" "$repo/scripts" "$repo/crate/src" "$repo/.cargo" "$(dirname -- "$config")" \
+  "$PREWARM_PROC_ROOT/self/task/1" "$PREWARM_PROC_ROOT/pressure" "$PREWARM_PROC_ROOT/100" "$PREWARM_CGROUP_ROOT/fixture"
 : >"$SCCACHE_CONF"
 : >"$FIXTURE_CONTROL/cargo.log"
 : >"$FIXTURE_CONTROL/sccache.log"
-printf '0\n' >"$FIXTURE_CONTROL/load"
+printf '0 0\n' >"$FIXTURE_CONTROL/cpu"
+printf '0::/fixture\n' >"$PREWARM_PROC_ROOT/self/cgroup"
+printf '1 (prewarm) S 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n' >"$PREWARM_PROC_ROOT/self/stat"
+printf '100\n' >"$PREWARM_PROC_ROOT/self/task/1/children"
+
+set_cpu() {
+  printf '%s %s\n' "$1" "$2" >"$FIXTURE_CONTROL/cpu.new"
+  mv -- "$FIXTURE_CONTROL/cpu.new" "$FIXTURE_CONTROL/cpu"
+}
+
+set_memory() {
+  printf 'MemTotal: 1000 kB\nMemAvailable: %s kB\n' "$1" >"$PREWARM_PROC_ROOT/meminfo.new"
+  mv -- "$PREWARM_PROC_ROOT/meminfo.new" "$PREWARM_PROC_ROOT/meminfo"
+}
+
+set_pressure() {
+  printf 'some avg10=99.00 avg60=%s avg300=0.00 total=10\n' "$1" >"$PREWARM_PROC_ROOT/pressure/cpu.new"
+  mv -- "$PREWARM_PROC_ROOT/pressure/cpu.new" "$PREWARM_PROC_ROOT/pressure/cpu"
+}
+
+set_memory 500
+python3 - <<'PY' &
+import os
+from pathlib import Path
+import time
+
+proc = Path(os.environ["PREWARM_PROC_ROOT"])
+cgroup = Path(os.environ["PREWARM_CGROUP_ROOT"]) / "fixture"
+control = Path(os.environ["FIXTURE_CONTROL"]) / "cpu"
+clock_ticks = os.sysconf("SC_CLK_TCK")
+cpus = 16
+
+def write(path, contents):
+    pending = path.with_suffix(".new")
+    pending.write_text(contents)
+    pending.replace(path)
+
+started = previous = time.monotonic()
+busy = own = 0
+while True:
+    busy_cpus, own_cpus = map(int, control.read_text().split())
+    now = time.monotonic()
+    busy += (now - previous) * busy_cpus
+    own += (now - previous) * own_cpus
+    previous = now
+    idle_ticks = int(((now - started) * cpus - busy) * clock_ticks)
+    write(cgroup / "cpu.stat", f"usage_usec {int(own * 1e6)}\n")
+    ticks = int(own * clock_ticks)
+    write(proc / "100/stat", f"100 (rustc) S 1 0 0 0 0 0 0 0 0 0 {ticks // 2} {ticks - ticks // 2} 0 0\n")
+    write(proc / "stat", f"cpu {int(busy * clock_ticks)} 0 0 {idle_ticks // 2} {idle_ticks - idle_ticks // 2} 0 0 0 0 0\n"
+          + "".join(f"cpu{i} 0 0 0 0 0 0 0 0 0 0\n" for i in range(cpus)))
+    time.sleep(0.02)
+PY
+sampler_pid=$!
 
 cat >"$tmp/bin/sccache" <<'EOF'
 #!/usr/bin/env bash
@@ -61,8 +122,7 @@ set -euo pipefail
 [[ ! -v CARGO_MAKEFLAGS && ! -v MAKEFLAGS && ! -v MFLAGS ]]
 printf '%s|%s|%s|%s\n' "$*" "${FIXTURE_EXTRA:-}" "${SCCACHE_BASEDIRS:-}" "${SCCACHE_CLIENT_SIDE:-}" \
   >>"$FIXTURE_CONTROL/cargo.log"
-export RUSTC_WRAPPER
-RUSTC_WRAPPER=$(command -v sccache)
+export RUSTC_WRAPPER="${FIXTURE_CONTROL%/*}/bin/sccache"
 exec cargo "$@"
 EOF
 
@@ -98,10 +158,10 @@ tip=$(git -C "$repo" rev-parse HEAD)
 cat >"$config" <<EOF
 PREWARM_REPO="$repo"
 PREWARM_JOBS=1
-PREWARM_LOAD_LIMIT=1
 PREWARM_POLL_SECONDS=0.1
+PREWARM_PAUSE_AFTER=0.5
+PREWARM_RESUME_AFTER=0.4
 PREWARM_MAX_PAUSE_SECONDS=10
-PREWARM_LOAD_CMD='cat "\$FIXTURE_CONTROL/load"'
 FIXTURE_EXTRA='value from project config'
 CARGO_MAKEFLAGS='-j --jobserver-auth=fifo:/nonexistent'
 MAKEFLAGS='-j --jobserver-auth=fifo:/nonexistent'
@@ -162,6 +222,11 @@ process_stopped() {
   ps -o state= -p "$1" | grep -qx T
 }
 
+resume_count_is() {
+  [[ $(grep -c 'resumed pid=' "$tmp/background.log") == "$1" ]]
+}
+
+wait_for test -s "$PREWARM_PROC_ROOT/stat"
 SCCACHE_CLIENT_SIDE=0 run
 status_is warmed "$tip"
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 2 ]] || fail "expected both Cargo commands"
@@ -172,7 +237,7 @@ grep -Fxq "test --workspace --no-run -j 1|value from project config|$checkout|1"
 grep -Eq '^1[|].*--crate-name fixture' "$FIXTURE_CONTROL/sccache.log" || fail "sccache did not get client-side mode"
 grep -Eq 'shared sccache delta \{"compile_requests": [1-9]' "$log" || fail "missing stats delta"
 [[ ! -e "$repo/target" ]] || fail "canonical repo received build output"
-printf 'ok - first run builds in client-side mode with project env, private jobs, stats and disk status\n'
+printf 'ok - spare CPU starts a client-side build with project env, private jobs, stats and disk status\n'
 
 run
 status_is unchanged "$tip"
@@ -195,14 +260,15 @@ printf 'ok - new packed branch tip builds and respects Cargo config and the clie
 
 last_warmed=$tip
 change_tip 3
-printf '2\n' >"$FIXTURE_CONTROL/load"
+set_cpu 16 0
 run
 status_is deferred "$last_warmed"
-[[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 4 ]] || fail "started Cargo under high load"
-[[ $(git -C "$checkout" rev-parse HEAD) == "$last_warmed" ]] || fail "fetched under high load"
-printf 'ok - high load defers an unwarmed tip\n'
+[[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 4 ]] || fail "started Cargo without spare CPU"
+[[ $(git -C "$checkout" rev-parse HEAD) == "$last_warmed" ]] || fail "fetched without spare CPU"
+grep -q 'deferred .*: spare CPU' "$tmp/run.log" || fail "missing CPU deferral reason"
+printf 'ok - a busy host with no spare CPU defers an unwarmed tip\n'
 
-printf '0\n' >"$FIXTURE_CONTROL/load"
+set_cpu 0 0
 touch "$FIXTURE_CONTROL/hold"
 "$runner" fixture >"$tmp/background.log" &
 prewarm_pid=$!
@@ -212,30 +278,72 @@ grep -q 'pre-warm already running' "$tmp/run.log" || fail "lock allowed overlapp
 status_is deferred "$last_warmed"
 printf 'ok - an active build holds the project lock\n'
 
-printf '2\n' >"$FIXTURE_CONTROL/load"
-wait_for grep -q 'paused pid=' "$tmp/background.log"
+set_cpu 16 0
+wait_for grep -q 'paused pid=.*spare CPU' "$tmp/background.log"
 rustc_pid=$(cat "$FIXTURE_CONTROL/rustc.pid")
 read -r cargo_pid < <(ps -o pgid= -p "$rustc_pid")
 for pid in "$cargo_pid" "$rustc_pid"; do
   wait_for process_stopped "$pid"
 done
-printf '0\n' >"$FIXTURE_CONTROL/load"
+printf 'ok - sustained CPU shortage stops the Cargo group\n'
+set_cpu 0 0
 wait_for grep -q 'resumed pid=' "$tmp/background.log"
+printf 'ok - sustained CPU recovery resumes the Cargo group\n'
+
+set_memory 100
+wait_for grep -q 'paused pid=.*available memory' "$tmp/background.log"
+wait_for process_stopped "$rustc_pid"
+set_memory 175
+sleep 0.7
+process_stopped "$rustc_pid" || fail "resumed before memory reached its recovery margin"
+set_memory 250
+wait_for resume_count_is 2
+printf 'ok - low memory pauses Cargo until available memory clears the recovery margin\n'
+
+set_pressure 90
+wait_for grep -q 'paused pid=.*CPU pressure avg60' "$tmp/background.log"
+wait_for process_stopped "$rustc_pid"
+set_pressure 20
+wait_for resume_count_is 3
+printf 'ok - enabled CPU pressure gate pauses Cargo until avg60 drops\n'
+
 rm -- "$FIXTURE_CONTROL/hold"
 settled
 status_is warmed "$tip"
-printf 'ok - rising load stops the Cargo group and lower load resumes it\n'
 
 last_warmed=$tip
 change_tip 4
 export PREWARM_COMMANDS='check --workspace --all-targets'
+rm -- "$FIXTURE_CONTROL/rustc.pid"
+touch "$FIXTURE_CONTROL/hold"
+set_cpu 16 16
+set_pressure 90
+PREWARM_MAX_CPU_PRESSURE=0 "$runner" fixture >"$tmp/background.log" &
+prewarm_pid=$!
+wait_for test -s "$FIXTURE_CONTROL/rustc.pid"
+sleep 0.8
+if grep -q 'paused pid=' "$tmp/background.log"; then fail "own CPU or disabled pressure gate paused Cargo"; fi
+rm -- "$FIXTURE_CONTROL/hold"
+settled
+status_is warmed "$tip"
+printf 'ok - subtracting own cgroup CPU keeps Cargo running on a busy host with the pressure gate disabled\n'
+
+change_tip 5
+PREWARM_CGROUP_ROOT="$tmp/missing-cgroup" PREWARM_MAX_CPU_PRESSURE=0 run
+status_is warmed "$tip"
+printf 'ok - process-tree CPU accounting works without cgroup usage\n'
+
+last_warmed=$tip
+change_tip 6
+set_cpu 0 0
+set_pressure 20
 sed -i 's/PREWARM_MAX_PAUSE_SECONDS=10/PREWARM_MAX_PAUSE_SECONDS=0.5/' "$config"
 rm -- "$FIXTURE_CONTROL/rustc.pid"
 touch "$FIXTURE_CONTROL/hold"
 "$runner" fixture >"$tmp/background.log" &
 prewarm_pid=$!
 wait_for test -s "$FIXTURE_CONTROL/rustc.pid"
-printf '2\n' >"$FIXTURE_CONTROL/load"
+set_cpu 16 0
 if wait "$prewarm_pid"; then fail "expired pause reported success"; fi
 prewarm_pid=
 status_is failed "$last_warmed"
@@ -245,7 +353,7 @@ if ps -o state= -p "$rustc_pid" | grep -Eq '^[^ZX]$'; then
   fail "pause timeout left the compiler running"
 fi
 rm -- "$FIXTURE_CONTROL/hold"
-printf '0\n' >"$FIXTURE_CONTROL/load"
+set_cpu 0 0
 run
 status_is warmed "$tip"
 printf 'ok - pause timeout leaves the tip eligible for retry\n'
