@@ -78,6 +78,10 @@ pub trait Storage: Send + Sync {
     /// finished.
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration>;
 
+    fn write_raw_objects(&self) -> bool {
+        false
+    }
+
     /// Get raw serialized cache entry bytes by `key` (for multi-level backfill).
     /// Returns `None` if the entry is not found, or if the implementation doesn't support raw access.
     /// This is used by multi-level caches to backfill faster levels.

@@ -285,14 +285,15 @@ pub fn storage_from_config(
     let preprocessor_cache_mode_config = config.fallback_cache.preprocessor_cache_mode;
     let rw_mode = config.fallback_cache.rw_mode.into();
     debug!("Init disk cache with dir {:?}, size {}", dir, size);
-    Ok(Arc::new(DiskCache::new(
+    let disk = DiskCache::new(
         dir,
         size,
         pool,
         preprocessor_cache_mode_config,
         rw_mode,
         config.basedirs.clone(),
-    )))
+    );
+    Ok(Arc::new(disk.with_reflink(config.fallback_cache.reflink)))
 }
 
 #[cfg(test)]
@@ -302,6 +303,36 @@ mod test {
         PreprocessorCacheEntry, cache::CacheMode, cache::CacheWrite, config::CacheModeConfig,
     };
     use fs_err as fs;
+
+    #[test]
+    fn test_multilevel_disk_reflink_uses_compression() {
+        use crate::config::{CacheConfigs, DiskCacheConfig, MultiLevelConfig};
+
+        let dir = tempfile::tempdir().unwrap();
+        let disk = DiskCacheConfig {
+            dir: dir.path().join("disk"),
+            reflink: true,
+            ..Default::default()
+        };
+        let config = Config {
+            cache_configs: CacheConfigs {
+                disk: Some(disk.clone()),
+                multilevel: Some(MultiLevelConfig {
+                    chain: vec!["disk".into()],
+                    write_error_policy: Default::default(),
+                }),
+                ..Default::default()
+            },
+            fallback_cache: disk,
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let storage = storage_from_config(&config, runtime.handle()).unwrap();
+        assert!(!storage.write_raw_objects());
+        assert!(!config.fallback_cache.dir.exists());
+    }
 
     #[test]
     #[cfg(not(feature = "redis"))]

@@ -443,8 +443,13 @@ impl LruDiskCache {
     /// Entries created by `LruDiskCache::prepare_add` but not yet committed return
     /// `Err(Error::FileNotInCache)`.
     pub fn get_untouched<K: AsRef<OsStr>>(&mut self, key: K) -> Result<Box<dyn ReadSeek>> {
+        self.get_file_untouched(key)
+            .map(|f| Box::new(f) as Box<dyn ReadSeek>)
+    }
+
+    pub(crate) fn get_file_untouched<K: AsRef<OsStr>>(&mut self, key: K) -> Result<File> {
         let path = self.get_abs_path(key).ok_or(Error::FileNotInCache)?;
-        Ok(Box::new(File::open(path)?))
+        Ok(File::open(path)?)
     }
 
     /// Return the absolute path for `key` if it is present in the cache, without opening the

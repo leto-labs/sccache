@@ -6,6 +6,14 @@ The default cache size is 10 gigabytes. To change this, set `SCCACHE_CACHE_SIZE`
 
 The local storage only supports a single sccache server at a time. Multiple concurrent servers will race and cause spurious build failures.
 
+## Reflink cache hits
+
+Set `reflink = true` under `[cache.disk]` or set `SCCACHE_DISK_REFLINK=true` before starting the server to enable reflinks for a standalone Linux disk cache. The default is `false`. The server probes the cache directory at startup and uses the usual compressed entries if the probe fails.
+
+With reflinks enabled, new entries store objects as aligned, uncompressed ZIP members. A hit can share the aligned part of the object with the cache when both files are on a filesystem that supports reflinks, such as btrfs. Any remaining bytes are copied. If cloning fails, sccache copies the object. Existing compressed entries remain usable. Client-side compilation can read raw members by copying them and still writes compressed entries.
+
+The disk cache limit counts apparent file size, so uncompressed objects count for more against the limit even on a filesystem with compression enabled. Older sccache versions treat hits on uncompressed entries as misses. Remove `reflink` from the TOML configuration before starting an older version.
+
 ## Preprocessor cache mode
 
 This is inspired by [ccache's direct mode](https://ccache.dev/manual/3.7.9.html#_the_direct_mode) and works roughly the same.

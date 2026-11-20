@@ -15,12 +15,15 @@ use crate::errors::*;
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
-use zip::read::{ArchiveOffset, Config as ZipReadConfig};
+use zip::read::{ArchiveOffset, Config as ZipReadConfig, ZipFile};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, System, ZipArchive, ZipWriter};
+
+const RAW_ALIGNMENT: u16 = 4096;
 
 /// Cache object sourced by a file.
 #[derive(Clone)]
@@ -74,6 +77,8 @@ impl<T: Read + Seek + Send> ReadSeek for T {}
 /// Data stored in the compiler cache.
 pub struct CacheRead {
     zip: ZipArchive<Box<dyn ReadSeek>>,
+    #[cfg(target_os = "linux")]
+    reflink_source: Option<File>,
 }
 
 /// Represents a failure to decompress stored object data.
@@ -101,7 +106,28 @@ impl CacheRead {
         };
         let z = ZipArchive::with_config(config, Box::new(reader) as Box<dyn ReadSeek>)
             .context("Failed to parse cache entry")?;
-        Ok(CacheRead { zip: z })
+        Ok(CacheRead {
+            zip: z,
+            #[cfg(target_os = "linux")]
+            reflink_source: None,
+        })
+    }
+
+    pub(super) fn from_file(reader: fs::File, _reflink: bool) -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        if _reflink {
+            let source = match reader.file().try_clone() {
+                Ok(file) => Some(file),
+                Err(error) => {
+                    log_reflink_failure(&error);
+                    None
+                }
+            };
+            let mut entry = Self::from(reader)?;
+            entry.reflink_source = source;
+            return Ok(entry);
+        }
+        Self::from(reader)
     }
 
     /// Get an object from this cache entry at `name` and write it to `to`.
@@ -110,13 +136,67 @@ impl CacheRead {
     where
         T: Write,
     {
-        let file = self.zip.by_name(name).or(Err(DecompressionFailure))?;
-        if file.compression() != CompressionMethod::Stored {
+        let (file, raw) = Self::object_member(&mut self.zip, name)?;
+        Self::copy_object(file, raw, to)
+    }
+
+    fn object_member<'a>(
+        zip: &'a mut ZipArchive<Box<dyn ReadSeek>>,
+        name: &str,
+    ) -> Result<(ZipFile<'a, Box<dyn ReadSeek>>, bool)> {
+        let (index, raw) = Self::object_index(zip, name).ok_or(DecompressionFailure)?;
+        let file = zip.by_index(index).or(Err(DecompressionFailure))?;
+        if file.compression() != CompressionMethod::Stored
+            || (raw && file.size() != file.compressed_size())
+        {
             bail!(DecompressionFailure);
         }
+        Ok((file, raw))
+    }
+
+    fn object_index(zip: &ZipArchive<Box<dyn ReadSeek>>, name: &str) -> Option<(usize, bool)> {
+        zip.index_for_name(name)
+            .map(|index| (index, false))
+            .or_else(|| {
+                zip.index_for_name(&format!("raw/{name}"))
+                    .map(|index| (index, true))
+            })
+    }
+
+    fn copy_object<T: Write>(
+        mut file: ZipFile<'_, Box<dyn ReadSeek>>,
+        raw: bool,
+        to: &mut T,
+    ) -> Result<Option<u32>> {
         let mode = file.unix_mode();
-        zstd::stream::copy_decode(file, to).or(Err(DecompressionFailure))?;
+        if raw {
+            io::copy(&mut file, to).or(Err(DecompressionFailure))?;
+        } else {
+            zstd::stream::copy_decode(file, to).or(Err(DecompressionFailure))?;
+        }
         Ok(mode)
+    }
+
+    fn extract_object(&mut self, name: &str, output: &mut File) -> Result<Option<u32>> {
+        let (file, raw) = Self::object_member(&mut self.zip, name)?;
+        #[cfg(target_os = "linux")]
+        if raw && let Some(source) = &self.reflink_source {
+            let size = file.size();
+            let head = size & !(u64::from(RAW_ALIGNMENT) - 1);
+            if head > 0
+                && let Some(offset) = file.data_start()
+            {
+                match reflink_object(source, output, offset, head, size - head) {
+                    Ok(()) => return Ok(file.unix_mode()),
+                    Err(error) => {
+                        log_reflink_failure(&error);
+                        self.reflink_source = None;
+                        output.set_len(0)?;
+                    }
+                }
+            }
+        }
+        Self::copy_object(file, raw, output)
     }
 
     /// Get the stdout from this cache entry, if it exists.
@@ -183,7 +263,7 @@ impl CacheRead {
                 let mut tmp = match NamedTempFile::new_in(dir) {
                     Ok(tmp) => tmp,
                     Err(err) => {
-                        if !optional || self.zip.index_for_name(&key).is_some() {
+                        if !optional || Self::object_index(&self.zip, &key).is_some() {
                             self.extract_object_to_new_file(&key, &path)
                                 .with_context(|| {
                                     format!(
@@ -195,12 +275,12 @@ impl CacheRead {
                         continue;
                     }
                 };
-                match self.get_object(&key, &mut tmp) {
+                match self.extract_object(&key, tmp.as_file_mut()) {
                     Ok(mode) => {
-                        tmp.persist(&path)?;
                         if let Some(mode) = mode {
-                            set_file_mode(path.as_path(), mode)?;
+                            set_file_mode(tmp.as_file(), mode)?;
                         }
+                        tmp.persist(&path)?;
                     }
                     Err(_) if optional => continue,
                     Err(e) => return Err(e),
@@ -220,7 +300,7 @@ impl CacheRead {
         // A concurrent writer may have recreated the name after unlink.
         let mut file = fs::File::create_new(path)?;
         if let Some(mode) = self.get_object(key, &mut file)? {
-            set_file_mode(path, mode)?;
+            set_file_mode(file.file(), mode)?;
         }
         Ok(())
     }
@@ -248,6 +328,45 @@ fn open_output_stream(path: &Path) -> Result<fs::File> {
         );
     }
     Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn reflink_object(
+    source: &File,
+    output: &File,
+    offset: u64,
+    head: u64,
+    tail: u64,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::FileExt;
+
+    let range = libc::file_clone_range {
+        src_fd: source.as_raw_fd().into(),
+        src_offset: offset,
+        src_length: head,
+        dest_offset: 0,
+    };
+    let tail_offset = offset.checked_add(head).ok_or(io::ErrorKind::InvalidData)?;
+    // SAFETY: FICLONERANGE reads the initialized range and both fds stay open.
+    let result = unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONERANGE, &raw const range) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if tail > 0 {
+        // The duplicate source fd shares the ZIP reader's seek position.
+        let mut bytes = [0; RAW_ALIGNMENT as usize];
+        let bytes = &mut bytes[..tail as usize];
+        source.read_exact_at(bytes, tail_offset)?;
+        output.write_all_at(bytes, head)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn log_reflink_failure(error: &io::Error) {
+    static LOG_FAILURE: std::sync::Once = std::sync::Once::new();
+    LOG_FAILURE.call_once(|| info!("Disk cache reflink failed, copying objects: {error}"));
 }
 
 #[cfg(unix)]
@@ -281,7 +400,11 @@ impl CacheWrite {
     }
 
     /// Create a new cache entry populated with the contents of `objects`.
-    pub async fn from_objects<T>(objects: T, pool: &tokio::runtime::Handle) -> Result<CacheWrite>
+    pub async fn from_objects<T>(
+        objects: T,
+        pool: &tokio::runtime::Handle,
+        raw: bool,
+    ) -> Result<CacheWrite>
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
@@ -298,7 +421,13 @@ impl CacheWrite {
                 match (f, optional) {
                     (Ok(mut f), _) => {
                         let mode = get_file_mode(&f)?;
-                        entry.put_object(&key, &mut f, mode).with_context(|| {
+                        let result = if raw {
+                            let large = f.metadata()?.len() >= zip::ZIP64_BYTES_THR;
+                            entry.put_raw_object(&key, &mut f, mode, large)
+                        } else {
+                            entry.put_object(&key, &mut f, mode)
+                        };
+                        result.with_context(|| {
                             format!("failed to put object `{:?}` in cache entry", path)
                         })?;
                     }
@@ -319,18 +448,8 @@ impl CacheWrite {
     {
         // We're going to declare the compression method as "stored",
         // but we're actually going to store zstd-compressed blobs.
-        // zip 0.6 wrote entries with Unix creator metadata on every platform.
-        // Preserve that cache format explicitly with zip 9.
-        let opts = SimpleFileOptions::default()
-            .compression_method(CompressionMethod::Stored)
-            .system(System::Unix);
-        let opts = if let Some(mode) = mode {
-            opts.unix_permissions(mode)
-        } else {
-            opts
-        };
         self.zip
-            .start_file(name, opts)
+            .start_file(name, Self::object_options(mode))
             .context("Failed to start cache entry object")?;
 
         let compression_level = std::env::var("SCCACHE_CACHE_ZSTD_LEVEL")
@@ -339,6 +458,36 @@ impl CacheWrite {
             .unwrap_or(3);
         zstd::stream::copy_encode(from, &mut self.zip, compression_level)?;
         Ok(())
+    }
+
+    fn put_raw_object<T: Read>(
+        &mut self,
+        name: &str,
+        from: &mut T,
+        mode: Option<u32>,
+        large: bool,
+    ) -> Result<()> {
+        self.zip
+            .start_file(
+                format!("raw/{name}"),
+                Self::object_options(mode)
+                    .with_alignment(RAW_ALIGNMENT)
+                    .large_file(large),
+            )
+            .context("Failed to start cache entry object")?;
+        io::copy(from, &mut self.zip)?;
+        Ok(())
+    }
+
+    fn object_options(mode: Option<u32>) -> SimpleFileOptions {
+        // zip 0.6 wrote entries with Unix creator metadata on every platform.
+        let opts = SimpleFileOptions::default()
+            .compression_method(CompressionMethod::Stored)
+            .system(System::Unix);
+        match mode {
+            Some(mode) => opts.unix_permissions(mode),
+            None => opts,
+        }
     }
 
     pub fn put_stdout(&mut self, bytes: &[u8]) -> Result<()> {
@@ -374,6 +523,266 @@ impl Default for CacheWrite {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RAW_SIZES: [usize; 6] = [0, 1, 4095, 4096, 4097, 1024 * 1024 + 7];
+
+    fn raw_member(size: usize) -> (String, Vec<u8>) {
+        (format!("object-{size}"), vec![(size % 251) as u8; size])
+    }
+
+    fn raw_entry(sizes: &[usize]) -> CacheWrite {
+        let mut entry = CacheWrite::new();
+        for &size in sizes {
+            let (key, payload) = raw_member(size);
+            entry
+                .put_raw_object(&key, &mut payload.as_slice(), Some(0o755), false)
+                .unwrap();
+        }
+        entry
+    }
+
+    #[test]
+    fn raw_cache_entry_alignment_and_roundtrip() {
+        let bytes = raw_entry(&RAW_SIZES).finish().unwrap();
+        let mut entry = CacheRead::from(Cursor::new(bytes)).unwrap();
+        for size in RAW_SIZES {
+            let (key, payload) = raw_member(size);
+            let file = entry.zip.by_name(&format!("raw/{key}")).unwrap();
+            assert_eq!(file.data_start().unwrap() % u64::from(RAW_ALIGNMENT), 0);
+            assert_eq!(file.compression(), CompressionMethod::Stored);
+            assert_eq!(file.size(), size as u64);
+            drop(file);
+            let mut output = Vec::new();
+            let mode = entry.get_object(&key, &mut output).unwrap().unwrap();
+            assert_eq!(mode & 0o777, 0o755);
+            assert_eq!(output, payload);
+        }
+    }
+
+    #[test]
+    fn raw_cache_entry_mixed_members() {
+        let mut entry = raw_entry(&[4096, 4097]);
+        entry
+            .put_object("legacy", &mut &b"compressed"[..], None)
+            .unwrap();
+        entry
+            .put_object("object-4096", &mut &b"preferred"[..], None)
+            .unwrap();
+        entry.put_stdout(b"stdout text").unwrap();
+        entry.put_stderr(b"stderr text").unwrap();
+        let mut entry = CacheRead::from(Cursor::new(entry.finish().unwrap())).unwrap();
+        for (name, expected) in [
+            ("legacy", b"compressed".as_slice()),
+            ("object-4096", b"preferred"),
+            ("object-4097", &raw_member(4097).1),
+        ] {
+            let mut output = Vec::new();
+            entry.get_object(name, &mut output).unwrap();
+            assert_eq!(output, expected);
+        }
+        assert_eq!(entry.get_stdout(), b"stdout text");
+        assert_eq!(entry.get_stderr(), b"stderr text");
+    }
+
+    #[test]
+    fn raw_cache_entry_legacy_lookup_is_decompression_failure() {
+        let bytes = raw_entry(&[4096]).finish().unwrap();
+        let mut entry = CacheRead::from(Cursor::new(bytes)).unwrap();
+        // The old reader maps a missing unprefixed ZIP member to DecompressionFailure.
+        let Err(error) = entry
+            .zip
+            .by_name("object-4096")
+            .or(Err(DecompressionFailure))
+        else {
+            panic!("legacy reader found an unprefixed member");
+        };
+        assert!(anyhow!(error).is::<DecompressionFailure>());
+        let mut output = Vec::new();
+        entry.get_object("object-4096", &mut output).unwrap();
+        assert_eq!(output, raw_member(4096).1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raw_cache_entry_hit_replaces_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output");
+        let session = dir.path().join("session");
+        fs::write(&path, b"session metadata").unwrap();
+        fs::hard_link(&path, &session).unwrap();
+        let archive = dir.path().join("entry.zip");
+        fs::write(&archive, raw_entry(&[4097]).finish().unwrap()).unwrap();
+        let reader = CacheRead::from_file(fs::File::open(archive).unwrap(), true).unwrap();
+        runtime
+            .block_on(reader.extract_objects(
+                [FileObjectSource {
+                    key: raw_member(4097).0,
+                    path: path.clone(),
+                    optional: false,
+                }],
+                runtime.handle(),
+            ))
+            .unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), raw_member(4097).1);
+        assert_eq!(fs::read(&session).unwrap(), b"session metadata");
+        assert_ne!(
+            fs::metadata(&path).unwrap().ino(),
+            fs::metadata(&session).unwrap().ino()
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cache_entry_clone_failure_copies_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("entry.zip");
+        let sizes = [4097, 8193];
+        fs::write(&archive, raw_entry(&sizes).finish().unwrap()).unwrap();
+        let mut reader = CacheRead::from_file(fs::File::open(&archive).unwrap(), true).unwrap();
+        if super::super::disk::probe_reflink(dir.path()).is_ok() {
+            // A write-only source forces the clone to fail even on a reflink-capable FS.
+            reader.reflink_source = Some(File::options().write(true).open(&archive).unwrap());
+        }
+        for size in sizes {
+            let (key, payload) = raw_member(size);
+            let mut output = NamedTempFile::new_in(dir.path()).unwrap();
+            assert_eq!(
+                reader
+                    .extract_object(&key, output.as_file_mut())
+                    .unwrap()
+                    .unwrap()
+                    & 0o777,
+                0o755,
+            );
+            assert!(reader.reflink_source.is_none());
+            assert_eq!(fs::read(output.path()).unwrap(), payload);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cache_entry_disk_hit_shares_aligned_extents() {
+        use crate::cache::{Storage, disk::DiskCache};
+
+        let dir = tempfile::tempdir().unwrap();
+        if let Err(error) = super::super::disk::probe_reflink(dir.path()) {
+            eprintln!("skipping shared extent check: FICLONE failed: {error}");
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let cache = DiskCache::new(
+            dir.path().join("cache"),
+            10 * 1024 * 1024,
+            runtime.handle(),
+            Default::default(),
+            CacheMode::ReadWrite,
+            vec![],
+        )
+        .with_reflink(true);
+        assert!(cache.write_raw_objects());
+        let key = "0123456789abcdef";
+        runtime.block_on(async {
+            cache.put(key, raw_entry(&RAW_SIZES)).await.unwrap();
+            let Cache::Hit(entry) = cache.get(key).await.unwrap() else {
+                panic!("expected disk cache hit");
+            };
+            entry
+                .extract_objects(
+                    RAW_SIZES.map(|size| FileObjectSource {
+                        key: raw_member(size).0,
+                        path: dir.path().join(size.to_string()),
+                        optional: false,
+                    }),
+                    runtime.handle(),
+                )
+                .await
+                .unwrap();
+        });
+        for size in RAW_SIZES {
+            let path = dir.path().join(size.to_string());
+            assert_eq!(fs::read(&path).unwrap(), raw_member(size).1);
+            let head = size & !(usize::from(RAW_ALIGNMENT) - 1);
+            if head != 0 {
+                assert_shared_extents(&File::open(&path).unwrap(), head as u64);
+            }
+        }
+        eprintln!("verified FIEMAP_EXTENT_SHARED and output bytes for {RAW_SIZES:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_shared_extents(file: &File, length: u64) {
+        use std::os::fd::AsRawFd;
+
+        #[repr(C)]
+        struct Fiemap {
+            start: u64,
+            length: u64,
+            flags: u32,
+            mapped_extents: u32,
+            extent_count: u32,
+            reserved: u32,
+        }
+
+        #[repr(C)]
+        #[derive(Clone, Copy, Default)]
+        struct Extent {
+            logical: u64,
+            physical: u64,
+            length: u64,
+            reserved64: [u64; 2],
+            flags: u32,
+            reserved: [u32; 3],
+        }
+
+        #[repr(C)]
+        struct FiemapRequest {
+            header: Fiemap,
+            extents: [Extent; 256],
+        }
+
+        const FIEMAP_FLAG_SYNC: u32 = 1;
+        const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
+        let mut request = FiemapRequest {
+            header: Fiemap {
+                start: 0,
+                length,
+                flags: FIEMAP_FLAG_SYNC,
+                mapped_extents: 0,
+                extent_count: 256,
+                reserved: 0,
+            },
+            extents: [Extent::default(); 256],
+        };
+        // SAFETY: The request has the Linux FIEMAP layout and room for extent_count results.
+        let result = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                libc::_IOWR::<Fiemap>(u32::from(b'f'), 11),
+                &raw mut request,
+            )
+        };
+        assert_eq!(result, 0, "FIEMAP: {}", io::Error::last_os_error());
+        let mut end = 0;
+        for extent in &request.extents[..request.header.mapped_extents as usize] {
+            assert_eq!(extent.logical, end);
+            assert_ne!(
+                extent.flags & FIEMAP_EXTENT_SHARED,
+                0,
+                "unshared extent at {end}"
+            );
+            end += extent.length;
+        }
+        assert!(end >= length, "shared only {end} of {length} bytes");
+    }
 
     #[test]
     fn cache_entry_roundtrip_preserves_zip_format() {
@@ -489,9 +898,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test_case::test_case(false ; "writable directory")]
-    #[test_case::test_case(true ; "unwritable directory")]
-    fn test_extract_object_preserves_existing_hard_link(unwritable: bool) {
+    #[test_case::test_case(false, false ; "writable directory")]
+    #[test_case::test_case(true, false ; "unwritable directory")]
+    #[test_case::test_case(true, true ; "unwritable directory with optional raw object")]
+    fn test_extract_object_preserves_existing_hard_link(unwritable: bool, raw: bool) {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -509,12 +919,18 @@ mod tests {
         let old_inode = fs::metadata(&session).unwrap().ino();
 
         let mut cache_data = CacheWrite::new();
-        cache_data.put_bytes("libfoo.rmeta", b"cache data").unwrap();
+        if raw {
+            cache_data
+                .put_raw_object("libfoo.rmeta", &mut &b"cache data"[..], None, false)
+                .unwrap();
+        } else {
+            cache_data.put_bytes("libfoo.rmeta", b"cache data").unwrap();
+        }
         let cache_read = CacheRead::from(Cursor::new(cache_data.finish().unwrap())).unwrap();
         let objects = vec![FileObjectSource {
             key: "libfoo.rmeta".into(),
             path: output.clone(),
-            optional: false,
+            optional: raw,
         }];
 
         if unwritable {

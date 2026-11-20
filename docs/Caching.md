@@ -6,6 +6,9 @@ computing some hashes to make sure the input is the same.
 Because the configuration and environment matter, the hash
 computation takes a few parameters into account.
 
+The standalone disk cache uses the same cache keys for compressed and
+reflink-ready entries. See [Reflink cache hits](Local.md#reflink-cache-hits).
+
 ## How hash keys are computed.
 
 ### Rust
