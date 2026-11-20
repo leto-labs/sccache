@@ -765,15 +765,27 @@ fn incremental_crate_dirs(checkout: &Path, name: &str) -> Result<Vec<PathBuf>> {
     Ok(dirs)
 }
 
+fn private_incremental_dirs(checkout: &Path, name: &str) -> Result<Vec<PathBuf>> {
+    let prefix = format!("{name}-sccache-");
+    Ok(incremental_crate_dirs(checkout, name)?
+        .into_iter()
+        .filter(|dir| {
+            dir.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(&prefix)
+        })
+        .collect())
+}
+
 fn assert_no_working_sessions(checkout: &Path, crates: &[&str]) -> Result<()> {
     for name in crates {
         for folder in incremental_crate_dirs(checkout, name)? {
-            for entry in fs::read_dir(&folder)? {
+            for entry in walkdir::WalkDir::new(folder).max_depth(2) {
                 let entry = entry?;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
+                let name = entry.file_name().to_string_lossy();
                 assert!(
-                    !(entry.file_type()?.is_dir()
+                    !(entry.file_type().is_dir()
                         && name.starts_with("s-")
                         && name.ends_with("-working")),
                     "unexpected preflight session at {:?}",
@@ -785,15 +797,26 @@ fn assert_no_working_sessions(checkout: &Path, crates: &[&str]) -> Result<()> {
     Ok(())
 }
 
+fn assert_cache_only_sessions(checkout: &Path, crates: &[&str]) -> Result<()> {
+    assert_no_working_sessions(checkout, crates)?;
+    for name in crates {
+        assert!(
+            private_incremental_dirs(checkout, name)?.is_empty(),
+            "unexpected private incremental directory for {name} in {checkout:?}"
+        );
+    }
+    Ok(())
+}
+
 fn incremental_sessions(checkout: &Path, name: &str) -> Result<Vec<PathBuf>> {
     assert_no_working_sessions(checkout, &[name])?;
-    let dirs = incremental_crate_dirs(checkout, name)?;
+    let dirs = private_incremental_dirs(checkout, name)?;
     assert_eq!(dirs.len(), 1, "crate {name} in {checkout:?}");
     let mut sessions = Vec::new();
-    for entry in fs::read_dir(&dirs[0])? {
+    for entry in walkdir::WalkDir::new(&dirs[0]).min_depth(2).max_depth(2) {
         let entry = entry?;
-        if entry.file_type()?.is_dir() && entry.file_name().to_string_lossy().starts_with("s-") {
-            sessions.push(entry.path());
+        if entry.file_type().is_dir() && entry.file_name().to_string_lossy().starts_with("s-") {
+            sessions.push(entry.into_path());
         }
     }
     sessions.sort();
@@ -861,7 +884,11 @@ fn test_rust_cargo_incremental_off(allow: Option<&str>) -> Result<()> {
     let stats = incremental_stats(&test, 1, 0)?;
     assert_eq!(stats["not_cached"]["incremental"], 2);
     assert_eq!(stats["rust_incremental_not_stored"], 0);
-    assert_no_working_sessions(&b, &["itoa"])?;
+    for name in ["la", "mylib"] {
+        assert!(private_incremental_dirs(&b, name)?.is_empty());
+        assert_eq!(incremental_crate_dirs(&b, name)?.len(), 1);
+    }
+    assert_cache_only_sessions(&b, &["itoa"])?;
     run_incremental_bin(&b, 10)
 }
 
@@ -889,7 +916,32 @@ fn test_rust_cargo_incremental_new_checkout_hits_and_replays_warnings(
     for name in ["la", "mylib"] {
         assert!(incremental_crate_dirs(&b, name)?.is_empty());
     }
-    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])
+    assert_cache_only_sessions(&b, &["itoa", "la", "mylib"])
+}
+
+#[test_case("test", "--no-run" ; "test harness")]
+#[test_case("check", "--all-targets" ; "check all targets")]
+#[serial]
+fn test_rust_cargo_incremental_lib_hits_with_test_harness(cmd: &str, flag: &str) -> Result<()> {
+    let (test, [a, b, ..]) = incremental_checkouts("cache", false)?;
+    incremental_cargo(&test, &a, cmd)
+        .args([flag, "-j", "4"])
+        .assert()
+        .try_success()?;
+    let stats = incremental_stats(&test, 0, 3)?;
+    assert_eq!(stats["cache_writes"], 3);
+    assert_eq!(stats["rust_incremental_not_stored"], 0);
+    assert_eq!(private_incremental_dirs(&a, "mylib")?.len(), 1);
+    assert_eq!(incremental_crate_dirs(&a, "mylib")?.len(), 2);
+
+    zero_incremental_stats()?;
+    incremental_cargo(&test, &b, cmd)
+        .args([flag, "-j", "4"])
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 3, 0)?;
+    assert_eq!(incremental_crate_dirs(&b, "mylib")?.len(), 1);
+    assert_cache_only_sessions(&b, &["itoa", "la", "mylib"])
 }
 
 #[test]
@@ -903,7 +955,7 @@ fn test_rust_cargo_incremental_edits_store_only_when_cold() -> Result<()> {
         .assert()
         .try_success()?;
     incremental_stats(&test, 3, 3)?;
-    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+    assert_cache_only_sessions(&b, &["itoa", "la", "mylib"])?;
     assert!(incremental_crate_dirs(&b, "mylib")?.is_empty());
 
     zero_incremental_stats()?;
@@ -938,7 +990,7 @@ fn test_rust_cargo_incremental_edits_store_only_when_cold() -> Result<()> {
         .assert()
         .try_success()?;
     assert_eq!(incremental_stats(&test, 2, 1)?["cache_writes"], 1);
-    assert_no_working_sessions(&c, &["itoa", "la"])?;
+    assert_cache_only_sessions(&c, &["itoa", "la"])?;
 
     zero_incremental_stats()?;
     edit_mylib(&d, 2)?;
@@ -947,7 +999,7 @@ fn test_rust_cargo_incremental_edits_store_only_when_cold() -> Result<()> {
         .try_success()?;
     incremental_stats(&test, 3, 0)?;
     run_incremental_bin(&d, 12)?;
-    assert_no_working_sessions(&d, &["itoa", "la", "mylib"])
+    assert_cache_only_sessions(&d, &["itoa", "la", "mylib"])
 }
 
 #[cfg(unix)]
@@ -964,7 +1016,7 @@ fn test_rust_cargo_incremental_hit_preserves_session_metadata_inode() -> Result<
         .assert()
         .try_success()?;
     incremental_stats(&test, 3, 3)?;
-    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+    assert_cache_only_sessions(&b, &["itoa", "la", "mylib"])?;
 
     edit_mylib(&a, 1)?;
     incremental_cargo(&test, &a, "build")
@@ -1024,7 +1076,7 @@ fn test_rust_cargo_incremental_edit_against_cache_served_dependency() -> Result<
         .assert()
         .try_success()?;
     incremental_stats(&test, 3, 3)?;
-    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+    assert_cache_only_sessions(&b, &["itoa", "la", "mylib"])?;
 
     edit_mylib(&b, 1)?;
     incremental_cargo(&test, &b, "build")
@@ -1052,7 +1104,7 @@ fn test_rust_cargo_incremental_edit_against_cache_served_dependency() -> Result<
         1
     );
     run_incremental_bin(&b, 21)?;
-    assert_no_working_sessions(&b, &["la"])?;
+    assert_cache_only_sessions(&b, &["la"])?;
     assert!(incremental_crate_dirs(&b, "la")?.is_empty());
     assert_ne!(incremental_sessions(&b, "mylib")?, before);
 
@@ -1081,7 +1133,7 @@ fn test_rust_cargo_incremental_stale_sessions_survive_hits() -> Result<()> {
         .assert()
         .try_success()?;
     run_incremental_bin(&b, 10)?;
-    assert_no_working_sessions(&b, &["itoa"])?;
+    assert_cache_only_sessions(&b, &["itoa"])?;
     let old_la = incremental_sessions(&b, "la")?;
     let old_mylib = incremental_sessions(&b, "mylib")?;
 
@@ -1122,7 +1174,7 @@ fn test_rust_cargo_incremental_modes_do_not_mix() -> Result<()> {
         .assert()
         .try_success()?;
     incremental_stats(&test, 1, 2)?;
-    assert_no_working_sessions(&b, &["itoa"])?;
+    assert_cache_only_sessions(&b, &["itoa"])?;
 
     // Cargo also forwards this variable to non-incremental dependencies.
     zero_incremental_stats()?;
@@ -1140,7 +1192,7 @@ fn test_rust_cargo_incremental_modes_do_not_mix() -> Result<()> {
         .assert()
         .try_success()?;
     incremental_stats(&test, 3, 0)?;
-    assert_no_working_sessions(&a, &["itoa", "la", "mylib"])?;
+    assert_cache_only_sessions(&a, &["itoa", "la", "mylib"])?;
     run_incremental_bin(&a, 10)
 }
 
@@ -1155,7 +1207,7 @@ fn test_rust_cargo_incremental_check_hits_then_bypasses_known_session() -> Resul
         .assert()
         .try_success()?;
     assert_eq!(incremental_stats(&test, 3, 3)?["cache_writes"], 3);
-    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+    assert_cache_only_sessions(&b, &["itoa", "la", "mylib"])?;
     assert!(incremental_crate_dirs(&b, "mylib")?.is_empty());
 
     zero_incremental_stats()?;
@@ -1175,6 +1227,10 @@ fn test_rust_cargo_incremental_check_hits_then_bypasses_known_session() -> Resul
     assert_eq!(stats["not_cached"]["incremental session"], 1);
     assert_eq!(stats["cache_writes"], 0);
     assert_ne!(incremental_sessions(&b, "mylib")?, old);
+    assert_eq!(
+        incremental_crate_dirs(&b, "mylib")?,
+        private_incremental_dirs(&b, "mylib")?
+    );
     test.show_text_stats(false)?
         .try_stdout(predicates::str::contains("incremental session").from_utf8())?;
 
