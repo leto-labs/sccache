@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cache::{Cache, CacheWrite, DecompressionFailure, FileObjectSource, Storage};
+use crate::cache::{Cache, CacheWrite, FileObjectSource, Storage};
 use crate::compiler::args::*;
 use crate::compiler::c::{CCompiler, CCompilerKind};
 use crate::compiler::cicc::Cicc;
@@ -696,14 +696,10 @@ where
 
                 let hit = CompileResult::CacheHit(duration);
                 match entry.extract_objects(filtered_outputs, &pool).await {
-                    Ok(()) => Ok(CacheLookupResult::Success(hit, output)),
+                    Ok(()) => CacheLookupResult::Success(hit, output),
                     Err(e) => {
-                        if e.downcast_ref::<DecompressionFailure>().is_some() {
-                            debug!("[{}]: Failed to decompress object", out_pretty);
-                            Ok(CacheLookupResult::Miss(MissType::CacheReadError))
-                        } else {
-                            Err(e)
-                        }
+                        debug!("[{}]: Failed to restore cached outputs: {e:#}", out_pretty);
+                        CacheLookupResult::Miss(MissType::CacheReadError)
                     }
                 }
             }
@@ -713,7 +709,7 @@ where
                     out_pretty,
                     fmt_duration_as_secs(&duration)
                 );
-                Ok(CacheLookupResult::Miss(MissType::Normal))
+                CacheLookupResult::Miss(MissType::Normal)
             }
             (Ok(Ok(Cache::None)), duration) => {
                 debug!(
@@ -721,7 +717,7 @@ where
                     out_pretty,
                     fmt_duration_as_secs(&duration)
                 );
-                Ok(CacheLookupResult::Miss(MissType::ForcedNoCache))
+                CacheLookupResult::Miss(MissType::ForcedNoCache)
             }
             (Ok(Ok(Cache::Recache)), duration) => {
                 debug!(
@@ -729,7 +725,7 @@ where
                     out_pretty,
                     fmt_duration_as_secs(&duration)
                 );
-                Ok(CacheLookupResult::Miss(MissType::ForcedRecache))
+                CacheLookupResult::Miss(MissType::ForcedRecache)
             }
             (Ok(Err(err)), duration) => {
                 error!(
@@ -738,7 +734,7 @@ where
                     err,
                     fmt_duration_as_secs(&duration)
                 );
-                Ok(CacheLookupResult::Miss(MissType::CacheReadError))
+                CacheLookupResult::Miss(MissType::CacheReadError)
             }
             (Err(_), duration) => {
                 debug!(
@@ -746,9 +742,9 @@ where
                     out_pretty,
                     fmt_duration_as_secs(&duration)
                 );
-                Ok(CacheLookupResult::Miss(MissType::TimedOut))
+                CacheLookupResult::Miss(MissType::TimedOut)
             }
-        }?;
+        };
 
         match lookup {
             CacheLookupResult::Success(compile_result, output) => {

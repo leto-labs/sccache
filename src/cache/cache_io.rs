@@ -162,6 +162,15 @@ impl CacheRead {
                     debug!("Skipping output to {}", path.display());
                     continue;
                 }
+                #[cfg(unix)]
+                if is_output_stream(&path) {
+                    let mut stream = open_output_stream(&path)?;
+                    let result = self.get_object(&key, &mut stream);
+                    if !optional {
+                        result?;
+                    }
+                    continue;
+                }
                 let dir = match path.parent() {
                     Some(d) => d,
                     None => bail!("Output file without a parent directory!"),
@@ -169,43 +178,48 @@ impl CacheRead {
                 // Write the cache entry to a tempfile and then atomically
                 // move it to its final location so that other rustc invocations
                 // happening in parallel don't see a partially-written file.
-                match (NamedTempFile::new_in(dir), optional) {
-                    (Ok(mut tmp), _) => {
-                        match (self.get_object(&key, &mut tmp), optional) {
-                            (Ok(mode), _) => {
-                                tmp.persist(&path)?;
-                                if let Some(mode) = mode {
-                                    set_file_mode(path.as_path(), mode)?;
-                                }
-                            }
-                            (Err(e), false) => return Err(e),
-                            // skip if no object found and it's optional
-                            (Err(_), true) => continue,
+                // Rustc can hard-link its outputs to an incremental session.
+                // Replacing the destination also leaves that session intact.
+                let mut tmp = NamedTempFile::new_in(dir)?;
+                match self.get_object(&key, &mut tmp) {
+                    Ok(mode) => {
+                        tmp.persist(&path)?;
+                        if let Some(mode) = mode {
+                            set_file_mode(path.as_path(), mode)?;
                         }
                     }
-                    (Err(e), false) => {
-                        // Fall back to writing directly to the final location
-                        warn!("Failed to create temp file on the same file system: {e}");
-                        let mut f = std::fs::File::create(&path)?;
-                        // `optional` is false in this branch, so do not ignore errors
-                        let mode = self.get_object(&key, &mut f)?;
-                        if let Some(mode) = mode
-                            && let Err(e) = set_file_mode(path.as_path(), mode)
-                        {
-                            // Here we ignore errors from setting file mode because
-                            // if we could not create a temp file in the same directory,
-                            // we probably can't set the mode either (e.g. /dev/stuff)
-                            warn!("Failed to reset file mode: {e}");
-                        }
-                    }
-                    // skip if no object found and it's optional
-                    (Err(_), true) => continue,
+                    Err(_) if optional => continue,
+                    Err(e) => return Err(e),
                 }
             }
             Ok(())
         })
         .await?
     }
+}
+
+#[cfg(unix)]
+fn is_output_stream(path: &Path) -> bool {
+    path == Path::new("/dev/stdout")
+        || path == Path::new("/dev/stderr")
+        || path.parent() == Some(Path::new("/dev/fd"))
+}
+
+#[cfg(unix)]
+fn open_output_stream(path: &Path) -> Result<fs::File> {
+    use std::os::unix::fs::FileTypeExt;
+
+    // A descriptor path can point to a regular file. Check the open handle
+    // before writing, without truncating anything on open.
+    let file = fs::OpenOptions::new().write(true).open(path)?;
+    let kind = file.metadata()?.file_type();
+    if !kind.is_fifo() && !kind.is_char_device() {
+        bail!(
+            "Output stream {} refers to a regular output",
+            path.display()
+        );
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -381,103 +395,84 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn test_extract_object_to_dev_fd_something() {
-        // Open a pipe, write to `/dev/fd/{fd}` and check the other end that the correct data was written.
+    fn test_extract_object_to_dev_fd_requires_atomic_restore() {
         use std::os::fd::AsRawFd;
-        use tokio::io::AsyncReadExt;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .worker_threads(1)
             .build()
             .unwrap();
-        let pool = runtime.handle();
+        let destination = tempfile::tempfile().unwrap();
+        let path = PathBuf::from(format!("/dev/fd/{}", destination.as_raw_fd()));
+        if !path.exists() {
+            return;
+        }
+
         let mut cache_data = CacheWrite::new();
-        let data = b"test data";
-        cache_data.put_bytes("test_key", data).unwrap();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
-        runtime.block_on(async {
-            let (sender, mut receiver) = tokio::net::unix::pipe::pipe().unwrap();
-            let sender_fd = sender.into_blocking_fd().unwrap();
-            let raw_fd = sender_fd.as_raw_fd();
-            let fd_path = PathBuf::from(format!("/dev/fd/{raw_fd}"));
-            let objects = vec![FileObjectSource {
-                key: "test_key".to_string(),
-                path: fd_path.clone(),
-                optional: false,
-            }];
-            // On FreeBSD, `/dev/fd/{fd}` does not always exist (i.e. without mounting `fdescfs`), so we skip this test if we get `ENOENT`.
-            if ! fd_path.exists() {
-                info!("Skipping test_extract_object_to_dev_fd_something because /dev/fd/{raw_fd} does not exist");
-                return;
-            }
-            let result = cache_read.extract_objects(objects, pool).await;
-            assert!(
-                result.is_ok(),
-                "Extracting to /dev/fd/{raw_fd} should succeed"
-            );
-            let mut buf = vec![0; data.len()];
-            let n = receiver.read_exact(&mut buf).await.unwrap();
-            assert_eq!(n, data.len(), "Read the correct number of bytes");
-            assert_eq!(buf, data, "Read the correct data from /dev/fd/{raw_fd}");
-        });
+        cache_data.put_bytes("object", b"cache data").unwrap();
+        let cache_read = CacheRead::from(Cursor::new(cache_data.finish().unwrap())).unwrap();
+        let objects = vec![FileObjectSource {
+            key: "object".into(),
+            path,
+            optional: false,
+        }];
+        runtime
+            .block_on(cache_read.extract_objects(objects, runtime.handle()))
+            .unwrap_err();
+        assert_eq!(destination.metadata().unwrap().len(), 0);
     }
 
-    #[test]
-    fn test_extract_object_to_non_writable_path() {
-        // See `test_extract_object_to_dev_fd_something`: we still cannot cover all platforms by the other tests. Here we test a more portable case of creating a file and making its parent directory non-writable, in which case we should still be able to extract the object successfully.
+    #[cfg(unix)]
+    #[test_case::test_case(false ; "writable directory")]
+    #[test_case::test_case(true ; "unwritable directory")]
+    fn test_extract_object_preserves_existing_hard_link(unwritable: bool) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .worker_threads(1)
             .build()
             .unwrap();
 
-        let pool = runtime.handle();
+        let tmpdir = tempfile::tempdir().unwrap();
+        let out_dir = tmpdir.path().join("out");
+        fs::create_dir(&out_dir).unwrap();
+        let output = out_dir.join("libfoo.rmeta");
+        let session = tmpdir.path().join("metadata.rmeta");
+        fs::write(&output, b"session data").unwrap();
+        fs::hard_link(&output, &session).unwrap();
+        let old_inode = fs::metadata(&session).unwrap().ino();
 
         let mut cache_data = CacheWrite::new();
-        cache_data.put_bytes("test_key", b"real_test_data").unwrap();
-        let cache_read =
-            CacheRead::from(std::io::Cursor::new(cache_data.finish().unwrap())).unwrap();
-
-        let tmpdir = tempfile::tempdir().unwrap();
-        let target_path = tmpdir.path().join("test_file");
-        std::fs::write(&target_path, b"test").unwrap();
-        // The current Rust fs permissions API is kind of awkward...
-        let mut perm = tmpdir.path().metadata().unwrap().permissions();
-        perm.set_readonly(true);
-        std::fs::set_permissions(tmpdir.path(), perm.clone()).unwrap();
-        // Note that this doesn't guarantee that the a new file cannot be created anymore.
-        // For example, as documented in `std::fs::Permissions::set_readonly`, the
-        // `FILE_ATTRIBUTE_READONLY` attribute on Windows is entirely ignored for directories.
-        // std::fs::File::create(tmpdir.path().join("another_file")).unwrap_err();
-
+        cache_data.put_bytes("libfoo.rmeta", b"cache data").unwrap();
+        let cache_read = CacheRead::from(Cursor::new(cache_data.finish().unwrap())).unwrap();
         let objects = vec![FileObjectSource {
-            key: "test_key".to_string(),
-            path: target_path.clone(),
+            key: "libfoo.rmeta".into(),
+            path: output.clone(),
             optional: false,
         }];
 
-        let result = runtime.block_on(cache_read.extract_objects(objects, pool));
-        assert!(
-            result.is_ok(),
-            "Extracting to the target path should succeed"
-        );
-        // Test the content; make sure the old content is overwritten
-        let content = std::fs::read(&target_path).unwrap();
-        assert_eq!(
-            content, b"real_test_data",
-            "Extracted content should be correct"
-        );
-
-        // `tempfile` needs us to reset permissions for cleanup to work
-        #[allow(
-            clippy::permissions_set_readonly_false,
-            reason = "The affected directory is immediately deleted with no security implications"
-        )]
-        perm.set_readonly(false);
-        std::fs::set_permissions(tmpdir.path(), perm).unwrap();
-        tmpdir.close().unwrap();
+        if unwritable {
+            fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+            if NamedTempFile::new_in(&out_dir).is_ok() {
+                fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+                eprintln!(
+                    "Skipping unwritable directory case: process can create a file in mode 0555"
+                );
+                return;
+            }
+        }
+        let result = runtime.block_on(cache_read.extract_objects(objects, runtime.handle()));
+        if unwritable {
+            fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            result.unwrap_err();
+            assert_eq!(fs::read(&output).unwrap(), b"session data");
+            assert_eq!(fs::metadata(&output).unwrap().ino(), old_inode);
+        } else {
+            result.unwrap();
+            assert_eq!(fs::read(&output).unwrap(), b"cache data");
+            assert_ne!(fs::metadata(&output).unwrap().ino(), old_inode);
+        }
+        assert_eq!(fs::read(&session).unwrap(), b"session data");
+        assert_eq!(fs::metadata(&session).unwrap().ino(), old_inode);
     }
 
     #[cfg(windows)]
