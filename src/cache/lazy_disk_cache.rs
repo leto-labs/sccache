@@ -16,15 +16,37 @@ use std::ffi::OsString;
 use std::path::Path;
 
 pub enum LazyDiskCache {
-    Uninit { root: OsString, max_size: u64 },
+    Uninit {
+        root: OsString,
+        max_size: u64,
+        use_weights: Option<bool>,
+    },
     Init(LruDiskCache),
 }
 
 impl LazyDiskCache {
+    pub fn detect_weights(&mut self) {
+        if let LazyDiskCache::Uninit {
+            root, use_weights, ..
+        } = self
+        {
+            use_weights.get_or_insert_with(|| LruDiskCache::supports_weights(Path::new(root)));
+        }
+    }
+
     pub fn get_or_init(&mut self) -> Result<&mut LruDiskCache> {
+        self.detect_weights();
         match self {
-            LazyDiskCache::Uninit { root, max_size } => {
-                *self = LazyDiskCache::Init(LruDiskCache::new(&root, *max_size)?);
+            LazyDiskCache::Uninit {
+                root,
+                max_size,
+                use_weights,
+            } => {
+                *self = LazyDiskCache::Init(LruDiskCache::open(
+                    Path::new(root).to_owned(),
+                    *max_size,
+                    use_weights.unwrap(),
+                )?);
                 self.get_or_init()
             }
             LazyDiskCache::Init(d) => Ok(d),
