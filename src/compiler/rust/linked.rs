@@ -37,8 +37,9 @@ fn linker_env(name: &OsStr) -> bool {
     LINK_ENV.contains(&name) || name.starts_with("MOLD_") || name.starts_with("LLD_")
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct Options {
+    pub(super) kind: &'static str,
     driver: Option<String>,
     flavor: Option<String>,
     target: Option<String>,
@@ -48,9 +49,17 @@ pub(super) struct Options {
 
 impl Options {
     pub(super) fn parse(
+        kind: &'static str,
         arguments: &[Argument<ArgData>],
     ) -> std::result::Result<Self, &'static str> {
-        let mut options = Self::default();
+        let mut options = Self {
+            kind,
+            driver: None,
+            flavor: None,
+            target: None,
+            fuse_ld: None,
+            search: Vec::new(),
+        };
         let mut link_args = Vec::new();
         for argument in arguments {
             match argument.get_data() {
@@ -309,7 +318,6 @@ impl Identity {
         env: &[(OsString, OsString)],
         basedirs: &[Vec<u8>],
     ) {
-        digest.delimiter(b"rust-linked-v1-proc-macro");
         let mut env: Vec<_> = env.iter().filter(|(key, _)| linker_env(key)).collect();
         env.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
         let mut hash = HashToDigest { digest };
@@ -515,6 +523,7 @@ pub struct LinkedCompilation {
     pub(super) available: Option<SearchPaths>,
     pub(super) uses_driver: bool,
     pub(super) output: PathBuf,
+    pub(super) object_stem: String,
     pub(super) cwd: PathBuf,
     pub(super) sysroot: PathBuf,
     pub(super) basedirs: Vec<Vec<u8>>,
@@ -668,17 +677,10 @@ impl LinkedCompilation {
         };
         match (components.next().and_then(OsStr::to_str), components.next()) {
             (None, None) => {
-                let stem = self
-                    .output
-                    .file_stem()
-                    .and_then(OsStr::to_str)
-                    .and_then(|s| s.strip_prefix("lib"));
                 first.ends_with(".rcgu.o")
-                    && stem.is_some_and(|stem| {
-                        first
-                            .strip_prefix(stem)
-                            .is_some_and(|suffix| suffix.starts_with('.'))
-                    })
+                    && first
+                        .strip_prefix(&self.object_stem)
+                        .is_some_and(|suffix| suffix.starts_with('.'))
             }
             (Some("list" | "symbols.o" | "rmeta.o" | "metadata.o"), None) => {
                 first.strip_prefix("rustc").is_some_and(|suffix| {
@@ -912,6 +914,20 @@ mod test {
     use std::io::Cursor;
 
     #[test]
+    fn test_linked_refuses_thin_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("libthin.a");
+        fs::write(&archive, b"!<thin>\n").unwrap();
+        let stamp = Stamp::of(&archive).unwrap();
+        assert!(
+            file_digest(&archive, &stamp)
+                .unwrap_err()
+                .to_string()
+                .contains("thin archive")
+        );
+    }
+
+    #[test]
     fn test_linked_key_hashes_tools_and_link_environment() {
         let tool = ToolIdentity {
             digest: "driver digest".into(),
@@ -1005,6 +1021,7 @@ mod test {
             }),
             uses_driver: true,
             output: cwd.join("libpm.so"),
+            object_stem: String::from("pm"),
             cwd: cwd.to_owned(),
             sysroot: PathBuf::from("/sysroot"),
             basedirs: crate::config::basedirs_from_env(cwd.as_os_str()).unwrap(),

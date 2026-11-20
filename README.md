@@ -401,7 +401,7 @@ Known Caveats
 
 ### Rust
 
-* Linked crates compile uncached by default. Set `SCCACHE_RUST_CACHE_LINKED=proc-macro` to cache [eligible proc-macros](docs/Rust.md#linked-proc-macros). You may be able to improve compilation time of large `bin` crates by converting them to a `lib` crate with a thin `bin` wrapper.
+* Linked crates compile uncached by default. Set `SCCACHE_RUST_CACHE_LINKED` on the server to cache eligible proc-macros, test harnesses, or executables. See [linked Rust outputs](docs/Rust.md#linked-outputs) for the stages and requirements.
 * Cargo enables incremental compilation for workspace members and path dependencies in the dev profile. sccache skips caching those invocations by default. Set `SCCACHE_RUST_INCREMENTAL=cache` on the server to enable caching of cold incremental builds. See [Rust caching](docs/Rust.md#incremental-compilation).
 
 [More details on Rust caveats](/docs/Rust.md)

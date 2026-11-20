@@ -15,8 +15,11 @@ rust_incremental = "off"
 # Codegen on first-build misses in either incremental cache mode.
 rust_incremental_first_build = "plain"
 
-# Cache metadata-only Rust test, bin and proc-macro targets with "check".
+# Cumulative Rust target caching stages: "off", "check", "proc-macro", "tests", "all".
 rust_cache_linked = "off"
+
+# Skip storing linked Rust outputs when their uncompressed size exceeds this limit.
+rust_cache_linked_max_entry_bytes = 268435456
 
 # Remove stale Rust incremental sessions after this many days. Set 0 to disable.
 incremental_prune_days = 7
@@ -220,7 +223,8 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_ALLOW_CORE_DUMPS` to enable core dumps by the server
 * `SCCACHE_RUST_INCREMENTAL` overrides the server's `rust_incremental` setting. Values are `off` (default), `cache`, and `cache-no-bypass`. Restart the server to change modes. See [incremental compilation](Rust.md#incremental-compilation).
 * `SCCACHE_RUST_INCREMENTAL_FIRST_BUILD` overrides the server's `rust_incremental_first_build` setting. Values are `plain` (default) and `incremental`. Restart the server to change the setting. See [incremental compilation](Rust.md#incremental-compilation).
-* `SCCACHE_RUST_CACHE_LINKED` overrides the server's `rust_cache_linked` setting. Values are `off` (default), `check`, `proc-macro`, `tests`, and `all`. The `tests` and `all` values warn at startup and use `proc-macro`. Restart the server to change the setting. See [Rust caching](Rust.md#metadata-only-target-caching).
+* `SCCACHE_RUST_CACHE_LINKED` overrides the server's `rust_cache_linked` setting. Values are `off` (default), `check`, `proc-macro`, `tests`, and `all`. Restart the server to change the setting. See [Rust caching](Rust.md#caching-test-binary-and-proc-macro-targets).
+* `SCCACHE_RUST_CACHE_LINKED_MAX_ENTRY` overrides the server's `rust_cache_linked_max_entry_bytes` setting in bytes. The default is 256 MiB. Restart the server to change the setting.
 * `SCCACHE_INCREMENTAL_PRUNE_DAYS` overrides `incremental_prune_days`. The default is 7 days. Set `0` to disable. The server reads this setting at startup. The local incremental fast path reads the client's setting. See [incremental compilation](Rust.md#incremental-compilation).
 * `SCCACHE_MISS_EXPLAIN` overrides the top-level `miss_explain` setting. Use an absolute path to a JSON Lines file. sccache creates the parent directory if needed and does not expand `~` or `%h`. An empty value disables the log. The log is disabled by default. Restart the server to change it. See [explaining cross-worktree misses](Rust.md#explain-cross-worktree-cache-misses).
 * `SCCACHE_SHUTDOWN_DRAIN_SECS` overrides `server.shutdown_drain_secs`. The server closes its listener and waits up to this many seconds for established connections and cache writes. It logs the remaining connection count at info level every 10 seconds. The default is 10 seconds. Set `0` to skip the wait. The server reads this setting at startup.
@@ -234,7 +238,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_DIST_CLIENT_CACHE_DIR` distributed toolchain cache directory; overrides `[dist].cache_dir` from the configuration file.
 * `SCCACHE_IDLE_TIMEOUT` how long the local daemon process waits for more client requests before exiting, in seconds. Set to `0` to run sccache permanently
 * `SCCACHE_STARTUP_NOTIFY` specify a path to a socket which will be used for server completion notification
-* `SCCACHE_MAX_FRAME_LENGTH` maximum IPC frame size in bytes. The default is 8 MiB, or 128 MiB when the daemon writes raw objects.
+* `SCCACHE_MAX_FRAME_LENGTH` maximum IPC frame size in bytes. The default is 8 MiB, or 128 MiB when the daemon writes raw objects. With the `proc-macro`, `tests`, or `all` stage, the default also accommodates the configured entry cap plus 16 MiB for framing and the manifest, up to the protocol limit.
 * `SCCACHE_NO_DAEMON` set to `1` to disable putting the server to the background
 * `SCCACHE_CLIENT_SIDE` set to `1` to run the compile in the client process and use the daemon only as a gateway to the cache storage (see [the architecture doc](Architecture.md#client-side-mode-sccache_client_side)). This is the recommended mode and is expected to become the only supported configuration in the future. Ignored when `SCCACHE_LOG` or distributed compilation is in use.
 * `SCCACHE_CACHE_READ_TIMEOUT_SECS` how long, in seconds, a cache lookup may take before sccache gives up on it and compiles locally. Defaults to `60`. A lower value helps when the storage backend is slow or unresponsive rather than failing outright, for example in CI.

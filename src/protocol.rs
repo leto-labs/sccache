@@ -3,6 +3,7 @@ use crate::compiler::ColorMode;
 use crate::config::{
     PreprocessorCacheModeConfig, RustCacheLinked, RustIncrementalFirstBuild,
     RustIncrementalSettings, default_incremental_prune_days,
+    default_rust_cache_linked_max_entry_bytes,
 };
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -139,6 +140,8 @@ pub struct StorageHandshakeInfo {
     pub write_raw_objects: bool,
     #[serde(skip)]
     pub rust_cache_linked: RustCacheLinked,
+    #[serde(skip, default = "default_rust_cache_linked_max_entry_bytes")]
+    pub rust_cache_linked_max_entry_bytes: u64,
 }
 
 // Older peers ignore trailing bytes. Keep extensions at the end of the
@@ -174,8 +177,13 @@ pub(crate) fn encode_response(response: &Response) -> bincode::Result<Vec<u8>> {
             bincode::serialize_into(&mut frame, &info.incremental_prune_days)?;
             bincode::serialize_into(&mut frame, &info.rust_incremental.first_build)?;
             bincode::serialize_into(&mut frame, &info.write_raw_objects)?;
-            if info.rust_cache_linked != RustCacheLinked::Off {
+            let custom_limit = info.rust_cache_linked_max_entry_bytes
+                != default_rust_cache_linked_max_entry_bytes();
+            if info.rust_cache_linked != RustCacheLinked::Off || custom_limit {
                 bincode::serialize_into(&mut frame, &info.rust_cache_linked)?;
+                if custom_limit {
+                    bincode::serialize_into(&mut frame, &info.rust_cache_linked_max_entry_bytes)?;
+                }
             }
         }
         _ => {}
@@ -210,7 +218,12 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                                 let (write_raw_objects, remaining) = decode_frame(remaining)?;
                                 info.write_raw_objects = write_raw_objects;
                                 if !remaining.is_empty() {
-                                    info.rust_cache_linked = bincode::deserialize(remaining)?;
+                                    let (linked, remaining) = decode_frame(remaining)?;
+                                    info.rust_cache_linked = linked;
+                                    if !remaining.is_empty() {
+                                        info.rust_cache_linked_max_entry_bytes =
+                                            bincode::deserialize(remaining)?;
+                                    }
                                 }
                             }
                         }
@@ -225,8 +238,11 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
 
 fn encode_stats_extension(frame: &mut Vec<u8>, stats: &ServerStats) -> bincode::Result<()> {
     bincode::serialize_into(&mut *frame, &stats.rust_incremental_not_stored)?;
-    if stats.miss_explain != Default::default() {
-        bincode::serialize_into(frame, &stats.miss_explain)?;
+    if stats.miss_explain != Default::default() || stats.rust_linked_entry_too_large != 0 {
+        bincode::serialize_into(&mut *frame, &stats.miss_explain)?;
+    }
+    if stats.rust_linked_entry_too_large != 0 {
+        bincode::serialize_into(frame, &stats.rust_linked_entry_too_large)?;
     }
     Ok(())
 }
@@ -235,7 +251,11 @@ fn decode_stats_extension(extension: &[u8], stats: &mut ServerStats) -> bincode:
     let (incremental, remaining) = decode_frame(extension)?;
     stats.rust_incremental_not_stored = incremental;
     if !remaining.is_empty() {
-        stats.miss_explain = bincode::deserialize(remaining)?;
+        let (miss_explain, remaining) = decode_frame(remaining)?;
+        stats.miss_explain = miss_explain;
+        if !remaining.is_empty() {
+            stats.rust_linked_entry_too_large = bincode::deserialize(remaining)?;
+        }
     }
     Ok(())
 }
@@ -302,6 +322,7 @@ mod tests {
             assert_eq!(info.stats.not_cached["incremental session"], 17);
             assert_eq!(info.stats.rust_incremental_not_stored, 0);
             assert_eq!(info.stats.miss_explain, MissExplainStats::default());
+            assert_eq!(info.stats.rust_linked_entry_too_large, 0);
             assert_eq!(info.cache_location, "cache");
             assert_eq!(info.basedirs, ["/work"]);
 
@@ -317,24 +338,34 @@ mod tests {
 
             info.stats.rust_incremental_not_stored = 23;
             info.stats.miss_explain.own_input = 41;
+            info.stats.rust_linked_entry_too_large = 47;
             let json = serde_json::to_value(&info).unwrap();
             assert_eq!(json["stats"]["rust_incremental_not_stored"], 23);
             assert_eq!(json["stats"]["miss_explain"]["own-input"], 41);
+            assert_eq!(json["stats"]["rust_linked_entry_too_large"], 47);
             let from_json: ServerInfo = serde_json::from_value(json).unwrap();
             assert_eq!(from_json.stats.rust_incremental_not_stored, 23);
             assert_eq!(from_json.stats.miss_explain.own_input, 41);
+            assert_eq!(from_json.stats.rust_linked_entry_too_large, 47);
 
             let new_frame = encode_response(&response).unwrap();
             assert!(new_frame.starts_with(&incremental_frame));
-            for (response, incremental, own_input) in [
-                (bincode::deserialize(&new_frame).unwrap(), 0, 0),
-                (decode_response(&new_frame).unwrap(), 23, 41),
+            for (response, incremental, own_input, oversized) in [
+                (bincode::deserialize(&new_frame).unwrap(), 0, 0, 0),
+                (
+                    decode_response(&new_frame[..new_frame.len() - 8]).unwrap(),
+                    23,
+                    41,
+                    0,
+                ),
+                (decode_response(&new_frame).unwrap(), 23, 41, 47),
             ] {
                 let (Response::Stats(info) | Response::ShuttingDown(info)) = response else {
                     panic!("expected stats response");
                 };
                 assert_eq!(info.stats.rust_incremental_not_stored, incremental);
                 assert_eq!(info.stats.miss_explain.own_input, own_input);
+                assert_eq!(info.stats.rust_linked_entry_too_large, oversized);
                 assert_eq!(info.cache_location, "cache");
             }
         }
@@ -357,11 +388,11 @@ mod tests {
         assert_eq!(previous.rust_incremental_not_stored, 23);
         assert_eq!(previous.miss_explain, MissExplainStats::default());
 
-        stats.miss_explain.dependency = 31;
+        stats.rust_linked_entry_too_large = 31;
         let new_frame = encode_request(&Request::RecordStats(stats)).unwrap();
         assert!(incremental_frame.starts_with(&old_frame));
         assert!(new_frame.starts_with(&incremental_frame));
-        for (request, incremental, dependency) in [
+        for (request, incremental, oversized) in [
             (bincode::deserialize(&new_frame).unwrap(), 0, 0),
             (decode_request(&new_frame).unwrap(), 23, 31),
         ] {
@@ -369,7 +400,8 @@ mod tests {
                 panic!("expected stats request");
             };
             assert_eq!(stats.rust_incremental_not_stored, incremental);
-            assert_eq!(stats.miss_explain.dependency, dependency);
+            assert_eq!(stats.miss_explain, MissExplainStats::default());
+            assert_eq!(stats.rust_linked_entry_too_large, oversized);
             assert_eq!(stats.cache_writes, 11);
         }
     }
@@ -401,6 +433,7 @@ mod tests {
         assert!(!info.miss_explain);
         assert!(!info.write_raw_objects);
         assert_eq!(info.rust_cache_linked, RustCacheLinked::Off);
+        assert_eq!(info.rust_cache_linked_max_entry_bytes, 256 * 1024 * 1024);
 
         let mode = CacheNoBypass;
         let mut mode_only = old_frame.clone();
@@ -427,7 +460,15 @@ mod tests {
         let mut raw_frame = legacy_frame.clone();
         bincode::serialize_into(&mut raw_frame, &true).unwrap();
         info.rust_cache_linked = RustCacheLinked::Check;
-        let incremental_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
+        let incremental_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
+        info.rust_cache_linked_max_entry_bytes = 1024;
+        let limited_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
+        assert!(limited_frame.starts_with(&incremental_frame));
+        let Response::StorageHandshake(limited) = decode_response(&limited_frame).unwrap() else {
+            panic!("expected storage handshake");
+        };
+        assert_eq!(limited.rust_cache_linked, RustCacheLinked::Check);
+        assert_eq!(limited.rust_cache_linked_max_entry_bytes, 1024);
         assert!(incremental_frame.starts_with(&raw_frame));
 
         let (legacy_mode, remaining) =

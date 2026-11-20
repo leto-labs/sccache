@@ -57,6 +57,10 @@ impl IpcStorage {
         self.handshake.rust_incremental
     }
 
+    pub(crate) fn rust_cache_linked_max_entry_bytes(&self) -> u64 {
+        self.handshake.rust_cache_linked_max_entry_bytes
+    }
+
     pub(crate) fn rust_cache_linked(&self) -> RustCacheLinked {
         self.handshake.rust_cache_linked
     }
@@ -255,6 +259,8 @@ mod tests {
                 max_size: None,
                 rust_incremental: Default::default(),
                 rust_cache_linked: Default::default(),
+                rust_cache_linked_max_entry_bytes:
+                    crate::config::default_rust_cache_linked_max_entry_bytes(),
                 miss_explain: false,
                 incremental_prune_days: 7,
                 write_raw_objects: true,
