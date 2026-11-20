@@ -16,7 +16,7 @@ use crate::cache::cache_io::{Cache, CacheRead, CacheWrite};
 use crate::cache::storage::{CacheStorage, PreprocessorCacheStorage};
 use crate::client::ServerConnection;
 use crate::compiler::PreprocessorCacheEntry;
-use crate::config::{PreprocessorCacheModeConfig, RustIncremental};
+use crate::config::{PreprocessorCacheModeConfig, RustIncrementalSettings};
 use crate::errors::*;
 use crate::protocol::{Request, Response, StorageHandshakeInfo};
 use async_trait::async_trait;
@@ -53,7 +53,7 @@ impl IpcStorage {
         Arc::clone(&self.conn)
     }
 
-    pub fn rust_incremental(&self) -> RustIncremental {
+    pub fn rust_incremental(&self) -> RustIncrementalSettings {
         self.handshake.rust_incremental
     }
 

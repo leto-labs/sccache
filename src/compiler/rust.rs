@@ -21,7 +21,7 @@ use crate::compiler::{
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
-use crate::config::RustIncremental;
+use crate::config::{RustIncremental, RustIncrementalFirstBuild, RustIncrementalSettings};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -334,7 +334,7 @@ pub struct RustHasher {
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
     /// Parsed arguments from the rustc invocation
     parsed_args: ParsedArguments,
-    bypass_incremental: bool,
+    incremental_settings: RustIncrementalSettings,
 }
 
 /// a lookup proxy for determining the actual compiler used per file or directory
@@ -404,6 +404,7 @@ pub struct RustCompilation {
     #[cfg(feature = "dist-client")]
     remaps_basedirs: bool,
     incremental: Option<IncrementalSession>,
+    first_build_metadata: Option<PathBuf>,
     /// The compiler inputs.
     inputs: Vec<PathBuf>,
     /// The compiler outputs.
@@ -979,7 +980,12 @@ where
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        self.parse_arguments_with_rust_incremental(arguments, cwd, env_vars, RustIncremental::Off)
+        self.parse_arguments_with_rust_incremental(
+            arguments,
+            cwd,
+            env_vars,
+            RustIncrementalSettings::default(),
+        )
     }
 
     fn parse_arguments_with_rust_incremental(
@@ -987,10 +993,10 @@ where
         arguments: &[OsString],
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
-        mode: RustIncremental,
+        settings: RustIncrementalSettings,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        let mode = mode.for_compile(env_vars);
-        match parse_arguments(arguments, cwd, mode) {
+        let settings = settings.for_compile(env_vars);
+        match parse_arguments(arguments, cwd, settings.mode) {
             CompilerArguments::Ok(args) => {
                 CompilerArguments::Ok(Box::new(RustHasher {
                     executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
@@ -1004,7 +1010,7 @@ where
                     #[cfg(feature = "dist-client")]
                     rlib_dep_reader: self.rlib_dep_reader.clone(),
                     parsed_args: args,
-                    bypass_incremental: mode == RustIncremental::Cache,
+                    incremental_settings: settings,
                 }))
             }
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
@@ -1721,12 +1727,12 @@ fn rust_compile_command(
 ) -> Result<RustCompileCommand> {
     let mut spawn_arguments = Vec::new();
     for arg in arguments {
-        if let Some(session) = incremental
-            && is_incremental_argument(arg)
-        {
-            let mut value = OsString::from("incremental=");
-            value.push(session.path());
-            spawn_arguments.extend([arg.to_os_string(), value]);
+        if is_incremental_argument(arg) {
+            if let Some(session) = incremental {
+                let mut value = OsString::from("incremental=");
+                value.push(session.path());
+                spawn_arguments.extend([arg.to_os_string(), value]);
+            }
         } else {
             spawn_arguments.extend(arg.iter_os_strings());
         }
@@ -2052,6 +2058,37 @@ fn parse_argument_iter(
         target_json,
         incremental_dir,
     })
+}
+
+impl ParsedArguments {
+    fn metadata_output(&self) -> Option<PathBuf> {
+        if !self.crate_types.rlib
+            || !self.emit.contains("metadata")
+            || self
+                .arguments
+                .iter()
+                .any(|arg| matches!(arg, Argument::UnknownFlag(flag) if flag == "--test"))
+        {
+            return None;
+        }
+        let extra_filename = self
+            .arguments
+            .iter()
+            .rev()
+            .find_map(|arg| match arg.get_data() {
+                Some(CodeGen(ArgCodegen { opt, value }))
+                    if opt == "extra-filename" || opt == "extra_filename" =>
+                {
+                    value.as_deref()
+                }
+                _ => None,
+            })
+            .unwrap_or_default();
+        Some(
+            self.output_dir
+                .join(format!("lib{}{extra_filename}.rmeta", self.crate_name)),
+        )
+    }
 }
 
 impl RustHasher {
@@ -2922,6 +2959,13 @@ where
                 arguments,
                 #[cfg(feature = "dist-client")]
                 remaps_basedirs,
+                first_build_metadata: if incremental.is_some()
+                    && self.incremental_settings.first_build == RustIncrementalFirstBuild::Plain
+                {
+                    self.parsed_args.metadata_output()
+                } else {
+                    None
+                },
                 incremental,
                 inputs,
                 outputs,
@@ -2943,7 +2987,7 @@ where
         env_vars: &[(OsString, OsString)],
         basedirs: &[Vec<u8>],
     ) -> Result<Option<(&'static str, Box<dyn CompileCommand<T>>)>> {
-        if !self.bypass_incremental {
+        if self.incremental_settings.mode != RustIncremental::Cache {
             return Ok(None);
         }
         let Some(session) = self.incremental_session() else {
@@ -3007,13 +3051,17 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
         trace!("[{}]: compile", crate_name);
 
-        let command = rust_compile_command(
-            executable,
-            arguments,
-            cwd,
-            env_vars,
-            self.incremental.as_ref(),
-        )?;
+        let mut session = self.incremental.as_ref();
+        if let (Some(current), Some(metadata)) = (session, &self.first_build_metadata)
+            && matches!(cwd.join(metadata).try_exists(), Ok(false))
+            && matches!(current.has_finalized_session(), Ok(false))
+        {
+            // Cargo leaves the old .rmeta on rebuilds. A plain first build supplies
+            // a complete crate: dependents hash its metadata and rustc validates
+            // upstream crates by SVH when reusing their sessions.
+            session = None;
+        }
+        let command = rust_compile_command(executable, arguments, cwd, env_vars, session)?;
 
         #[cfg(not(feature = "dist-client"))]
         let dist_command = None;
@@ -4216,6 +4264,177 @@ LLVM version: 15.0.2
         parse_arguments(&args, cwd, mode)
     }
 
+    #[test_case("lib", "metadata", &[], Some("libfoo.rmeta") ; "lib check")]
+    #[test_case("rlib", "metadata", &["-Cextra-filename=-abc"], Some("libfoo-abc.rmeta") ; "rlib check with suffix")]
+    #[test_case("rlib", "dep-info,metadata,link", &[], Some("libfoo.rmeta") ; "rlib build")]
+    #[test_case("lib", "dep-info,metadata,link", &["-C", "extra-filename=-abc"], Some("libfoo-abc.rmeta") ; "lib build with suffix")]
+    #[test_case("lib", "metadata", &["-Cextra-filename=-first", "-Cextra-filename=-last"], Some("libfoo-last.rmeta") ; "last suffix wins")]
+    #[test_case("lib", "link", &[], None ; "link only")]
+    #[test_case("staticlib", "metadata,link", &[], None ; "static library")]
+    #[test_case("lib", "metadata", &["--test"], None ; "test harness")]
+    fn test_incremental_metadata_output(
+        crate_type: &str,
+        emit: &str,
+        extra_args: &[&str],
+        expected: Option<&str>,
+    ) {
+        let args = [
+            "foo.rs",
+            "--crate-name=foo",
+            "--crate-type",
+            crate_type,
+            "--emit",
+            emit,
+            "--out-dir=out",
+        ]
+        .into_iter()
+        .chain(extra_args.iter().copied())
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        let CompilerArguments::Ok(parsed) =
+            parse_arguments(&args, Path::new("."), RustIncremental::Cache)
+        else {
+            panic!("expected compile arguments");
+        };
+        assert_eq!(
+            parsed.metadata_output(),
+            expected.map(|filename| Path::new("out").join(filename))
+        );
+    }
+
+    #[test]
+    fn test_incremental_cold_compile_policy_preserves_key() {
+        use RustIncrementalFirstBuild::{Incremental, Plain};
+
+        let fixture = TestFixture::new();
+        let cwd = fixture.tempdir.path();
+        fixture.touch("foo.rs").unwrap();
+        fs::create_dir(cwd.join("out")).unwrap();
+        let rustc = Rust {
+            executable: "rustc".into(),
+            host: "x86-64-unknown-unknown-unknown".into(),
+            version: TEST_RUSTC_VERSION.into(),
+            sysroot: cwd.join("sysroot"),
+            #[cfg(feature = "dist-client")]
+            target_libdir: cwd.join("sysroot/lib/rustlib/fake-target/lib"),
+            compiler_shlibs_digests: vec![],
+            dist_archive: None,
+            #[cfg(feature = "dist-client")]
+            rlib_dep_reader: None,
+        };
+        let runtime = single_threaded_runtime();
+        let new_hasher = |emit: &str, mode, first_build| {
+            let args = [
+                "foo.rs",
+                "--crate-name=foo",
+                "--crate-type=lib",
+                emit,
+                "--out-dir=out",
+                "-Cincremental=other",
+                "--codegen=incremental=inc",
+            ]
+            .map(OsString::from);
+            let settings = RustIncrementalSettings { mode, first_build };
+            let parsed =
+                Compiler::<Arc<Mutex<MockCommandCreator>>>::parse_arguments_with_rust_incremental(
+                    &rustc,
+                    &args,
+                    cwd,
+                    &[],
+                    settings,
+                );
+            let CompilerArguments::Ok(hasher) = parsed else {
+                panic!("expected incremental arguments to parse");
+            };
+            hasher
+        };
+        let hash = |hasher: &mut dyn CompilerHasher<Arc<Mutex<MockCommandCreator>>>| {
+            let creator = new_creator();
+            mock_dep_info(&creator, &["foo.rs"]);
+            mock_file_names(&creator, &["libfoo.rlib"]);
+            hasher
+                .generate_hash_key(
+                    &creator,
+                    cwd.to_owned(),
+                    vec![],
+                    false,
+                    runtime.handle(),
+                    false,
+                    Arc::new(MockStorage::new(None, false)),
+                    &[],
+                    CacheControl::Default,
+                    false,
+                )
+                .wait()
+                .unwrap()
+        };
+        let compile = |result: &HashResult<Arc<Mutex<MockCommandCreator>>>| {
+            let (local, dist, _) = result
+                .compilation
+                .generate_compile_commands(&mut dist::PathTransformer::new(), false)
+                .unwrap();
+            assert!(dist.is_none());
+            local
+        };
+        let emit = "--emit=dep-info,metadata,link";
+        let mut hasher = new_hasher(emit, RustIncremental::Cache, Plain);
+        assert!(
+            hasher
+                .cache_bypass_command(cwd, &[], &[])
+                .unwrap()
+                .is_none()
+        );
+        let first_build = hash(&mut *hasher);
+        let plain_arguments = compile(&first_build).get_arguments();
+        assert!(
+            plain_arguments
+                .iter()
+                .all(|arg| arg != "-C" && arg != "--codegen" && !arg.starts_with("incremental="))
+        );
+
+        let session = incremental_session(&cwd.join("inc"), &[]);
+        let mut rewritten = OsString::from("incremental=");
+        rewritten.push(session.path());
+        let legacy = hash(&mut *new_hasher(emit, RustIncremental::Cache, Incremental));
+        assert_eq!(first_build.key, legacy.key);
+        assert!(compile(&legacy).get_arguments().contains(&rewritten));
+
+        fixture.touch("out/libfoo.rmeta").unwrap();
+        let rebuild = hash(&mut *hasher);
+        assert_eq!(first_build.key, rebuild.key);
+        let rebuild = compile(&rebuild);
+        assert!(rebuild.get_arguments().contains(&rewritten));
+        assert!(rebuild.cache_store_veto().is_none());
+        fs::remove_file(cwd.join("out/libfoo.rmeta")).unwrap();
+
+        fs::create_dir_all(session.path().join("foo-id/s-finalized")).unwrap();
+        let (reason, bypass) = hasher.cache_bypass_command(cwd, &[], &[]).unwrap().unwrap();
+        assert_eq!(reason, "incremental session");
+        assert!(bypass.get_arguments().contains(&rewritten));
+
+        let mut no_bypass = new_hasher(emit, RustIncremental::CacheNoBypass, Plain);
+        assert!(
+            no_bypass
+                .cache_bypass_command(cwd, &[], &[])
+                .unwrap()
+                .is_none()
+        );
+        let warm = compile(&hash(&mut *no_bypass));
+        assert!(warm.get_arguments().contains(&rewritten));
+        assert_eq!(
+            warm.cache_store_veto(),
+            Some(CacheStoreVeto::RustIncrementalSession)
+        );
+        fs::remove_dir_all(session.path()).unwrap();
+
+        let mut link_only = new_hasher("--emit=link", RustIncremental::Cache, Plain);
+        assert!(
+            compile(&hash(&mut *link_only))
+                .get_arguments()
+                .contains(&rewritten)
+        );
+    }
+
     #[test_case(&["-C", "incremental=x"] ; "short separate")]
     #[test_case(&["-Cincremental=x"] ; "short joined")]
     #[test_case(&["--codegen", "incremental=x"] ; "long separate")]
@@ -5175,7 +5394,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![FAKE_DIGEST.to_owned()],
             dist_archive: None,
-            bypass_incremental: false,
+            incremental_settings: RustIncrementalSettings::default(),
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
@@ -5403,7 +5622,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
                 compiler_shlibs_digests: vec!["abcd1234".to_owned()],
                 dist_archive: None,
-                bypass_incremental: false,
+                incremental_settings: RustIncrementalSettings::default(),
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
                 parsed_args: ParsedArguments {
@@ -5496,7 +5715,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: Some("/toolchains/rust.tar.gz".into()),
-            bypass_incremental: false,
+            incremental_settings: RustIncrementalSettings::default(),
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
@@ -5715,7 +5934,7 @@ foo.rs:
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: None,
-            bypass_incremental: false,
+            incremental_settings: RustIncrementalSettings::default(),
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args,
@@ -5805,7 +6024,7 @@ foo.rs:
                 target_libdir: cwd.join("sysroot/lib/rustlib/fake-target/lib"),
                 compiler_shlibs_digests: vec![],
                 dist_archive: None,
-                bypass_incremental: false,
+                incremental_settings: RustIncrementalSettings::default(),
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
                 parsed_args,
