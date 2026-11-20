@@ -2689,18 +2689,19 @@ where
             None
         };
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
-        let os_string_arguments: Vec<(OsString, Option<OsString>)> = self
+        let arg_parts = |arg: &Argument<ArgData>| {
+            (
+                arg.to_os_string(),
+                arg.get_data().cloned().map(IntoArg::into_arg_os_string),
+            )
+        };
+        let os_string_arguments: Vec<_> = self
             .parsed_args
             .arguments
             .iter()
             // Preflight must never create a rustc incremental session.
             .filter(|arg| !is_incremental_argument(arg))
-            .map(|arg| {
-                (
-                    arg.to_os_string(),
-                    arg.get_data().cloned().map(IntoArg::into_arg_os_string),
-                )
-            })
+            .map(arg_parts)
             .collect();
         // `filtered_arguments` omits --emit and --out-dir arguments.
         // It's used for invoking rustc with `--emit=dep-info` to get the list of
@@ -2893,10 +2894,7 @@ where
             }
         }
         let remap_arguments = self.remap_arguments(&cwd, &env_vars, basedirs);
-        let remap_strings: Vec<_> = remap_arguments
-            .iter()
-            .flat_map(|arg| arg.iter_os_strings())
-            .collect();
+        let remap_parts: Vec<_> = remap_arguments.iter().map(arg_parts).collect();
         // 3. The full commandline (self.arguments)
         // TODO: there will be full paths here, it would be nice to
         // normalize them so we can get cross-machine cache hits.
@@ -2929,25 +2927,25 @@ where
             sortables.sort();
             rest.into_iter()
                 .chain(sortables)
-                .flat_map(|(arg, val)| iter::once(arg).chain(val.as_ref()))
-                .chain(&remap_strings)
-                .map(|arg| strip_basedirs_os(arg, basedirs))
+                .chain(&remap_parts)
+                .flat_map(|(arg, val)| {
+                    let arg = strip_basedirs_os(arg, basedirs);
+                    let val = val.as_deref().map(|val| strip_basedirs_os(val, basedirs));
+                    if let Some(manifest) = &mut manifest {
+                        manifest.add_argument(&arg, val.as_deref());
+                    }
+                    iter::once(arg).chain(val)
+                })
         };
         if linked_options.is_some() {
             let args: Vec<_> = args.collect();
             args.hash(&mut HashToDigest { digest: &mut m });
-            if let Some(manifest) = &mut manifest {
-                manifest.add("arguments", miss_explain::digest(&args));
-            }
         } else {
             let args = args.fold(OsString::new(), |mut joined, arg| {
                 joined.push(arg);
                 joined
             });
             args.hash(&mut HashToDigest { digest: &mut m });
-            if let Some(manifest) = &mut manifest {
-                manifest.add("arguments", miss_explain::digest(&args));
-            }
         }
         let incremental = self.incremental_session();
         if incremental.is_some() {
@@ -5873,7 +5871,10 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             [
                 "cache-version",
                 "compiler",
-                "arguments",
+                "arg:input",
+                "arg:input",
+                "arg:--cfg abc",
+                "arg:--cfg xyz",
                 "source:bar.rs",
                 "source:foo.rs",
                 "extern:renamed_bar",
@@ -5886,12 +5887,12 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 "compiler-version",
             ]
         );
-        assert_eq!(manifest.components[5].artifact.as_deref(), Some("bar.rlib"));
+        assert_eq!(manifest.components[8].artifact.as_deref(), Some("bar.rlib"));
         let m = Digest::new();
         let empty_digest = m.finish();
-        assert_eq!(manifest.components[3].digest, empty_digest);
-        assert_eq!(manifest.components[5].digest, empty_digest);
-        assert_eq!(manifest.components[6].digest, libbaz_a_digest);
+        assert_eq!(manifest.components[6].digest, empty_digest);
+        assert_eq!(manifest.components[8].digest, empty_digest);
+        assert_eq!(manifest.components[9].digest, libbaz_a_digest);
 
         let mut m = Digest::new();
         // Version.

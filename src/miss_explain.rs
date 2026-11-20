@@ -15,6 +15,7 @@ use crate::util::{Digest, HashToDigest};
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::hash::Hash;
 use std::io::{self, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -48,6 +49,26 @@ impl Manifest {
             digest,
             artifact: None,
         });
+    }
+
+    pub(crate) fn add_argument(&mut self, arg: &OsStr, value: Option<&OsStr>) {
+        let flag = arg.to_string_lossy();
+        let name = match (flag.as_ref(), value) {
+            ("--cfg", Some(cfg)) => format!("arg:--cfg {}", cfg.to_string_lossy()),
+            ("-C" | "--codegen" | "-Z", Some(option)) => {
+                let option = option.to_string_lossy();
+                let key = option
+                    .split_once('=')
+                    .map_or(option.as_ref(), |(key, _)| key);
+                format!("arg:{flag} {key}")
+            }
+            (flag, _) if flag.starts_with('-') => {
+                let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+                format!("arg:{name}")
+            }
+            _ => "arg:input".into(),
+        };
+        self.add(name, digest((arg, value)));
     }
 }
 
@@ -342,6 +363,53 @@ mod test {
                 ("env:VAR", Some("3"), Some("4")),
                 ("source:gone", Some("1"), None),
                 ("source:new", None, Some("5")),
+            ]
+        );
+    }
+
+    #[test]
+    fn diff_reports_changed_rust_flags() {
+        let args = |args: &[(&str, &str)]| {
+            let mut manifest = manifest(&[]);
+            for (flag, value) in args {
+                manifest.add_argument(OsStr::new(flag), Some(OsStr::new(value)));
+            }
+            manifest.components
+        };
+        let old = args(&[
+            ("--cfg", r#"feature="x""#),
+            ("--cfg", "unix"),
+            ("-C", "metadata=abcd"),
+            ("-C", "opt-level=2"),
+            ("--edition", "2024"),
+        ]);
+        let reordered = args(&[
+            ("--edition", "2024"),
+            ("-C", "opt-level=2"),
+            ("--cfg", "unix"),
+            ("-C", "metadata=abcd"),
+            ("--cfg", r#"feature="x""#),
+        ]);
+        assert!(differences(&old, &reordered).is_empty());
+
+        let new = args(&[
+            ("--edition", "2024"),
+            ("-C", "opt-level=3"),
+            ("--cfg", "unix"),
+            ("-C", "metadata=abcd"),
+            ("--cfg", r#"feature="y""#),
+        ]);
+        let diff = differences(&old, &new);
+        let changes: Vec<_> = diff
+            .iter()
+            .map(|item| (item.name, item.previous.is_some(), item.current.is_some()))
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                (r#"arg:--cfg feature="x""#, true, false),
+                (r#"arg:--cfg feature="y""#, false, true),
+                ("arg:-C opt-level", true, true),
             ]
         );
     }
