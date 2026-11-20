@@ -74,9 +74,9 @@ impl Storage for IpcStorage {
     async fn get(&self, key: &str) -> Result<Cache> {
         match self.get_path(key).await {
             GetPathResult::Found(path) => {
-                let file = std::fs::File::open(&path)
+                let file = fs_err::File::open(&path)
                     .with_context(|| format!("IpcStorage::get: open {}", path.display()))?;
-                match CacheRead::from(file) {
+                match CacheRead::from_file(file, self.write_raw_objects()) {
                     Ok(entry) => Ok(Cache::Hit(entry)),
                     Err(_) => Ok(Cache::Miss),
                 }
@@ -107,6 +107,10 @@ impl Storage for IpcStorage {
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         self.put_raw(key, entry.finish()?.into()).await
+    }
+
+    fn write_raw_objects(&self) -> bool {
+        self.handshake.write_raw_objects
     }
 
     async fn get_raw(&self, key: &str) -> Result<Option<Bytes>> {
@@ -210,5 +214,91 @@ impl Storage for IpcStorage {
                 bail!("IpcStorage::put_preprocessor_cache_entry: unexpected response: {other:?}")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cache::FileObjectSource;
+    use crate::protocol::{decode_request, encode_response};
+    use crate::util::write_length_prefixed_bytes;
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test_case::test_case(false; "legacy handshake")]
+    #[test_case::test_case(true; "raw handshake")]
+    fn ipc_packs_objects_in_daemon_format(raw: bool) {
+        fn read_request(mut stream: &TcpStream) -> Request {
+            let mut length = [0; 4];
+            stream.read_exact(&mut length).unwrap();
+            let mut frame = vec![0; u32::from_be_bytes(length) as usize];
+            stream.read_exact(&mut frame).unwrap();
+            decode_request(&frame).unwrap()
+        }
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let daemon = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            assert!(matches!(read_request(&stream), Request::StorageHandshake));
+            let mut frame = encode_response(&Response::StorageHandshake(StorageHandshakeInfo {
+                location: "cache".into(),
+                cache_type_name: "disk".into(),
+                basedirs: vec![],
+                preprocessor_cache_mode_config: Default::default(),
+                cache_mode: CacheMode::ReadWrite,
+                max_size: None,
+                rust_incremental: Default::default(),
+                miss_explain: false,
+                incremental_prune_days: 7,
+                write_raw_objects: true,
+            }))
+            .unwrap();
+            if !raw {
+                frame.pop();
+            }
+            write_length_prefixed_bytes(&stream, &frame).unwrap();
+            let Request::StoragePutRaw { data, .. } = read_request(&stream) else {
+                panic!("expected a cache put");
+            };
+            let zip = zip::ZipArchive::new(Cursor::new(&data)).unwrap();
+            let member = if raw { "raw/object" } else { "object" };
+            assert!(zip.index_for_name(member).is_some());
+            assert_eq!(zip.len(), 1);
+            let mut entry = CacheRead::from(Cursor::new(data)).unwrap();
+            let mut bytes = Vec::new();
+            entry.get_object("object", &mut bytes).unwrap();
+            assert_eq!(bytes, b"compiler output");
+            let response = encode_response(&Response::StoragePutRaw(Ok(()))).unwrap();
+            write_length_prefixed_bytes(&stream, &response).unwrap();
+        });
+        let mut conn = ServerConnection::new(Box::new(stream)).unwrap();
+        let Response::StorageHandshake(handshake) =
+            conn.request(Request::StorageHandshake).unwrap()
+        else {
+            panic!("expected a storage handshake");
+        };
+        let storage = IpcStorage::new(conn, handshake);
+        let output = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(output.path(), b"compiler output").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let entry = CacheWrite::from_objects(
+                [FileObjectSource {
+                    key: "object".into(),
+                    path: output.path().into(),
+                    optional: false,
+                }],
+                runtime.handle(),
+                storage.write_raw_objects(),
+            )
+            .await
+            .unwrap();
+            storage.put("01", entry).await.unwrap();
+        });
+        daemon.join().unwrap();
     }
 }

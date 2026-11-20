@@ -94,6 +94,13 @@ impl std::fmt::Display for DecompressionFailure {
 impl std::error::Error for DecompressionFailure {}
 
 impl CacheRead {
+    pub(super) fn has_raw_objects(&self) -> bool {
+        self.zip
+            .file_names()
+            .flatten()
+            .any(|name| name.starts_with("raw/"))
+    }
+
     /// Create a cache entry from `reader`.
     pub fn from<R>(reader: R) -> Result<CacheRead>
     where

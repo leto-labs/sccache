@@ -106,7 +106,8 @@ The compile pipeline runs **in the CLI process itself**; the daemon is used only
 as a shared gateway to the storage backend (and as a place to aggregate stats).
 
 On startup the CLI performs a one-shot `StorageHandshake` to fetch the cache
-metadata (cache mode, max size, basedirs, preprocessor-cache config). It then
+metadata (cache mode, max size, basedirs, preprocessor-cache config, and
+whether to write aligned raw objects). It then
 runs the same pipeline locally — including direct mode — and forwards each
 individual cache operation to the daemon over IPC. On the client side this is
 implemented by `IpcStorage`, which implements the same `Storage` trait as every
