@@ -22,7 +22,7 @@ use crate::compiler::{
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
-use crate::config::{Config, RustIncremental};
+use crate::config::{Config, RustIncremental, default_incremental_prune_days};
 use crate::dist;
 use crate::jobserver::Client;
 pub use crate::miss_explain::MissExplainStats;
@@ -577,7 +577,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     dist_client,
                     storage,
                     cache_mode,
-                    config.rust_incremental,
+                    config,
                 )
                 .with_miss_explain(miss_explain);
                 Ok((
@@ -599,7 +599,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     dist_client,
                     storage,
                     cache_mode,
-                    config.rust_incremental,
+                    config,
                 )
                 .with_miss_explain(miss_explain);
                 Ok((
@@ -624,7 +624,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     dist_client,
                     storage,
                     cache_mode,
-                    config.rust_incremental,
+                    config,
                 )
                 .with_miss_explain(miss_explain);
                 Ok((
@@ -693,7 +693,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             dist_client,
             storage,
             cache_mode,
-            RustIncremental::Off,
+            &Config::default(),
         ))
     }
 }
@@ -706,7 +706,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
         cache_mode: CacheMode,
-        rust_incremental: RustIncremental,
+        config: &Config,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
@@ -715,7 +715,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let pool = runtime.handle().clone();
         let mut service =
             SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info)
-                .with_rust_incremental(rust_incremental);
+                .with_rust_incremental(config.rust_incremental, config.incremental_prune_days());
         service.background_cache_writes = true;
 
         SccacheServer {
@@ -929,6 +929,7 @@ where
 
     rust_incremental: RustIncremental,
     pub(crate) miss_explain: Option<Arc<MissExplain>>,
+    pub(crate) incremental_prune_days: u64,
 
     /// A cache of known compiler info.
     compilers: Arc<RwLock<CompilerMap<C>>>,
@@ -1054,6 +1055,7 @@ where
                         cache_mode: me.effective_cache_mode,
                         rust_incremental: me.rust_incremental,
                         miss_explain: me.miss_explain.is_some(),
+                        incremental_prune_days: me.incremental_prune_days,
                         max_size: me.storage.max_size().await.unwrap_or(None),
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
@@ -1157,6 +1159,7 @@ where
             effective_cache_mode,
             rust_incremental: RustIncremental::Off,
             miss_explain: None,
+            incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1167,8 +1170,9 @@ where
         }
     }
 
-    pub(crate) fn with_rust_incremental(mut self, mode: RustIncremental) -> Self {
+    pub(crate) fn with_rust_incremental(mut self, mode: RustIncremental, prune_days: u64) -> Self {
         self.rust_incremental = mode;
+        self.incremental_prune_days = prune_days;
         self
     }
 
@@ -1189,6 +1193,7 @@ where
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncremental::Off,
             miss_explain: None,
+            incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1230,6 +1235,7 @@ where
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncremental::Off,
             miss_explain: None,
+            incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt: rt.clone(),

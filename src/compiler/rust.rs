@@ -1681,9 +1681,13 @@ impl<T: CommandCreatorSync> CompileCommand<T> for RustCompileCommand {
         service: &crate::server::SccacheService<T>,
         creator: &T,
     ) -> Result<process::Output> {
+        if let Some(session) = &self.incremental {
+            session.refresh_mtime();
+        }
         let result = self.inner.execute(service, creator).await;
         if let Some(session) = &self.incremental {
             session.refresh_mtime();
+            session.prune(service.incremental_prune_days);
         }
         result
     }

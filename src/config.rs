@@ -819,6 +819,10 @@ impl RustIncremental {
     }
 }
 
+pub(crate) const fn default_incremental_prune_days() -> u64 {
+    7
+}
+
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -831,6 +835,7 @@ pub struct FileConfig {
     pub basedirs: Vec<String>,
     pub client_side_mode: bool,
     pub rust_incremental: RustIncremental,
+    pub incremental_prune_days: Option<u64>,
 }
 
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
@@ -873,6 +878,7 @@ pub struct EnvConfig {
     dist_cache_dir: Option<PathBuf>,
     client_side_mode: Option<bool>,
     rust_incremental: Option<RustIncremental>,
+    incremental_prune_days: Option<u64>,
 }
 
 fn string_from_env_var(env_var_name: &str) -> Option<String> {
@@ -1331,8 +1337,19 @@ fn config_from_env() -> Result<EnvConfig> {
         Err(err) => return Err(err).context("Invalid SCCACHE_RUST_INCREMENTAL"),
     };
 
+    let incremental_prune_days = match env::var("SCCACHE_INCREMENTAL_PRUNE_DAYS") {
+        Ok(value) => Some(
+            value
+                .parse()
+                .context("Invalid SCCACHE_INCREMENTAL_PRUNE_DAYS")?,
+        ),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => return Err(err).context("Invalid SCCACHE_INCREMENTAL_PRUNE_DAYS"),
+    };
+
     Ok(EnvConfig {
         rust_incremental,
+        incremental_prune_days,
         cache,
         disk_reflink,
         basedirs,
@@ -1436,6 +1453,7 @@ pub struct Config {
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
     pub rust_incremental: RustIncremental,
+    pub incremental_prune_days: Option<u64>,
 }
 
 impl Config {
@@ -1453,6 +1471,11 @@ impl Config {
         Ok(config)
     }
 
+    pub(crate) fn incremental_prune_days(&self) -> u64 {
+        self.incremental_prune_days
+            .unwrap_or_else(default_incremental_prune_days)
+    }
+
     fn from_env_and_file_configs(env_conf: EnvConfig, file_conf: FileConfig) -> Result<Self> {
         let mut conf_caches: CacheConfigs = Default::default();
 
@@ -1463,6 +1486,7 @@ impl Config {
             basedirs: file_basedirs,
             client_side_mode: file_client_side_mode,
             rust_incremental: file_rust_incremental,
+            incremental_prune_days: file_incremental_prune_days,
         } = file_conf;
         conf_caches.merge(cache);
 
@@ -1476,6 +1500,7 @@ impl Config {
             dist_cache_dir: env_dist_cache_dir,
             client_side_mode: env_client_side_mode,
             rust_incremental: env_rust_incremental,
+            incremental_prune_days: env_incremental_prune_days,
         } = env_conf;
         let file_reflink = conf_caches.disk.as_ref().map(|disk| disk.reflink);
         conf_caches.merge(cache);
@@ -1529,6 +1554,7 @@ impl Config {
             basedirs,
             client_side_mode,
             rust_incremental: env_rust_incremental.unwrap_or(file_rust_incremental),
+            incremental_prune_days: env_incremental_prune_days.or(file_incremental_prune_days),
         })
     }
 }
@@ -1983,6 +2009,7 @@ fn config_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2014,6 +2041,7 @@ fn config_overrides() {
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     assert_eq!(
@@ -2074,6 +2102,7 @@ fn config_overrides() {
             basedirs: vec![],
             client_side_mode: false,
             rust_incremental: Default::default(),
+            incremental_prune_days: None,
         }
     );
 }
@@ -2089,6 +2118,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2098,6 +2128,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2111,6 +2142,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2120,6 +2152,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2133,6 +2166,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2142,6 +2176,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2155,6 +2190,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2164,6 +2200,7 @@ fn config_basedirs_overrides() {
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2181,6 +2218,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2190,6 +2228,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2203,6 +2242,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2212,6 +2252,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2225,6 +2266,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2234,6 +2276,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2247,6 +2290,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2256,6 +2300,7 @@ fn config_basedirs_overrides() {
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2267,6 +2312,7 @@ fn config_basedirs_overrides() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -2276,6 +2322,7 @@ fn config_basedirs_overrides() {
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2309,6 +2356,26 @@ fn test_rust_incremental_config() {
         );
     }
     temp_env::with_var(VAR, Some("invalid"), || assert!(config_from_env().is_err()));
+}
+
+#[test]
+#[serial]
+fn test_incremental_prune_days_config() {
+    const VAR: &str = "SCCACHE_INCREMENTAL_PRUNE_DAYS";
+    let config = |value, file| {
+        let env = temp_env::with_var(VAR, value, || config_from_env().unwrap());
+        Config::from_env_and_file_configs(env, toml::from_str(file).unwrap()).unwrap()
+    };
+    assert_eq!(config(None, "").incremental_prune_days(), 7);
+    assert_eq!(
+        config(None, "incremental_prune_days = 3").incremental_prune_days(),
+        3
+    );
+    assert_eq!(
+        config(Some("0"), "incremental_prune_days = 3").incremental_prune_days(),
+        0
+    );
+    assert!(temp_env::with_var(VAR, Some("-1"), config_from_env).is_err());
 }
 
 #[test]
@@ -2499,6 +2566,7 @@ fn test_env_basedirs_with_spaces() {
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2530,6 +2598,7 @@ fn test_env_basedirs_with_spaces() {
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -3232,6 +3301,7 @@ key_prefix = "cosprefix"
             basedirs: vec![],
             client_side_mode: false,
             rust_incremental: Default::default(),
+            incremental_prune_days: None,
         }
     );
 }
@@ -3327,6 +3397,7 @@ size = "7g"
             basedirs: vec![],
             client_side_mode: false,
             rust_incremental: Default::default(),
+            incremental_prune_days: None,
         }
     );
 }
@@ -3374,6 +3445,7 @@ fn test_integration_config_normalizes_and_strips() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3383,6 +3455,7 @@ fn test_integration_config_normalizes_and_strips() {
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3413,6 +3486,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3422,6 +3496,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         basedirs: vec!["/home//user///project/".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3448,6 +3523,7 @@ fn test_integration_windows_path_normalization() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3457,6 +3533,7 @@ fn test_integration_windows_path_normalization() {
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3484,6 +3561,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3493,6 +3571,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3520,6 +3599,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3529,6 +3609,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3555,6 +3636,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3564,6 +3646,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3595,6 +3678,7 @@ fn test_integration_paths_with_dots_normalized() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3604,6 +3688,7 @@ fn test_integration_paths_with_dots_normalized() {
         basedirs: vec!["/home/user/./project/../project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3631,6 +3716,7 @@ fn test_integration_windows_mixed_slashes() {
         dist_cache_dir: None,
         client_side_mode: None,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let file_conf = FileConfig {
@@ -3640,6 +3726,7 @@ fn test_integration_windows_mixed_slashes() {
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();

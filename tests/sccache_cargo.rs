@@ -871,6 +871,37 @@ fn private_incremental_dirs(checkout: &Path, name: &str) -> Result<Vec<PathBuf>>
         .collect())
 }
 
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_prunes_old_session_after_lockfile_change() -> Result<()> {
+    let (test, [a, ..]) = incremental_checkouts("cache-no-bypass", false)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    let before = fs::read(a.join("Cargo.lock"))?;
+    let dirs = private_incremental_dirs(&a, "la")?;
+    assert_eq!(dirs.len(), 1);
+    let stale = &dirs[0];
+    let old = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    for entry in walkdir::WalkDir::new(stale) {
+        filetime::set_file_mtime(entry?.path(), old)?;
+    }
+    filetime::set_file_mtime(stale.with_file_name("la-sccache-prune"), old)?;
+
+    let manifest = a.join("la/Cargo.toml");
+    let updated = fs::read_to_string(&manifest)?.replace("0.1.0", "0.2.0");
+    fs::write(&manifest, updated)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    assert_ne!(before, fs::read(a.join("Cargo.lock"))?);
+    assert!(!stale.exists());
+    let dirs = private_incremental_dirs(&a, "la")?;
+    assert_eq!(dirs.len(), 1);
+    assert_ne!(&dirs[0], stale);
+    run_incremental_bin(&a, 10)
+}
+
 fn assert_no_working_sessions(checkout: &Path, crates: &[&str]) -> Result<()> {
     for name in crates {
         for folder in incremental_crate_dirs(checkout, name)? {
@@ -1060,6 +1091,12 @@ fn test_rust_cargo_incremental_client_bypass_sends_no_request(client_side: bool)
     let private = private_incremental_dirs(&a, "mylib")?;
     run_incremental_bin(&a, 10)?;
 
+    let stale = private[0].with_file_name("mylib-01abc3ef4567z");
+    fs::create_dir(&stale)?;
+    let old_mtime = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(&stale, old_mtime)?;
+    filetime::set_file_mtime(stale.with_file_name("mylib-sccache-prune"), old_mtime)?;
+
     zero_incremental_stats()?;
     edit_mylib(&a, 1)?;
     build().assert().try_success()?;
@@ -1072,6 +1109,7 @@ fn test_rust_cargo_incremental_client_bypass_sends_no_request(client_side: bool)
     assert_eq!(stats["requests_executed"], 0);
     assert_eq!(stats["cache_writes"], 0);
     assert!(stats["not_cached"]["incremental session"].is_null());
+    assert!(!stale.exists());
     assert_eq!(private_incremental_dirs(&a, "mylib")?, private);
     assert_ne!(incremental_sessions(&a, "mylib")?, old);
     run_incremental_bin(&a, 11)
