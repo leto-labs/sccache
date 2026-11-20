@@ -12,7 +12,11 @@ Set `reflink = true` under `[cache.disk]` or set `SCCACHE_DISK_REFLINK=true` bef
 
 With reflinks enabled, new entries store objects as aligned, uncompressed ZIP members. A hit can share the aligned part of the object with the cache when both files are on a filesystem that supports reflinks, such as btrfs. Any remaining bytes are copied. If cloning fails, sccache copies the object. Existing compressed entries remain usable. Client-side compilation can read raw members by copying them and still writes compressed entries.
 
-The disk cache limit counts apparent file size, so uncompressed objects count for more against the limit even on a filesystem with compression enabled. Older sccache versions treat hits on uncompressed entries as misses. Remove `reflink` from the TOML configuration before starting an older version.
+The disk cache limit uses each entry's expected on-disk size. On btrfs with 4 KiB sectors and a `zstd` compression property such as `zstd:1` on the cache directory, sccache estimates the size of raw entries in the background using zstd level 1 on 128 KiB chunks. It saves the estimate in the entry's `user.sccache.weight` extended attribute and reads it when loading the cache index. Other filesystems, existing entries without an estimate, and entries whose extended attributes cannot be read or written count at file length. Set the compression property before starting sccache. The estimate can differ from actual btrfs allocation.
+
+Eviction removes the cache's reference to shared extents. Reflinked worktree outputs remain intact through copy-on-write, and the filesystem frees those extents only when their last reference is gone.
+
+Older sccache versions treat hits on uncompressed entries as misses. Remove `reflink` from the TOML configuration before starting an older version.
 
 ## Preprocessor cache mode
 

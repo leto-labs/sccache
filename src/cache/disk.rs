@@ -58,6 +58,7 @@ impl DiskCache {
             lru: Arc::new(Mutex::new(LazyDiskCache::Uninit {
                 root: root.as_ref().to_os_string(),
                 max_size,
+                use_weights: None,
             })),
             pool: pool.clone(),
             preprocessor_cache_mode_config,
@@ -66,6 +67,7 @@ impl DiskCache {
                     .join("preprocessor")
                     .into_os_string(),
                 max_size,
+                use_weights: Some(false),
             })),
             rw_mode,
             basedirs,
@@ -87,6 +89,58 @@ impl DiskCache {
         }
         self
     }
+
+    async fn store(&self, key: &str, data: Bytes, has_raw_objects: bool) -> Result<Duration> {
+        if self.rw_mode == CacheMode::ReadOnly {
+            return Err(anyhow!("Cannot write to a read-only cache"));
+        }
+
+        let lru = self.lru.clone();
+        let key = make_key_path(key);
+        self.pool
+            .spawn_blocking(move || {
+                let start = Instant::now();
+                let weight = if has_raw_objects && lru.lock().unwrap().get_or_init()?.uses_weights()
+                {
+                    estimate_weight(&data).ok()
+                } else {
+                    None
+                };
+                let mut entry = lru
+                    .lock()
+                    .unwrap()
+                    .get_or_init()?
+                    .prepare_add(key, weight.unwrap_or(data.len() as u64))?;
+                let written = entry.as_file_mut().write_all(&data);
+                let mut lru = lru.lock().unwrap();
+                let lru = lru.get().unwrap();
+                if let Err(error) = written {
+                    lru.cancel_add(entry);
+                    return Err(error.into());
+                }
+                lru.commit_weighted(entry, weight)?;
+                Ok(start.elapsed())
+            })
+            .await?
+    }
+}
+
+fn estimate_weight(data: &[u8]) -> io::Result<u64> {
+    const EXTENT: usize = 128 * 1024;
+    const SECTOR: usize = 4096;
+
+    let mut zstd = zstd::bulk::Compressor::new(1)?;
+    let mut compressed = Vec::with_capacity(zstd::zstd_safe::compress_bound(EXTENT));
+    let mut weight = 0;
+    // Chunk the ZIP from offset zero so its headers and raw data share the same
+    // boundaries as they do in the file being compressed by btrfs.
+    for chunk in data.chunks(EXTENT) {
+        let len = zstd.compress_to_buffer(chunk, &mut compressed)?;
+        weight += len
+            .next_multiple_of(SECTOR)
+            .min(chunk.len().next_multiple_of(SECTOR));
+    }
+    Ok(weight as u64)
 }
 
 #[cfg(target_os = "linux")]
@@ -226,9 +280,9 @@ impl CacheStorage for DiskCache {
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         trace!("DiskCache::put({})", key);
-        // Delegate to put_raw after serializing the entry
+        let has_raw_objects = entry.has_raw_objects();
         let data = entry.finish()?;
-        self.put_raw(key, data.into()).await
+        self.store(key, data.into(), has_raw_objects).await
     }
 
     fn write_raw_objects(&self) -> bool {
@@ -237,30 +291,11 @@ impl CacheStorage for DiskCache {
 
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
         trace!("DiskCache::put_raw({}, {} bytes)", key, data.len());
-
-        if self.rw_mode == CacheMode::ReadOnly {
-            return Err(anyhow!("Cannot write to a read-only cache"));
-        }
-
-        let lru = self.lru.clone();
-        let key = make_key_path(key);
-
-        self.pool
-            .spawn_blocking(move || {
-                let start = Instant::now();
-                let mut f = lru
-                    .lock()
-                    .unwrap()
-                    .get_or_init()?
-                    .prepare_add(key, data.len() as u64)?;
-                f.as_file_mut().write_all(&data)?;
-                lru.lock().unwrap().get().unwrap().commit(f)?;
-                Ok(start.elapsed())
-            })
-            .await?
+        self.store(key, data, false).await
     }
 
     async fn check(&self) -> Result<CacheMode> {
+        self.lru.lock().unwrap().detect_weights();
         Ok(self.rw_mode)
     }
 
@@ -315,14 +350,14 @@ impl PreprocessorCacheStorage for DiskCache {
             .unwrap()
             .get_or_init()?
             .prepare_add(key, 0)?;
-        preprocessor_cache_entry.serialize_to(BufWriter::new(f.as_file_mut()))?;
-        Ok(self
-            .preprocessor_cache
-            .lock()
-            .unwrap()
-            .get()
-            .unwrap()
-            .commit(f)?)
+        let written = preprocessor_cache_entry.serialize_to(BufWriter::new(f.as_file_mut()));
+        let mut lru = self.preprocessor_cache.lock().unwrap();
+        let lru = lru.get().unwrap();
+        if let Err(error) = written {
+            lru.cancel_add(f);
+            return Err(error.into());
+        }
+        Ok(lru.commit(f)?)
     }
 }
 
@@ -348,6 +383,23 @@ mod tests {
 
         assert_eq!(disk.cache_type_name(), "disk");
         assert!(!disk.write_raw_objects());
+    }
+
+    #[test]
+    fn raw_weight_estimate_counts_incompressible_extents_at_full_length() {
+        use rand::{RngCore, SeedableRng};
+
+        let mut bytes = vec![0; 1024 * 1024];
+        rand::rngs::StdRng::seed_from_u64(7).fill_bytes(&mut bytes);
+        assert_eq!(estimate_weight(&bytes).unwrap(), bytes.len() as u64);
+    }
+
+    #[test]
+    fn raw_weight_estimate_rounds_zero_extents_to_one_sector_each() {
+        assert_eq!(
+            estimate_weight(&vec![0; 1024 * 1024 + 1]).unwrap(),
+            9 * 4096
+        );
     }
 
     const KEY: &str = "0123456789abcdef";

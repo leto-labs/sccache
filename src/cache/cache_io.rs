@@ -394,6 +394,7 @@ pub(crate) struct OpenCacheObject {
 /// Data to be stored in the compiler cache.
 pub struct CacheWrite {
     zip: ZipWriter<Cursor<Vec<u8>>>,
+    has_raw_objects: bool,
 }
 
 impl CacheWrite {
@@ -401,6 +402,7 @@ impl CacheWrite {
     pub fn new() -> CacheWrite {
         CacheWrite {
             zip: ZipWriter::new(Cursor::new(vec![])),
+            has_raw_objects: false,
         }
     }
 
@@ -500,7 +502,12 @@ impl CacheWrite {
             )
             .context("Failed to start cache entry object")?;
         io::copy(from, &mut self.zip)?;
+        self.has_raw_objects = true;
         Ok(())
+    }
+
+    pub(super) fn has_raw_objects(&self) -> bool {
+        self.has_raw_objects
     }
 
     fn object_options(mode: Option<u32>) -> SimpleFileOptions {
@@ -532,8 +539,10 @@ impl CacheWrite {
 
     /// Finish writing data to the cache entry writer, and return the data.
     pub fn finish(self) -> Result<Vec<u8>> {
-        let CacheWrite { zip } = self;
-        let cur = zip.finish().context("Failed to finish cache entry zip")?;
+        let cur = self
+            .zip
+            .finish()
+            .context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
     }
 }
@@ -740,6 +749,97 @@ mod tests {
             }
         }
         eprintln!("verified FIEMAP_EXTENT_SHARED and output bytes for {RAW_SIZES:?}");
+    }
+
+    #[test]
+    fn raw_cache_entry_without_compression_counts_full_length() {
+        use crate::cache::{CacheStorage, disk::DiskCache};
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let cache = DiskCache::new(
+            dir.path(),
+            10 * 1024 * 1024,
+            runtime.handle(),
+            Default::default(),
+            CacheMode::ReadWrite,
+            vec![],
+        );
+        let size = 1024 * 1024;
+        let length = raw_entry(&[size]).finish().unwrap().len() as u64;
+        runtime.block_on(async {
+            cache.check().await.unwrap();
+            cache
+                .put("0123456789abcdef", raw_entry(&[size]))
+                .await
+                .unwrap();
+            assert_eq!(cache.current_size().await.unwrap(), Some(length));
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cache_entry_btrfs_weighted_eviction_keeps_reflink_output() {
+        use crate::cache::{CacheStorage, disk::DiskCache};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        fs::create_dir(&root).unwrap();
+        if !crate::lru_disk_cache::test_btrfs_zstd(&root) {
+            return;
+        }
+        if let Err(error) = super::super::disk::probe_reflink(&root) {
+            eprintln!("skipping reflink eviction check: FICLONE failed: {error}");
+            return;
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let capacity = 64 * 1024;
+        let cache = DiskCache::new(
+            &root,
+            capacity,
+            runtime.handle(),
+            Default::default(),
+            CacheMode::ReadWrite,
+            vec![],
+        )
+        .with_reflink(true);
+        let size = 1024 * 1024 + 7;
+        let (object, payload) = raw_member(size);
+        let output = dir.path().join("object");
+        let key = "0123456789abcdef";
+        runtime.block_on(async {
+            cache.check().await.unwrap();
+            cache.put(key, raw_entry(&[size])).await.unwrap();
+            let Cache::Hit(entry) = cache.get(key).await.unwrap() else {
+                panic!("expected disk cache hit");
+            };
+            entry
+                .extract_objects(
+                    [FileObjectSource {
+                        key: object,
+                        path: output.clone(),
+                        optional: false,
+                    }],
+                    runtime.handle(),
+                )
+                .await
+                .unwrap();
+            assert_shared_extents(&File::open(&output).unwrap(), 1024 * 1024);
+            cache
+                .put("1123456789abcdef", raw_entry(&[size]))
+                .await
+                .unwrap();
+            assert!(matches!(cache.get(key).await.unwrap(), Cache::Miss));
+            assert!(!root.join("0/1").join(key).exists());
+            assert_eq!(fs::read(&output).unwrap(), payload);
+        });
+        eprintln!(
+            "verified shared extents before eviction and {size} intact output bytes after eviction"
+        );
     }
 
     #[cfg(target_os = "linux")]

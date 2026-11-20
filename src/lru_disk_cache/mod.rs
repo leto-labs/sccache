@@ -1,4 +1,7 @@
 pub mod lru_cache;
+mod weight;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use weight::test_btrfs_zstd;
 
 use fs::File;
 use fs_err as fs;
@@ -14,6 +17,7 @@ use std::io::prelude::*;
 use std::path::{Path, PathBuf};
 
 use filetime::{FileTime, set_file_times};
+use lru_cache::CountableMeterWithMeasure;
 pub use lru_cache::{LruCache, Meter};
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
@@ -57,16 +61,29 @@ fn write_cache_dir_tag<P: AsRef<Path>>(root: P) {
     }
 }
 
-struct FileSize;
+struct FileWeight;
 
-/// Given a tuple of (path, filesize), use the filesize for measurement.
-impl<K> Meter<K, u64> for FileSize {
-    type Measure = usize;
-    fn measure<Q: ?Sized>(&self, _: &Q, v: &u64) -> usize
+impl<K> Meter<K, u64> for FileWeight {
+    type Measure = u64;
+    fn measure<Q: ?Sized>(&self, _: &Q, v: &u64) -> u64
     where
         K: Borrow<Q>,
     {
-        *v as usize
+        *v
+    }
+}
+
+impl<K> CountableMeterWithMeasure<K, u64, u64> for FileWeight {
+    fn meter_add(&self, current: u64, amount: u64) -> u64 {
+        current + amount
+    }
+
+    fn meter_sub(&self, current: u64, amount: u64) -> u64 {
+        current - amount
+    }
+
+    fn meter_size(&self, current: u64) -> Option<u64> {
+        Some(current)
     }
 }
 
@@ -103,10 +120,10 @@ fn get_all_files<P: AsRef<Path>>(path: P) -> Box<dyn Iterator<Item = (PathBuf, u
 
 /// An LRU cache of files on disk.
 pub struct LruDiskCache<S: BuildHasher = RandomState> {
-    lru: LruCache<OsString, u64, S, FileSize>,
+    lru: LruCache<OsString, u64, S, FileWeight>,
     root: PathBuf,
-    pending: Vec<OsString>,
-    pending_size: u64,
+    use_weights: bool,
+    pending_weight: u64,
 }
 
 /// Errors returned by this crate.
@@ -162,7 +179,7 @@ enum AddFile<'a> {
 pub struct LruDiskCacheAddEntry {
     file: NamedTempFile,
     key: OsString,
-    size: u64,
+    reserved_weight: u64,
 }
 
 impl LruDiskCacheAddEntry {
@@ -184,18 +201,31 @@ impl LruDiskCache {
     where
         PathBuf: From<T>,
     {
+        Self::open(PathBuf::from(path), size, false)
+    }
+
+    pub(crate) fn supports_weights(root: &Path) -> bool {
+        weight::detect(root)
+    }
+
+    pub(crate) fn open(root: PathBuf, size: u64, use_weights: bool) -> Result<Self> {
+        fs::create_dir_all(&root)?;
         LruDiskCache {
-            lru: LruCache::with_meter(size, FileSize),
-            root: PathBuf::from(path),
-            pending: vec![],
-            pending_size: 0,
+            lru: LruCache::with_meter(size, FileWeight),
+            use_weights,
+            root,
+            pending_weight: 0,
         }
         .init()
     }
 
-    /// Return the current size of all the files in the cache.
+    pub(crate) fn uses_weights(&self) -> bool {
+        self.use_weights
+    }
+
+    /// Return the total weight of cached and pending files.
     pub fn size(&self) -> u64 {
-        self.lru.size() + self.pending_size
+        self.lru.size() + self.pending_weight
     }
 
     /// Return the count of entries in the cache.
@@ -224,9 +254,8 @@ impl LruDiskCache {
 
     /// Scan `self.root` for existing files and store them.
     fn init(mut self) -> Result<Self> {
-        fs::create_dir_all(&self.root)?;
         write_cache_dir_tag(&self.root);
-        for (file, size) in get_all_files(&self.root) {
+        for (file, length) in get_all_files(&self.root) {
             if file
                 .file_name()
                 .expect("Bad path?")
@@ -235,11 +264,18 @@ impl LruDiskCache {
                 fs::remove_file(&file).unwrap_or_else(|e| {
                     error!("Error removing temporary file `{}`: {}", file.display(), e);
                 });
+                continue;
             } else if file.file_name().expect("Bad path?") == CACHEDIR_TAG_FILE_NAME {
                 // Not a cache entry: eviction would delete it, and the size
                 // limit would too.
                 continue;
-            } else if !self.can_store(size) {
+            }
+            let size = if self.use_weights {
+                weight::read(&file, length)
+            } else {
+                length
+            };
+            if !self.can_store(size) {
                 fs::remove_file(file).unwrap_or_else(|e| {
                     error!(
                         "Error removing file `{}` which is too large for the cache ({} bytes)",
@@ -260,11 +296,11 @@ impl LruDiskCache {
     }
 
     fn make_space(&mut self, size: u64) -> Result<()> {
-        if !self.can_store(size) {
+        if size > self.capacity() - self.pending_weight {
             return Err(Error::FileTooLarge);
         }
         //TODO: ideally LRUCache::insert would give us back the entries it had to remove.
-        while self.size() + size > self.capacity() {
+        while size > self.capacity() - self.size() {
             let (rel_path, _) = self.lru.remove_lru().expect("Unexpectedly empty cache!");
             let remove_path = self.rel_to_abs_path(rel_path);
             //TODO: check that files are removable during `init`, so that this is only
@@ -372,42 +408,56 @@ impl LruDiskCache {
     pub fn prepare_add<'a, K: AsRef<OsStr> + 'a>(
         &mut self,
         key: K,
-        size: u64,
+        reserved_weight: u64,
     ) -> Result<LruDiskCacheAddEntry> {
-        // Ensure we have enough space for the advertized space.
-        self.make_space(size)?;
-        let key = key.as_ref().to_owned();
-        self.pending.push(key.clone());
-        self.pending_size += size;
-        tempfile::Builder::new()
+        let file = tempfile::Builder::new()
             .prefix(TEMPFILE_PREFIX)
-            .tempfile_in(&self.root)
-            .map(|file| LruDiskCacheAddEntry { file, key, size })
-            .map_err(Into::into)
+            .tempfile_in(&self.root)?;
+        self.make_space(reserved_weight)?;
+        self.pending_weight += reserved_weight;
+        Ok(LruDiskCacheAddEntry {
+            file,
+            key: key.as_ref().to_owned(),
+            reserved_weight,
+        })
+    }
+
+    pub(crate) fn cancel_add(&mut self, entry: LruDiskCacheAddEntry) {
+        self.pending_weight -= entry.reserved_weight;
     }
 
     /// Commit an entry coming from `LruDiskCache::prepare_add`.
     pub fn commit(&mut self, entry: LruDiskCacheAddEntry) -> Result<()> {
+        self.commit_weighted(entry, None)
+    }
+
+    pub(crate) fn commit_weighted(
+        &mut self,
+        entry: LruDiskCacheAddEntry,
+        estimated_weight: Option<u64>,
+    ) -> Result<()> {
         let LruDiskCacheAddEntry {
             mut file,
             key,
-            size,
+            reserved_weight,
         } = entry;
+        self.pending_weight -= reserved_weight;
         file.flush()?;
-        let real_size = file.as_file().metadata()?.len();
-        // If the file is larger than the size that had been advertized, ensure
-        // we have enough space for it.
-        self.make_space(real_size.saturating_sub(size))?;
-        self.pending
-            .iter()
-            .position(|k| k == &key)
-            .map(|i| self.pending.remove(i))
-            .unwrap();
-        self.pending_size -= size;
+        let length = file.as_file().metadata()?.len();
+        let weight = estimated_weight
+            .filter(|&weight| self.use_weights && weight > 0 && weight < length)
+            .filter(|&weight| weight::write(file.as_file(), weight))
+            .unwrap_or(length);
+        if weight > self.capacity() - self.pending_weight {
+            return Err(Error::FileTooLarge);
+        }
+        // A concurrent writer may already have committed the same key.
+        let replaced_weight = self.lru.get(&key).copied().unwrap_or(0);
+        self.make_space(weight.saturating_sub(replaced_weight))?;
         let path = self.rel_to_abs_path(&key);
         fs::create_dir_all(path.parent().unwrap())?;
         file.persist(path).map_err(|e| e.error)?;
-        self.lru.insert(key, real_size);
+        self.lru.insert(key, weight);
         Ok(())
     }
 
@@ -566,6 +616,48 @@ mod tests {
         let c = LruDiskCache::new(f.tmp(), 20).unwrap();
         assert_eq!(c.size(), 20);
         assert_eq!(c.len(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn btrfs_weighted_cache_evicts_by_weight() {
+        let fixture = TestFixture::new();
+        if !super::test_btrfs_zstd(fixture.tmp()) {
+            return;
+        }
+        let mut cache = LruDiskCache::open(fixture.tmp().to_owned(), 8192, true).unwrap();
+        assert!(cache.uses_weights());
+        for key in ["old", "new", "latest"] {
+            let mut entry = cache.prepare_add(key, 4096).unwrap();
+            entry.as_file_mut().write_all(&vec![0; 128 * 1024]).unwrap();
+            cache.commit_weighted(entry, Some(4096)).unwrap();
+        }
+        assert_eq!(cache.size(), 8192);
+        assert!(!cache.contains_key("old"));
+        assert!(!fixture.tmp().join("old").exists());
+        assert!(cache.contains_key("new"));
+        assert!(cache.contains_key("latest"));
+        eprintln!("two 128 KiB entries fit in 8 KiB of LRU weight, oldest entry evicted");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn btrfs_weighted_cache_reads_back_weights_and_falls_back_to_length() {
+        let fixture = TestFixture::new();
+        if !super::test_btrfs_zstd(fixture.tmp()) {
+            return;
+        }
+        let mut cache = LruDiskCache::open(fixture.tmp().to_owned(), 8192, true).unwrap();
+        let mut entry = cache.prepare_add("weighted", 4096).unwrap();
+        entry.as_file_mut().write_all(&vec![0; 128 * 1024]).unwrap();
+        cache.commit_weighted(entry, Some(4096)).unwrap();
+        cache.insert_bytes("unweighted", &[0; 4096]).unwrap();
+        drop(cache);
+
+        let cache = LruDiskCache::open(fixture.tmp().to_owned(), 8192, true).unwrap();
+        assert_eq!(cache.size(), 8192);
+        assert_eq!(cache.len(), 2);
+        eprintln!("startup counted 4096 bytes from the xattr and 4096 from file length");
     }
 
     #[test]
