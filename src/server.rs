@@ -517,13 +517,18 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
         .enable_all()
         .worker_threads(std::cmp::max(20, 2 * util::num_cpus()))
         .build()?;
+    let signals = {
+        let _guard = runtime.enter();
+        ShutdownSignals::new()?
+    };
     let pool = runtime.handle().clone();
     let dist_client = DistClientContainer::new(config, &pool);
 
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
-    let miss_explain = env::var_os("SCCACHE_MISS_EXPLAIN")
-        .filter(|path| !path.is_empty())
-        .map(|path| Arc::new(MissExplain::new(&config.fallback_cache.dir, path.into())));
+    let miss_explain = config
+        .miss_explain
+        .as_ref()
+        .map(|path| Arc::new(MissExplain::new(&config.fallback_cache.dir, path.clone())));
 
     let raw_storage = match storage_from_config(config, &pool) {
         Ok(storage) => storage,
@@ -582,7 +587,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 .with_miss_explain(miss_explain);
                 Ok((
                     srv.local_addr().unwrap(),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+                    Box::new(move |signals| srv.run_with_signals(future::pending::<()>(), signals))
+                        as Box<dyn FnOnce(_) -> _>,
                 ))
             }
             #[cfg(unix)]
@@ -604,7 +610,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 .with_miss_explain(miss_explain);
                 Ok((
                     srv.local_addr().unwrap(),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+                    Box::new(move |signals| srv.run_with_signals(future::pending::<()>(), signals))
+                        as Box<dyn FnOnce(_) -> _>,
                 ))
             }
             #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -630,7 +637,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                 Ok((
                     srv.local_addr()
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
-                    Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
+                    Box::new(move |signals| srv.run_with_signals(future::pending::<()>(), signals))
+                        as Box<dyn FnOnce(_) -> _>,
                 ))
             }
         })();
@@ -643,7 +651,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     addr: addr.to_string(),
                 },
             )?;
-            run(future::pending::<()>()).map_err(anyhow::Error::from)?;
+            run(signals)?;
             Ok(())
         }
         Err(e) => {
@@ -665,11 +673,56 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     }
 }
 
+#[derive(Default)]
+struct ShutdownSignals {
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    interrupt: Option<tokio::signal::unix::Signal>,
+}
+
+impl ShutdownSignals {
+    fn new() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            Ok(Self {
+                terminate: Some(signal(SignalKind::terminate())?),
+                interrupt: Some(signal(SignalKind::interrupt())?),
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self::default())
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        if let (Some(terminate), Some(interrupt)) = (&mut self.terminate, &mut self.interrupt) {
+            tokio::select! {
+                _ = terminate.recv() => (),
+                _ = interrupt.recv() => (),
+            }
+            return;
+        }
+        future::pending::<()>().await;
+    }
+
+    async fn recv_terminate(&mut self) {
+        #[cfg(unix)]
+        if let Some(terminate) = &mut self.terminate {
+            terminate.recv().await;
+            return;
+        }
+        future::pending::<()>().await;
+    }
+}
+
 pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = ProcessCommandCreator> {
     runtime: Runtime,
     listener: A,
     rx: mpsc::Receiver<ServerMessage>,
     timeout: Duration,
+    shutdown_drain: Duration,
     service: SccacheService<C>,
     wait: WaitUntilZero,
 }
@@ -724,6 +777,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             rx,
             service,
             timeout: Duration::from_secs(get_idle_timeout()),
+            shutdown_drain: Duration::from_secs(config.server.shutdown_drain_secs),
             wait,
         }
     }
@@ -774,85 +828,97 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         C: Send,
         A::Socket: 'static,
     {
+        self.run_with_signals(shutdown, ShutdownSignals::default())
+    }
+
+    fn run_with_signals<F>(self, shutdown: F, mut signals: ShutdownSignals) -> io::Result<()>
+    where
+        F: Future,
+        A::Socket: 'static,
+    {
         let SccacheServer {
             runtime,
             listener,
             rx,
             service,
             timeout,
+            shutdown_drain,
             wait,
         } = self;
 
-        // Create our "server future" which will simply handle all incoming
-        // connections in separate tasks.
-        let server = async move {
-            loop {
-                let socket = listener.accept().await?;
-                trace!("incoming connection");
-                let conn = service.clone().bind(socket).map_err(|res| {
-                    error!("Failed to bind socket: {}", res);
-                });
-
-                // We're not interested if the task panicked; immediately process
-                // another connection
-                #[allow(clippy::let_underscore_future)]
-                let _ = tokio::spawn(conn);
+        let connections = Arc::new(());
+        let accept = {
+            let connections = connections.clone();
+            async move {
+                loop {
+                    let socket = listener.accept().await?;
+                    trace!("incoming connection");
+                    let connection = connections.clone();
+                    let service = service.clone();
+                    tokio::spawn(async move {
+                        let _connection = connection;
+                        if let Err(err) = service.bind(socket).await {
+                            error!("Failed to bind socket: {err}");
+                        }
+                    });
+                }
             }
         };
-
-        // Right now there's a whole bunch of ways to shut down this server for
-        // various purposes. These include:
-        //
-        // 1. The `shutdown` future above.
-        // 2. An RPC indicating the server should shut down
-        // 3. A period of inactivity (no requests serviced)
-        //
-        // These are all encapsulated with the future that we're creating below.
-        // The `ShutdownOrInactive` indicates the RPC or the period of
-        // inactivity, and this is then select'd with the `shutdown` future
-        // passed to this function.
-
-        let shutdown = shutdown.map(|_| {
-            info!("shutting down due to explicit signal");
-        });
 
         let shutdown_idle = async {
             ShutdownOrInactive {
                 rx,
-                timeout: if timeout != Duration::new(0, 0) {
-                    Some(Box::pin(sleep(timeout)))
-                } else {
-                    None
-                },
+                timeout: (!timeout.is_zero()).then(|| Box::pin(sleep(timeout))),
                 timeout_dur: timeout,
             }
             .await;
-            info!("shutting down due to being idle or request");
         };
 
         runtime.block_on(async {
-            futures::select! {
-                server = server.fuse() => server,
-                _res = shutdown.fuse() => Ok(()),
-                _res = shutdown_idle.fuse() => Ok::<_, io::Error>(()),
+            tokio::select! {
+                biased;
+                _ = signals.recv() => info!("shutting down due to a Unix signal"),
+                _ = shutdown => info!("shutting down due to explicit signal"),
+                _ = shutdown_idle => info!("shutting down due to being idle or request"),
+                result = accept => return result,
             }
+            Ok::<_, io::Error>(())
         })?;
 
-        const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
         info!(
-            "moving into the shutdown phase now, waiting at most {} seconds \
-             for all client requests to complete",
-            SHUTDOWN_TIMEOUT.as_secs()
+            "waiting up to {} seconds for connections and cache writes to finish",
+            shutdown_drain.as_secs()
         );
-
-        // Once our server has shut down either due to inactivity or a manual
-        // request we still need to give a bit of time for all active
-        // connections to finish. This `wait` future will resolve once all
-        // instances of `SccacheService` have been dropped.
-        //
-        // Note that we cap the amount of time this can take, however, as we
-        // don't want to wait *too* long.
-        runtime.block_on(async { time::timeout(SHUTDOWN_TIMEOUT, wait).await })?;
+        let forced = runtime.block_on(async {
+            let deadline = sleep(shutdown_drain);
+            tokio::pin!(deadline, wait);
+            let interval = Duration::from_secs(10);
+            let mut progress = time::interval_at(time::Instant::now() + interval, interval);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = signals.recv_terminate() => {
+                        warn!("received SIGTERM during shutdown; exiting immediately");
+                        break true;
+                    }
+                    _ = &mut wait => break false,
+                    _ = &mut deadline => {
+                        warn!("shutdown drain timed out with {} connections remaining", Arc::strong_count(&connections) - 1);
+                        break false;
+                    }
+                    _ = progress.tick() => {
+                        info!("draining server with {} connections remaining", Arc::strong_count(&connections) - 1);
+                    }
+                }
+            }
+        });
+        if forced {
+            runtime.shutdown_background();
+        } else {
+            // Let cancelled tasks drop their compiler children without waiting indefinitely
+            // for blocking work that Tokio cannot cancel.
+            runtime.shutdown_timeout(Duration::from_millis(100));
+        }
 
         info!("ok, fully shutting down now");
 
@@ -1936,6 +2002,7 @@ where
         let pending = self.pending_cache_writes.clone();
         *pending.keys.lock().await.entry(key.clone()).or_default() += 1;
         let stats = self.stats.clone();
+        // Keep the drain open even after this compile's client disconnects.
         let active = self.info.clone();
         self.rt.spawn(async move {
             let _active = active;
@@ -2790,7 +2857,7 @@ impl Future for ShutdownOrInactive {
 }
 
 /// Helper future which tracks the `ActiveInfo` below. This future will resolve
-/// once all instances of `ActiveInfo` have been dropped.
+/// once all services and their deferred cache writes have been dropped.
 pub(crate) struct WaitUntilZero {
     info: std::sync::Weak<std::sync::Mutex<Info>>,
 }
@@ -3224,6 +3291,48 @@ mod tests {
     }
 
     type MockService = SccacheService<MockCreator>;
+
+    #[test]
+    fn test_shutdown_waits_for_deferred_cache_write() {
+        use crate::compiler::CacheWriteInfo;
+        use crate::test::mock_storage::MockStorage;
+        use tokio::sync::oneshot;
+
+        let runtime = util::new_client_runtime().unwrap();
+        let mut service = MockService::mock_with_storage(
+            Arc::new(MockStorage::new(None, false)),
+            runtime.handle().clone(),
+        );
+        let (wait, active) = WaitUntilZero::new();
+        service.info = active;
+        service.background_cache_writes = true;
+        let stats = service.stats.clone();
+        let (release, blocked) = oneshot::channel();
+
+        runtime.block_on(async {
+            service
+                .start_cache_write(
+                    CacheWriteFuture {
+                        key: "entry".to_owned(),
+                        future: Box::pin(async {
+                            blocked.await?;
+                            Ok(CacheWriteInfo {
+                                object_file_pretty: "libslow.rlib".to_owned(),
+                                duration: Duration::ZERO,
+                            })
+                        }),
+                    },
+                    true,
+                )
+                .await;
+            drop(service);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            release.send(()).unwrap();
+            time::timeout(Duration::from_secs(1), wait).await.unwrap();
+            assert_eq!(stats.lock().await.cache_writes, 1);
+        });
+    }
 
     /// A service whose mocked rustc is queued for one cache-miss compile of `dep`,
     /// and then a request for that compile.

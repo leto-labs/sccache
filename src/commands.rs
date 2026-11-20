@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cache::{CacheMode, CacheStorage as _, IpcStorage, storage_from_config};
-use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
+use crate::client::{ServerConnection, connect_to_server, connect_with_retry, connect_with_wait};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::{self, ColorMode, is_rmeta_artifact_notification};
 use crate::config::{Config, RustIncremental};
@@ -334,9 +334,12 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
 /// Attempt to connect to an sccache server listening on `addr`, or start one if no server is running.
 fn connect_or_start_server(
     addr: &crate::net::SocketAddr,
-    startup_timeout: Option<Duration>,
+    config: &Config,
 ) -> Result<ServerConnection> {
     trace!("connect_or_start_server({addr})");
+    if !config.server.autostart {
+        return Ok(connect_to_server(addr)?);
+    }
     match connect_to_server(addr) {
         Ok(server) => Ok(server),
         Err(ref e)
@@ -346,7 +349,7 @@ fn connect_or_start_server(
         {
             // If the connection was refused we probably need to start
             // the server.
-            match run_server_process(startup_timeout)? {
+            match run_server_process(config.server_startup_timeout)? {
                 ServerStartup::Ok { addr: actual_addr } => {
                     if addr.to_string() != actual_addr {
                         // bail as the next connect_with_retry will fail
@@ -938,7 +941,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         Command::ZeroStats => {
             trace!("Command::ZeroStats");
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let conn = connect_or_start_server(&get_addr(), config)?;
             request_zero_stats(conn).context("couldn't zero stats on server")?;
             eprintln!("Statistics zeroed.");
         }
@@ -1000,7 +1003,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         ),
         Command::DistStatus => {
             trace!("Command::DistStatus");
-            let srv = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let srv = connect_or_start_server(&get_addr(), config)?;
             let status =
                 request_dist_status(srv).context("failed to get dist-status from server")?;
             serde_json::to_writer(&mut io::stdout(), &status)?;
@@ -1068,7 +1071,34 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 local.session.prune(config.incremental_prune_days());
                 return result.context("failed to execute incremental compile");
             }
-            let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
+            let addr = get_addr();
+            let conn = if config.server.autostart {
+                connect_or_start_server(&addr, config)?
+            } else {
+                match connect_with_wait(&addr, Duration::from_secs(config.server.connect_wait_secs))
+                {
+                    Ok(conn) => conn,
+                    Err(err) => {
+                        eprintln!(
+                            "sccache: warning: could not connect to the server ({err}), compiling locally"
+                        );
+                        let exe_path = which_in(&exe, env::var_os("PATH"), &cwd)?;
+                        return handle_compile_result(
+                            ProcessCommandCreator::new(&jobserver),
+                            &mut new_client_runtime()?,
+                            CompileResponse::UnhandledCompile,
+                            None,
+                            false,
+                            &exe_path,
+                            cmdline,
+                            &cwd,
+                            &mut io::stdout(),
+                            &mut io::stderr(),
+                        )
+                        .context("failed to execute compile");
+                    }
+                }
+            };
             // One compile needs no worker threads of its own: starting two in
             // every invocation cost about 1ms per cache hit. The blocking
             // thread pool still absorbs zstd/zip work.

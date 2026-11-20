@@ -144,6 +144,32 @@ pub fn connect(addr: &SocketAddr) -> std::io::Result<Box<dyn Connection>> {
     }
 }
 
+pub(crate) async fn connect_async(addr: &SocketAddr) -> std::io::Result<Box<dyn Connection>> {
+    let stream: Box<dyn Connection> = match addr {
+        SocketAddr::Net(addr) => {
+            let stream = tokio::net::TcpStream::connect(addr).await?.into_std()?;
+            stream.set_nonblocking(false)?;
+            Box::new(stream)
+        }
+        #[cfg(unix)]
+        SocketAddr::Unix(path) => {
+            let stream = tokio::net::UnixStream::connect(path).await?.into_std()?;
+            stream.set_nonblocking(false)?;
+            Box::new(stream)
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        SocketAddr::UnixAbstract(name) => {
+            let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?.into();
+            let stream = tokio::net::UnixStream::connect_addr(&addr)
+                .await?
+                .into_std()?;
+            stream.set_nonblocking(false)?;
+            Box::new(stream)
+        }
+    };
+    Ok(stream)
+}
+
 #[cfg(unix)]
 mod unix_imp {
     use futures::TryFutureExt;

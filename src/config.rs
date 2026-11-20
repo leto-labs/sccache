@@ -867,6 +867,31 @@ pub(crate) const fn default_incremental_prune_days() -> u64 {
     7
 }
 
+#[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    pub shutdown_drain_secs: u64,
+    pub autostart: bool,
+    pub connect_wait_secs: u64,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            shutdown_drain_secs: 10,
+            autostart: true,
+            connect_wait_secs: 30,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ServerEnvConfig {
+    shutdown_drain_secs: Option<u64>,
+    autostart: Option<bool>,
+    connect_wait_secs: Option<u64>,
+}
+
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -875,6 +900,8 @@ pub struct FileConfig {
     pub cache: CacheConfigs,
     pub dist: DistConfig,
     pub server_startup_timeout_ms: Option<u64>,
+    pub server: ServerConfig,
+    pub miss_explain: Option<PathBuf>,
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
     pub client_side_mode: bool,
@@ -918,6 +945,8 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
 #[derive(Debug)]
 pub struct EnvConfig {
     cache: CacheConfigs,
+    server: ServerEnvConfig,
+    miss_explain: Option<PathBuf>,
     disk_reflink: Option<bool>,
     basedirs: Option<Vec<String>>,
     dist_cache_dir: Option<PathBuf>,
@@ -1404,6 +1433,13 @@ fn config_from_env() -> Result<EnvConfig> {
     };
 
     Ok(EnvConfig {
+        server: ServerEnvConfig {
+            shutdown_drain_secs: number_from_env_var("SCCACHE_SHUTDOWN_DRAIN_SECS").transpose()?,
+            autostart: bool_from_env_var("SCCACHE_SERVER_AUTOSTART")?,
+            connect_wait_secs: number_from_env_var("SCCACHE_SERVER_CONNECT_WAIT_SECS")
+                .transpose()?,
+        },
+        miss_explain: env::var_os("SCCACHE_MISS_EXPLAIN").map(PathBuf::from),
         rust_incremental,
         rust_incremental_first_build,
         incremental_prune_days,
@@ -1504,6 +1540,8 @@ pub struct Config {
     pub fallback_cache: DiskCacheConfig,
     pub dist: DistConfig,
     pub server_startup_timeout: Option<std::time::Duration>,
+    pub server: ServerConfig,
+    pub miss_explain: Option<PathBuf>,
     pub skip_cache_check: bool,
     /// Base directory (or directories) to strip from paths for cache key computation.
     /// Similar to ccache's CCACHE_BASEDIR.
@@ -1540,6 +1578,8 @@ impl Config {
             cache,
             mut dist,
             server_startup_timeout_ms,
+            server: file_server,
+            miss_explain: file_miss_explain,
             basedirs: file_basedirs,
             client_side_mode: file_client_side_mode,
             rust_incremental: file_rust_incremental,
@@ -1553,6 +1593,8 @@ impl Config {
 
         let EnvConfig {
             cache,
+            server: env_server,
+            miss_explain: env_miss_explain,
             disk_reflink,
             basedirs: env_basedirs,
             dist_cache_dir: env_dist_cache_dir,
@@ -1561,6 +1603,25 @@ impl Config {
             rust_incremental_first_build: env_first_build,
             incremental_prune_days: env_incremental_prune_days,
         } = env_conf;
+        let server = ServerConfig {
+            shutdown_drain_secs: env_server
+                .shutdown_drain_secs
+                .unwrap_or(file_server.shutdown_drain_secs),
+            autostart: env_server.autostart.unwrap_or(file_server.autostart),
+            connect_wait_secs: env_server
+                .connect_wait_secs
+                .unwrap_or(file_server.connect_wait_secs),
+        };
+        let miss_explain = match env_miss_explain {
+            Some(path) if path.as_os_str().is_empty() => None,
+            Some(path) => Some(path),
+            None => file_miss_explain,
+        };
+        if let Some(path) = &miss_explain
+            && !path.is_absolute()
+        {
+            bail!("miss_explain (SCCACHE_MISS_EXPLAIN) must be an absolute path: {path:?}");
+        }
         let file_reflink = conf_caches.disk.as_ref().map(|disk| disk.reflink);
         conf_caches.merge(cache);
         if let Some(reflink) = disk_reflink.or(file_reflink)
@@ -1609,6 +1670,8 @@ impl Config {
             fallback_cache,
             dist,
             server_startup_timeout,
+            server,
+            miss_explain,
             skip_cache_check: false,
             basedirs,
             client_side_mode,
@@ -2039,6 +2102,8 @@ fn test_disk_reflink_config() {
 #[test]
 fn config_overrides() {
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: CacheConfigs {
             azure: Some(AzureCacheConfig {
@@ -2101,6 +2166,8 @@ fn config_overrides() {
         },
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2162,6 +2229,8 @@ fn config_overrides() {
             },
             dist: Default::default(),
             server_startup_timeout: None,
+            server: Default::default(),
+            miss_explain: None,
             skip_cache_check: false,
             basedirs: vec![],
             client_side_mode: false,
@@ -2176,6 +2245,8 @@ fn config_overrides() {
 fn config_basedirs_overrides() {
     // Test that env variable takes precedence over file config
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: vec!["C:/env/basedir".to_string()].into(),
@@ -2190,6 +2261,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2202,6 +2275,8 @@ fn config_basedirs_overrides() {
 
     // Test that file config is used when env is None
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -2216,6 +2291,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2228,6 +2305,8 @@ fn config_basedirs_overrides() {
 
     // Test that env config is used when env is set but empty
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
@@ -2242,6 +2321,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2254,6 +2335,8 @@ fn config_basedirs_overrides() {
 
     // Test that both empty results in empty
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
@@ -2268,6 +2351,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2284,6 +2369,8 @@ fn config_basedirs_overrides() {
 fn config_basedirs_overrides() {
     // Test that env variable takes precedence over file config
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: vec!["/env/basedir".to_string()].into(),
@@ -2298,6 +2385,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2310,6 +2399,8 @@ fn config_basedirs_overrides() {
 
     // Test that file config is used when env is None
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -2324,6 +2415,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2336,6 +2429,8 @@ fn config_basedirs_overrides() {
 
     // Test that env config is used when env is set but empty
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
@@ -2350,6 +2445,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2362,6 +2459,8 @@ fn config_basedirs_overrides() {
 
     // Test that both empty results in empty
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
@@ -2376,6 +2475,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2386,6 +2487,8 @@ fn config_basedirs_overrides() {
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
     assert!(config.basedirs.is_empty());
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -2400,6 +2503,8 @@ fn config_basedirs_overrides() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2409,6 +2514,72 @@ fn config_basedirs_overrides() {
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
     assert!(config.basedirs.is_empty());
+}
+
+#[test]
+#[serial]
+fn test_managed_server_config() {
+    const DRAIN: &str = "SCCACHE_SHUTDOWN_DRAIN_SECS";
+    const AUTOSTART: &str = "SCCACHE_SERVER_AUTOSTART";
+    const WAIT: &str = "SCCACHE_SERVER_CONNECT_WAIT_SECS";
+    const EXPLAIN: &str = "SCCACHE_MISS_EXPLAIN";
+    let cwd = env::current_dir().unwrap();
+    let log = cwd.join("misses.jsonl");
+    let env_log = cwd.join("override.jsonl");
+    let path = |path: &Path| toml::Value::String(path.to_str().unwrap().to_owned());
+    let file = format!(
+        "miss_explain = {}\n[server]\nshutdown_drain_secs = 300\nautostart = false\nconnect_wait_secs = 45",
+        path(&log)
+    );
+    let resolve = |vars: &[(&str, Option<&str>)], file: &str| {
+        temp_env::with_vars(vars, || {
+            Config::from_env_and_file_configs(config_from_env()?, toml::from_str(file)?)
+        })
+    };
+    let unset = [
+        (DRAIN, None),
+        (AUTOSTART, None),
+        (WAIT, None),
+        (EXPLAIN, None),
+    ];
+    let defaults = resolve(&unset, "").unwrap();
+    assert_eq!(defaults.server.shutdown_drain_secs, 10);
+    assert!(defaults.server.autostart);
+    assert_eq!(defaults.server.connect_wait_secs, 30);
+    assert_eq!(defaults.miss_explain, None);
+
+    let configured = resolve(&unset, &file).unwrap();
+    assert_eq!(configured.server.shutdown_drain_secs, 300);
+    assert!(!configured.server.autostart);
+    assert_eq!(configured.server.connect_wait_secs, 45);
+    assert_eq!(configured.miss_explain, Some(log));
+
+    let overridden = resolve(
+        &[
+            (DRAIN, Some("0")),
+            (AUTOSTART, Some("1")),
+            (WAIT, Some("3")),
+            (EXPLAIN, env_log.to_str()),
+        ],
+        &file,
+    )
+    .unwrap();
+    assert_eq!(overridden.server.shutdown_drain_secs, 0);
+    assert!(overridden.server.autostart);
+    assert_eq!(overridden.server.connect_wait_secs, 3);
+    assert_eq!(overridden.miss_explain, Some(env_log));
+    assert_eq!(
+        resolve(&[(EXPLAIN, Some(""))], &file).unwrap().miss_explain,
+        None
+    );
+    for var in [DRAIN, AUTOSTART, WAIT] {
+        assert!(resolve(&[(var, Some("-1"))], &file).is_err());
+    }
+    for relative in ["misses.jsonl", "~/misses.jsonl", "%h/misses.jsonl"] {
+        assert!(resolve(&[(EXPLAIN, Some(relative))], &file).is_err());
+        assert!(resolve(&unset, &format!("miss_explain = {relative:?}")).is_err());
+    }
+    assert!(resolve(&unset, r#"miss_explain = """#).is_err());
 }
 
 #[test]
@@ -2673,6 +2844,8 @@ fn test_env_basedirs_with_spaces() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -2706,6 +2879,8 @@ fn test_env_basedirs_with_spaces() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3410,6 +3585,8 @@ key_prefix = "cosprefix"
                 rewrite_includes_only: false,
             },
             server_startup_timeout_ms: Some(10000),
+            server: Default::default(),
+            miss_explain: None,
             basedirs: vec![],
             client_side_mode: false,
             rust_incremental: Default::default(),
@@ -3507,6 +3684,8 @@ size = "7g"
                 ..Default::default()
             },
             server_startup_timeout_ms: None,
+            server: Default::default(),
+            miss_explain: None,
             basedirs: vec![],
             client_side_mode: false,
             rust_incremental: Default::default(),
@@ -3553,6 +3732,8 @@ fn test_integration_config_normalizes_and_strips() {
     use std::borrow::Cow;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3567,6 +3748,8 @@ fn test_integration_config_normalizes_and_strips() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3596,6 +3779,8 @@ fn test_integration_normalized_path_with_double_slashes() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3610,6 +3795,8 @@ fn test_integration_normalized_path_with_double_slashes() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/home//user///project/".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3635,6 +3822,8 @@ fn test_integration_windows_path_normalization() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3649,6 +3838,8 @@ fn test_integration_windows_path_normalization() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3675,6 +3866,8 @@ fn test_integration_cow_borrowed_when_no_match() {
     use std::borrow::Cow;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3689,6 +3882,8 @@ fn test_integration_cow_borrowed_when_no_match() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3715,6 +3910,8 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     use std::borrow::Cow;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3729,6 +3926,8 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3754,6 +3953,8 @@ fn test_integration_multiple_basedirs_longest_match() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3768,6 +3969,8 @@ fn test_integration_multiple_basedirs_longest_match() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3798,6 +4001,8 @@ fn test_integration_paths_with_dots_normalized() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3812,6 +4017,8 @@ fn test_integration_paths_with_dots_normalized() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),
@@ -3838,6 +4045,8 @@ fn test_integration_windows_mixed_slashes() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        server: Default::default(),
+        miss_explain: None,
         disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
@@ -3852,6 +4061,8 @@ fn test_integration_windows_mixed_slashes() {
         cache: Default::default(),
         dist: Default::default(),
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
         client_side_mode: false,
         rust_incremental: Default::default(),

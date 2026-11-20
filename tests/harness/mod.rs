@@ -195,6 +195,8 @@ pub fn sccache_client_cfg(
             rewrite_includes_only: false, // TODO
         },
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),

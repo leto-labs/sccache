@@ -59,6 +59,8 @@ fn config_with_dist_auth(
             rewrite_includes_only: true,
         },
         server_startup_timeout_ms: None,
+        server: Default::default(),
+        miss_explain: None,
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),

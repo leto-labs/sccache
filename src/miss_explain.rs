@@ -253,11 +253,18 @@ impl MissExplain {
         let mut line = serde_json::to_vec(&explanation)?;
         line.push(b'\n');
         let _lock = self.log_lock.lock().unwrap_or_else(|err| err.into_inner());
-        fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log)?
-            .write_all(&line)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        let mut log = match options.open(&self.log) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                if let Some(dir) = self.log.parent() {
+                    fs::create_dir_all(dir)?;
+                }
+                options.open(&self.log)?
+            }
+            result => result?,
+        };
+        log.write_all(&line)?;
         Ok(explanation.classification)
     }
 

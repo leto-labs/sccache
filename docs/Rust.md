@@ -98,7 +98,8 @@ local sessions.
 
 ## Explain cross-worktree cache misses
 
-Set `SCCACHE_MISS_EXPLAIN` to an absolute log path when starting the server.
+Set `miss_explain` in the [configuration file](Configuration.md) or set
+`SCCACHE_MISS_EXPLAIN` to an absolute log path when starting the server.
 For a fresh baseline, use a dedicated server and disk cache. Build a known-good checkout
 first, then build the checkout you want to compare using the same Cargo
 command and profile. Each build should set `SCCACHE_BASEDIRS` to its own root.
@@ -130,7 +131,8 @@ log. Pass `--json` to include the root crates in JSON output.
 The server stores up to four distinct keys per crate identity under
 `$SCCACHE_DIR/explain` as it writes cache entries. This history survives a
 server restart, and existing cache hits do not populate it. Keep the log
-outside the disk cache folder. The log appends across builds and restarts.
+outside the cache entry directories. The log appends across builds and restarts.
 This mode routes client-side builds through the server for diagnostics.
 Warm incremental compiles that bypass the cache produce no miss record.
-Unset `SCCACHE_MISS_EXPLAIN` and restart the server to turn the mode off.
+Remove the setting and any environment override, then restart the server to
+turn the mode off.
