@@ -32,11 +32,7 @@ else
   exit 2
 fi
 
-# Queue behind build-bench timing runs on this host, and make them queue
-# behind us. -o keeps the lock out of the sccache servers the tests spawn.
-lock=$HOME/.cache/leto-maintenance/build-bench/timing.lock
-mkdir -p "$(dirname "$lock")"
-flock -o "$lock" "${sandbox[@]}" \
+"${sandbox[@]}" \
   env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER \
   SCCACHE_DIR="$tmp/cache" SCCACHE_CONF="$tmp/sccache.conf" \
   SCCACHE_SERVER_PORT=4240 SCCACHE_IDLE_TIMEOUT=60 \
