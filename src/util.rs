@@ -467,9 +467,11 @@ pub async fn hash_all_archives(
 }
 
 /// Calculate the digest of each `--extern` input in `files`. A dylib, which is how a proc-macro
-/// is built, is hashed by its `.rustc` metadata alone, since on macOS the rest embeds its path.
+/// is built, is usually hashed by its `.rustc` metadata alone. Linked caching includes
+/// native code in ELF dylibs because their bytes can be shared across checkouts.
 pub async fn hash_all_externs(
     files: &[PathBuf],
+    whole_elf_dylib: bool,
     pool: &tokio::runtime::Handle,
 ) -> Result<Vec<String>> {
     let start = time::Instant::now();
@@ -482,7 +484,12 @@ pub async fn hash_all_externs(
         pool.spawn_blocking(move || -> Result<String> {
             let data = fs::read(&library)?;
             let mut m = Digest::new();
-            m.update(rustc_metadata_section(&data).unwrap_or(&data));
+            let input = if whole_elf_dylib && data.starts_with(b"\x7fELF") {
+                &data
+            } else {
+                rustc_metadata_section(&data).unwrap_or(&data)
+            };
+            m.update(input);
             Ok(m.finish())
         })
         .await?
@@ -1789,10 +1796,15 @@ mod tests {
 
         let runtime = single_threaded_runtime();
         let hashes = runtime
-            .block_on(hash_all_externs(&files, runtime.handle()))
+            .block_on(hash_all_externs(&files, false, runtime.handle()))
             .unwrap();
         assert_eq!(hashes[0], hashes[1]);
         assert_ne!(hashes[0], hashes[2]);
+        let whole = runtime
+            .block_on(hash_all_externs(&files, true, runtime.handle()))
+            .unwrap();
+        assert_ne!(whole[0], whole[1]);
+        assert_ne!(whole[0], whole[2]);
     }
 
     fn coff_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
@@ -1923,10 +1935,12 @@ mod tests {
         let pool = runtime.handle();
         let whole = |path| runtime.block_on(Digest::file(path, pool)).unwrap();
         let files = [rlib.clone(), not_an_object.clone()];
-        let hashes = runtime.block_on(hash_all_externs(&files, pool)).unwrap();
+        let hashes = runtime
+            .block_on(hash_all_externs(&files, false, pool))
+            .unwrap();
         assert_eq!(hashes, vec![whole(&rlib), whole(&not_an_object)]);
 
-        let missing_result = runtime.block_on(hash_all_externs(&[missing], pool));
+        let missing_result = runtime.block_on(hash_all_externs(&[missing], false, pool));
         assert!(missing_result.is_err());
     }
 

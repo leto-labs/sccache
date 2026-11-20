@@ -820,7 +820,8 @@ impl RustCacheLinked {
     pub(crate) fn effective(self) -> Self {
         match self {
             Self::Off => Self::Off,
-            Self::Check | Self::ProcMacro | Self::Tests | Self::All => Self::Check,
+            Self::Check => Self::Check,
+            Self::ProcMacro | Self::Tests | Self::All => Self::ProcMacro,
         }
     }
 }

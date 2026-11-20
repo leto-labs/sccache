@@ -1358,7 +1358,7 @@ fn test_rust_metadata_only_proc_macro() -> Result<()> {
         .env_remove("SCCACHE_RUST_CACHE_LINKED")
         .assert()
         .try_success()?
-        .try_stderr(predicate::str::contains("not implemented yet, using check"))?;
+        .try_stderr(predicate::str::contains("not implemented yet").not())?;
 
     let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
     let [a, b] = ["a", "b"].map(|name| root.join(name));
@@ -1375,6 +1375,8 @@ fn test_rust_metadata_only_proc_macro() -> Result<()> {
                 "--crate-name=identity",
                 "--crate-type=proc-macro",
                 "--emit=dep-info,metadata",
+                "--extern",
+                "proc_macro",
                 "--out-dir=out",
                 "identity.rs",
             ])
@@ -2265,5 +2267,299 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
             assert_ne!(difference["previous"], difference["current"]);
         }
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test_case("rust-lld")]
+#[test_case("mold")]
+#[test_case("bfd")]
+#[serial]
+fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let driver = if linker == "rust-lld" { "cc" } else { "clang" };
+    let fuse_ld = (linker != "rust-lld").then(|| format!("-Clink-arg=-fuse-ld={linker}"));
+    let probe = tempfile::tempdir()?;
+    let probe_source = probe.path().join("probe.rs");
+    let probe_dylib = probe.path().join("libprobe.so");
+    let depfile = probe.path().join("link.d");
+    fs::write(
+        &probe_source,
+        "extern crate proc_macro; #[proc_macro] pub fn probe(x: proc_macro::TokenStream) -> proc_macro::TokenStream { x }",
+    )?;
+    let mut rustc_probe = Command::new(rustc);
+    rustc_probe
+        .arg(&probe_source)
+        .args(["--crate-type=proc-macro", "--out-dir"])
+        .arg(probe.path())
+        .arg(format!("-Clinker={driver}"))
+        .args(fuse_ld.iter());
+    let mut with_depfile = rustc_probe.output()?;
+    if !with_depfile.status.success() {
+        eprintln!(
+            "skipping {linker}: {}",
+            String::from_utf8_lossy(&with_depfile.stderr)
+        );
+        return Ok(());
+    }
+    let bytes = fs::read(&probe_dylib)?;
+    with_depfile = rustc_probe
+        .arg(format!(
+            "-Clink-arg=-Wl,--dependency-file={}",
+            depfile.display()
+        ))
+        .args(["--print", "link-args"])
+        .output()?;
+    if !with_depfile.status.success()
+        || !depfile.is_file()
+        || (linker == "rust-lld"
+            && !String::from_utf8_lossy(&with_depfile.stdout).contains("/gcc-ld"))
+    {
+        eprintln!("skipping {linker}: GNU dependency files unavailable");
+        return Ok(());
+    }
+    assert!(
+        bytes == fs::read(&probe_dylib)?,
+        "{linker} changed the dylib bytes"
+    );
+
+    let test = SccacheTest::new(None)?;
+    let root = test.tempdir.path();
+    let wrapper = root.join("linker");
+    let write_wrapper = |revision| -> Result<()> {
+        fs::write(
+            &wrapper,
+            format!("#!/bin/sh\n# revision {revision}\nexec {driver} \"$@\"\n"),
+        )?;
+        fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+        Ok(())
+    };
+    write_wrapper(1)?;
+    let miss_log = root.join("misses.jsonl");
+    restart_sccache(
+        &test,
+        Some(vec![
+            (
+                "SCCACHE_MISS_EXPLAIN".into(),
+                miss_log.display().to_string(),
+            ),
+            ("SCCACHE_RUST_CACHE_LINKED".into(), "proc-macro".into()),
+        ]),
+    )?;
+
+    let a = root.join("checkout-a");
+    let b = root.join("checkout-b");
+    for checkout in [&a, &b] {
+        write_linked_proc_macro_workspace(checkout)?;
+    }
+    let rustflags = format!(
+        "-Clinker={} {}",
+        wrapper.display(),
+        fuse_ld.as_deref().unwrap_or_default()
+    );
+    let cargo = |checkout: &Path| {
+        let mut cmd = Command::new(CARGO.as_os_str());
+        cmd.envs(test.env.iter().cloned())
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("LIBRARY_PATH")
+            .env_remove("LD_LIBRARY_PATH")
+            .env("SCCACHE_BASEDIRS", checkout)
+            .env("RUSTFLAGS", &rustflags)
+            .current_dir(checkout);
+        cmd
+    };
+    let answer = |checkout: &Path, value| -> Result<()> {
+        cargo(checkout)
+            .args(["run", "--offline", "-p", "user"])
+            .assert()
+            .try_success()?
+            .try_stdout(format!("{value}\n"))?;
+        Ok(())
+    };
+    let dylib = |checkout: &Path| -> Result<PathBuf> {
+        for entry in fs::read_dir(checkout.join("target/debug/deps"))? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().starts_with("libpm-")
+                && entry.path().extension().is_some_and(|ext| ext == "so")
+            {
+                return Ok(entry.path());
+            }
+        }
+        bail!("missing proc-macro output in {}", checkout.display());
+    };
+
+    answer(&a, 42)?;
+    incremental_stats(&test, 0, 4)?;
+    zero_incremental_stats()?;
+    answer(&b, 42)?;
+    incremental_stats(&test, 4, 0)?;
+    assert!(
+        fs::read(dylib(&a)?)? == fs::read(dylib(&b)?)?,
+        "restored proc-macro differs"
+    );
+
+    fs::write(a.join("nat/answer.c"), "int answer(void) { return 43; }\n")?;
+    zero_incremental_stats()?;
+    answer(&a, 43)?;
+    let pm_misses = || -> Result<Vec<String>> {
+        let entries = fs::read_to_string(&miss_log)?;
+        let mut keys = Vec::new();
+        for line in entries.lines() {
+            let miss: serde_json::Value = serde_json::from_str(line)?;
+            if miss["crate_name"] == "pm" {
+                keys.push(
+                    miss["key"]
+                        .as_str()
+                        .context("missing link cache key")?
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(keys)
+    };
+    let misses = pm_misses()?;
+    assert_eq!(misses.len(), 2);
+    assert_eq!(
+        misses[0], misses[1],
+        "the C-only change must invalidate the manifest"
+    );
+
+    cargo(&a)
+        .args(["clean", "-p", "pm"])
+        .assert()
+        .try_success()?;
+    answer(&a, 43)?;
+    assert_eq!(pm_misses()?.len(), 2, "the updated manifest should hit");
+
+    let clean_pm = || -> Result<()> {
+        cargo(&b)
+            .args(["clean", "-p", "pm"])
+            .assert()
+            .try_success()?;
+        zero_incremental_stats()
+    };
+    write_wrapper(2)?;
+    clean_pm()?;
+    cargo(&b)
+        .args(["build", "--offline", "-p", "pm"])
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 0, 1)?;
+    assert_eq!(pm_misses()?.len(), 3);
+
+    clean_pm()?;
+    cargo(&b)
+        .args([
+            "rustc",
+            "--offline",
+            "-p",
+            "pm",
+            "--",
+            "-Clink-arg=-Wl,--build-id=none",
+        ])
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 0, 1)?;
+    assert_eq!(pm_misses()?.len(), 4);
+
+    clean_pm()?;
+    cargo(&b)
+        .args(["build", "--offline", "-p", "pm"])
+        .env("LIBRARY_PATH", b.join("other-libraries"))
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 0, 1)?;
+    assert_eq!(pm_misses()?.len(), 5);
+
+    fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nfor arg do\n    case \"$arg\" in\n        -Wl,--dependency-file=*) shift ;;\n        *) shift; set -- \"$@\" \"$arg\" ;;\n    esac\ndone\nexec {driver} \"$@\"\n"
+        ),
+    )?;
+    for expected in [6, 7] {
+        clean_pm()?;
+        cargo(&b)
+            .args(["build", "--offline", "-p", "pm"])
+            .assert()
+            .try_success()?;
+        incremental_stats(&test, 0, 0)?;
+        assert_eq!(pm_misses()?.len(), expected);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_linked_proc_macro_workspace(root: &Path) -> Result<()> {
+    fs::create_dir_all(root)?;
+    fs::write(
+        root.join("Cargo.toml"),
+        "[workspace]\nmembers = [\"nat\", \"mid\", \"pm\", \"user\"]\nresolver = \"2\"\n",
+    )?;
+    for (name, extra, source) in [
+        (
+            "nat",
+            "",
+            r#"
+            unsafe extern "C" { fn answer() -> i32; }
+            pub fn value() -> i32 { unsafe { answer() } }
+        "#,
+        ),
+        (
+            "mid",
+            "[dependencies]\nnat = { path = \"../nat\" }\n",
+            "pub fn value() -> i32 { nat::value() }",
+        ),
+        (
+            "pm",
+            "[lib]\nproc-macro = true\n[dependencies]\nmid = { path = \"../mid\" }\n",
+            r#"
+            use proc_macro::TokenStream;
+            #[proc_macro]
+            pub fn answer(_: TokenStream) -> TokenStream { mid::value().to_string().parse().unwrap() }
+        "#,
+        ),
+        (
+            "user",
+            "[dependencies]\npm = { path = \"../pm\" }\n",
+            "pub fn answer() -> i32 { pm::answer!() }",
+        ),
+    ] {
+        let dir = root.join(name);
+        fs::create_dir_all(dir.join("src"))?;
+        fs::write(
+            dir.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
+            ),
+        )?;
+        fs::write(dir.join("src/lib.rs"), source)?;
+    }
+    fs::write(
+        root.join("user/src/main.rs"),
+        "fn main() { println!(\"{}\", user::answer()); }",
+    )?;
+    fs::write(
+        root.join("nat/answer.c"),
+        "int answer(void) { return 42; }\n",
+    )?;
+    fs::write(
+        root.join("nat/build.rs"),
+        r#"
+        use std::{env, path::PathBuf, process::Command};
+        fn main() {
+            let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+            let object = out.join("answer.o");
+            let archive = out.join("libanswer.a");
+            assert!(Command::new("cc").args(["-c", "answer.c", "-o"]).arg(&object).status().unwrap().success());
+            assert!(Command::new("ar").arg("crs").arg(archive).arg(object).status().unwrap().success());
+            println!("cargo:rerun-if-changed=answer.c");
+            println!("cargo:rustc-link-search=native={}", out.display());
+            println!("cargo:rustc-link-lib=static=answer");
+        }
+    "#,
+    )?;
     Ok(())
 }
