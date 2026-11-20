@@ -14,7 +14,11 @@ trap 'rm -rf "$tmp"' EXIT
 : >"$tmp/sccache.conf"
 [[ $# -gt 0 ]] || set -- cargo test --locked --lib --bins --tests --no-fail-fast
 cpus=${LETO_TEST_CPUS:-0-15,32-47}
-exec bwrap --dev-bind / / --unshare-net --die-with-parent -- \
+# Queue behind build-bench timing runs on this host, and make them queue
+# behind us. -o keeps the lock out of the sccache servers the tests spawn.
+lock=$HOME/.cache/leto-maintenance/build-bench/timing.lock
+mkdir -p "$(dirname "$lock")"
+exec flock -o "$lock" bwrap --dev-bind / / --unshare-net --die-with-parent -- \
   env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER \
   SCCACHE_DIR="$tmp/cache" SCCACHE_CONF="$tmp/sccache.conf" \
   SCCACHE_SERVER_PORT=4240 SCCACHE_IDLE_TIMEOUT=60 \
