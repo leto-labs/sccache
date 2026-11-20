@@ -46,6 +46,9 @@ output path, no existing `.rmeta` and no finalized session compiles without
 session creation until the first rebuild. Cargo keeps the previous `.rmeta`,
 including metadata-only builds from `cargo check`. A library with existing
 metadata, or whose metadata path cannot be determined, compiles incrementally.
+Such a plain compile also gets `-C lto=off` unless the command sets `-C lto`:
+incremental compiles skip rustc's thin local LTO across codegen units, and
+above `opt-level=0` that extra work would cost more than the session it saves.
 Set `rust_incremental_first_build = "incremental"` in the server config or
 `SCCACHE_RUST_INCREMENTAL_FIRST_BUILD=incremental` when starting the server
 to use incremental codegen on the first miss as well. The default is `plain`.
