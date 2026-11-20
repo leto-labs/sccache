@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # Runs a command (default: the CI test set) in a private network namespace.
-# The upstream test harness strips every SCCACHE_* variable, including the
-# port, and sends --stop-server, which on a shared host would reach the shared
-# server on 127.0.0.1:4226. In its own network namespace the test run has its
-# own loopback, so nothing outside it can be reached or stopped.
+# The test run has its own loopback, so it cannot reach a shared server.
+# The harness restores the sandbox's port after stripping SCCACHE_* variables.
 #
 # bwrap where unprivileged user namespaces work (devbox); otherwise sudo
 # unshare -n, then back to this user with setpriv (the workers restrict
@@ -18,6 +16,7 @@ trap 'rm -rf "$tmp"' EXIT
 : >"$tmp/sccache.conf"
 [[ $# -gt 0 ]] || set -- cargo test --locked --lib --bins --tests --no-fail-fast
 cpus=${LETO_TEST_CPUS:-0-15,32-47}
+port=4240
 
 if bwrap --dev-bind / / --unshare-net -- true 2>/dev/null; then
   sandbox=(bwrap --dev-bind / / --unshare-net --die-with-parent --)
@@ -32,12 +31,8 @@ else
   exit 2
 fi
 
-# Queue behind build-bench timing runs on this host, and make them queue
-# behind us. -o keeps the lock out of the sccache servers the tests spawn.
-lock=$HOME/.cache/leto-maintenance/build-bench/timing.lock
-mkdir -p "$(dirname "$lock")"
-flock -o "$lock" "${sandbox[@]}" \
+"${sandbox[@]}" \
   env -u RUSTC_WRAPPER -u CARGO_BUILD_RUSTC_WRAPPER \
   SCCACHE_DIR="$tmp/cache" SCCACHE_CONF="$tmp/sccache.conf" \
-  SCCACHE_SERVER_PORT=4240 SCCACHE_IDLE_TIMEOUT=60 \
+  SCCACHE_SERVER_PORT="$port" LETO_TEST_SERVER_PORT="$port" SCCACHE_IDLE_TIMEOUT=60 \
   nice -n 10 taskset -c "$cpus" "$@"

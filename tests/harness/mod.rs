@@ -136,6 +136,9 @@ pub fn prune_command(mut cmd: Command) -> Command {
             cmd.env_remove(var);
         }
     }
+    if let Some(port) = env::var_os("LETO_TEST_SERVER_PORT") {
+        cmd.env("SCCACHE_SERVER_PORT", port);
+    }
     cmd
 }
 
