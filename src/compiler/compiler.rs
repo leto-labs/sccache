@@ -94,8 +94,8 @@ where
         creator: &T,
     ) -> Result<process::Output>;
 
-    /// Capture state before a local compile and check it before storing successful outputs.
-    fn prepare_cache_store(&self) -> Option<CacheStoreCheck> {
+    /// Determine before running the compiler whether its outputs can be stored.
+    fn cache_store_veto(&self) -> Option<CacheStoreVeto> {
         None
     }
 
@@ -586,6 +586,15 @@ where
     /// Return the state of any `--color` option passed to the compiler.
     fn color_mode(&self) -> ColorMode;
 
+    fn cache_bypass_command(
+        &self,
+        _cwd: &Path,
+        _env_vars: &[(OsString, OsString)],
+        _basedirs: &[Vec<u8>],
+    ) -> Result<Option<(&'static str, Box<dyn CompileCommand<T>>)>> {
+        Ok(None)
+    }
+
     /// Look up a cached compile result in `storage`. If not found, run the
     /// compile and store the result.
     #[allow(clippy::too_many_arguments)]
@@ -610,6 +619,14 @@ where
             _ => false,
         };
         let basedirs = request_basedirs(&env_vars, storage.basedirs());
+        if let Some((reason, command)) = self.cache_bypass_command(&cwd, &env_vars, &basedirs)? {
+            let start = Instant::now();
+            let output = match command.execute(service, &creator).await {
+                Ok(output) => output,
+                Err(err) => err.downcast::<ProcessError>()?.0,
+            };
+            return Ok((CompileResult::CacheBypass(reason, start.elapsed()), output));
+        }
         let result = self
             .generate_hash_key(
                 &creator,
@@ -914,13 +931,8 @@ async fn run_local_compile<T: CommandCreatorSync>(
     service: &server::SccacheService<T>,
     creator: &T,
 ) -> Result<(process::Output, Option<CacheStoreVeto>)> {
-    let check_store = command.prepare_cache_store();
+    let veto = command.cache_store_veto();
     let output = command.execute(service, creator).await?;
-    let veto = if output.status.success() {
-        check_store.and_then(|check| check())
-    } else {
-        None
-    };
     Ok((output, veto))
 }
 
@@ -1321,7 +1333,6 @@ pub enum CacheStoreVeto {
     RustIncrementalSession,
 }
 
-pub type CacheStoreCheck = Box<dyn FnOnce() -> Option<CacheStoreVeto> + Send>;
 type CacheWriteFuture = Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>;
 
 /// The result of a compilation or cache retrieval.
@@ -1330,10 +1341,12 @@ pub enum CompileResult {
     Error,
     /// Result was found in cache.
     CacheHit(Duration),
+    /// A local compile intentionally skipped the cache.
+    CacheBypass(&'static str, Duration),
     /// Result was not found in cache.
     ///
     /// The `CacheWriteFuture` will resolve when the result is finished
-    /// being stored in the cache. A post-compile veto replaces the future.
+    /// being stored in the cache. A veto replaces the future.
     CacheMiss(
         MissType,
         DistType,
@@ -1363,6 +1376,9 @@ impl fmt::Debug for CompileResult {
         match *self {
             CompileResult::Error => write!(f, "CompileResult::Error"),
             CompileResult::CacheHit(ref d) => write!(f, "CompileResult::CacheHit({:?})", d),
+            CompileResult::CacheBypass(reason, ref d) => {
+                write!(f, "CompileResult::CacheBypass({reason:?}, {d:?})")
+            }
             CompileResult::CacheMiss(ref m, ref dt, ref d, _) => {
                 write!(f, "CompileResult::CacheMiss({:?}, {:?}, {:?}, _)", d, m, dt)
             }
@@ -1385,6 +1401,7 @@ impl PartialEq<CompileResult> for CompileResult {
         match (self, other) {
             (&CompileResult::Error, &CompileResult::Error) => true,
             (&CompileResult::CacheHit(_), &CompileResult::CacheHit(_)) => true,
+            (CompileResult::CacheBypass(a, _), CompileResult::CacheBypass(b, _)) => a == b,
             (CompileResult::CacheMiss(m, dt, _, _), CompileResult::CacheMiss(n, dt2, _, _)) => {
                 m == n && dt == dt2
             }

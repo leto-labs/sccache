@@ -15,9 +15,9 @@
 use crate::cache::{FileObjectSource, Storage};
 use crate::compiler::args::*;
 use crate::compiler::{
-    CacheStoreCheck, CacheStoreVeto, Cacheable, ColorMode, Compilation, CompileCommand,
-    CompileCommandImpl, Compiler, CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy,
-    HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
+    CacheStoreVeto, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
+    Compiler, CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
+    SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
@@ -333,6 +333,7 @@ pub struct RustHasher {
     rlib_dep_reader: Option<Arc<RlibDepReader>>,
     /// Parsed arguments from the rustc invocation
     parsed_args: ParsedArguments,
+    bypass_incremental: bool,
 }
 
 /// a lookup proxy for determining the actual compiler used per file or directory
@@ -989,7 +990,7 @@ where
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
         match parse_arguments(arguments, cwd, mode) {
             CompilerArguments::Ok(args) => {
-                let hasher = RustHasher {
+                CompilerArguments::Ok(Box::new(RustHasher {
                     executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
                     host: self.host.clone(),
                     version: self.version.clone(),
@@ -1001,15 +1002,8 @@ where
                     #[cfg(feature = "dist-client")]
                     rlib_dep_reader: self.rlib_dep_reader.clone(),
                     parsed_args: args,
-                };
-                if mode == RustIncremental::Cache
-                    && hasher
-                        .incremental_session()
-                        .is_some_and(|session| session.has_session())
-                {
-                    cannot_cache!("incremental session");
-                }
-                CompilerArguments::Ok(Box::new(hasher))
+                    bypass_incremental: mode == RustIncremental::Cache,
+                }))
             }
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
             CompilerArguments::CannotCache(why, extra_info) => {
@@ -1681,13 +1675,59 @@ impl<T: CommandCreatorSync> CompileCommand<T> for RustCompileCommand {
         self.inner.execute(service, creator).await
     }
 
-    fn prepare_cache_store(&self) -> Option<CacheStoreCheck> {
-        let session = self.incremental.clone()?;
-        let before = session.snapshot();
-        Some(Box::new(move || {
-            (!session.store_after_compile(before)).then_some(CacheStoreVeto::RustIncrementalSession)
-        }))
+    fn cache_store_veto(&self) -> Option<CacheStoreVeto> {
+        let session = self.incremental.as_ref()?;
+        match session.has_finalized_session() {
+            Ok(false) => None,
+            Ok(true) => Some(CacheStoreVeto::RustIncrementalSession),
+            Err(err) => {
+                debug!(
+                    "Could not inspect incremental directory {:?}: {err}",
+                    session.path()
+                );
+                Some(CacheStoreVeto::RustIncrementalSession)
+            }
+        }
     }
+}
+
+fn is_incremental_argument(argument: &Argument<ArgData>) -> bool {
+    matches!(argument.get_data(), Some(CodeGen(ArgCodegen { opt, .. })) if opt == "incremental")
+}
+
+fn rust_compile_command(
+    executable: &Path,
+    arguments: &[Argument<ArgData>],
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+    incremental: Option<&IncrementalSession>,
+) -> Result<RustCompileCommand> {
+    let mut spawn_arguments = Vec::new();
+    for arg in arguments {
+        if let Some(session) = incremental
+            && is_incremental_argument(arg)
+        {
+            let mut value = OsString::from("incremental=");
+            value.push(session.path());
+            spawn_arguments.extend([arg.to_os_string(), value]);
+        } else {
+            spawn_arguments.extend(arg.iter_os_strings());
+        }
+    }
+    let (arguments, response_file) =
+        arguments_for_spawn(executable, &spawn_arguments, COMMAND_LINE_LIMIT)?;
+    Ok(RustCompileCommand {
+        inner: SingleCompileCommand {
+            executable: executable.to_owned(),
+            arguments,
+            env_vars: env_vars.to_owned(),
+            cwd: cwd.to_owned(),
+            // Rustc uses the jobserver to size its codegen thread pool.
+            share_jobserver: true,
+        },
+        _response_file: response_file,
+        incremental: incremental.cloned(),
+    })
 }
 
 fn parse_arguments(
@@ -1999,6 +2039,32 @@ impl RustHasher {
             &self.compiler_shlibs_digests,
         ))
     }
+
+    fn remap_arguments(
+        &self,
+        cwd: &Path,
+        env_vars: &[(OsString, OsString)],
+        basedirs: &[Vec<u8>],
+    ) -> Vec<Argument<ArgData>> {
+        if basedirs_remap_paths(env_vars) {
+            basedirs_remap_arguments(cwd, &self.parsed_args.output_dir, basedirs)
+        } else {
+            vec![]
+        }
+    }
+
+    fn compile_arguments(&self, mut arguments: Vec<Argument<ArgData>>) -> Vec<Argument<ArgData>> {
+        arguments.extend(self.parsed_args.arguments.iter().cloned());
+        // Request color unless rustc is emitting JSON, so the client can strip it as needed.
+        if !self.parsed_args.has_json {
+            arguments.push(Argument::WithValue(
+                "--color",
+                ArgData::Color("always".into()),
+                ArgDisposition::Separated,
+            ));
+        }
+        arguments
+    }
 }
 
 fn cargo_incremental_env(var: &OsStr) -> bool {
@@ -2184,7 +2250,7 @@ where
             .arguments
             .iter()
             // Preflight must never create a rustc incremental session.
-            .filter(|arg| !matches!(arg.get_data(), Some(CodeGen(ArgCodegen { opt, .. })) if opt == "incremental"))
+            .filter(|arg| !is_incremental_argument(arg))
             .map(|arg| {
                 (
                     arg.to_os_string(),
@@ -2343,11 +2409,7 @@ where
             m.update(d.as_bytes());
         }
         let weak_toolchain_key = rust_dist_toolchain_weak_key(&m, &self.sysroot);
-        let remap_arguments = if basedirs_remap_paths(&env_vars) {
-            basedirs_remap_arguments(&cwd, &self.parsed_args.output_dir, basedirs)
-        } else {
-            vec![]
-        };
+        let remap_arguments = self.remap_arguments(&cwd, &env_vars, basedirs);
         let remap_strings: Vec<_> = remap_arguments
             .iter()
             .flat_map(|arg| arg.iter_os_strings())
@@ -2576,16 +2638,7 @@ where
         }
         #[cfg(feature = "dist-client")]
         let remaps_basedirs = !remap_arguments.is_empty();
-        let mut arguments = remap_arguments;
-        arguments.extend(self.parsed_args.arguments.iter().cloned());
-        // Request color output unless json was requested. The client will strip colors if needed.
-        if !self.parsed_args.has_json {
-            arguments.push(Argument::WithValue(
-                "--color",
-                ArgData::Color("always".into()),
-                ArgDisposition::Separated,
-            ));
-        }
+        let arguments = self.compile_arguments(remap_arguments);
 
         let inputs = source_files
             .into_iter()
@@ -2617,6 +2670,28 @@ where
             }),
             weak_toolchain_key,
         })
+    }
+
+    fn cache_bypass_command(
+        &self,
+        cwd: &Path,
+        env_vars: &[(OsString, OsString)],
+        basedirs: &[Vec<u8>],
+    ) -> Result<Option<(&'static str, Box<dyn CompileCommand<T>>)>> {
+        if !self.bypass_incremental {
+            return Ok(None);
+        }
+        let Some(session) = self.incremental_session() else {
+            return Ok(None);
+        };
+        if !session.has_finalized_session().unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let arguments = self.compile_arguments(self.remap_arguments(cwd, env_vars, basedirs));
+        let command =
+            rust_compile_command(&self.executable, &arguments, cwd, env_vars, Some(&session))?;
+        Ok(Some(("incremental session", Box::new(command))))
     }
 
     fn color_mode(&self) -> ColorMode {
@@ -2667,24 +2742,13 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
 
         trace!("[{}]: compile", crate_name);
 
-        let spawn_arguments: Vec<OsString> = arguments
-            .iter()
-            .flat_map(|arg| arg.iter_os_strings())
-            .collect();
-        // The response file lives as long as the command, see `arguments_for_spawn`.
-        let (spawn_arguments, response_file) =
-            arguments_for_spawn(executable, &spawn_arguments, COMMAND_LINE_LIMIT)?;
-        let command = SingleCompileCommand {
-            executable: executable.to_owned(),
-            arguments: spawn_arguments,
-            env_vars: env_vars.to_owned(),
-            cwd: cwd.to_owned(),
-            // rustc reads `CARGO_MAKEFLAGS` and runs codegen on a thread pool
-            // sized by the jobserver. Without one, every concurrent rustc
-            // spawns as many threads as there are CPUs, which is the
-            // oversubscription sccache's own jobserver exists to prevent.
-            share_jobserver: true,
-        };
+        let command = rust_compile_command(
+            executable,
+            arguments,
+            cwd,
+            env_vars,
+            self.incremental.as_ref(),
+        )?;
 
         #[cfg(not(feature = "dist-client"))]
         let dist_command = None;
@@ -2795,11 +2859,6 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             })
         })();
 
-        let command = RustCompileCommand {
-            inner: command,
-            _response_file: response_file,
-            incremental: self.incremental.clone(),
-        };
         Ok((Box::new(command), dist_command, Cacheable::Yes))
     }
 
@@ -3944,21 +4003,24 @@ LLVM version: 15.0.2
     }
 
     #[test]
-    fn test_incremental_marker_identity() {
+    fn test_incremental_directory_identity() {
         let dir = Path::new("incremental");
         let metadata = ["-Cmetadata=a", "--codegen=metadata=b"];
-        let marker = |args: &[&str], version: &str, digests: &[String]| {
-            incremental_session(dir, args, version, digests).marker_path()
+        let private_dir = |args: &[&str], version: &str, digests: &[String]| {
+            incremental_session(dir, args, version, digests)
+                .path()
+                .to_owned()
         };
-        let lib = marker(&metadata, "version", &["digest".into()]);
+        let lib = private_dir(&metadata, "version", &["digest".into()]);
         assert_eq!(
             lib,
-            marker(
+            private_dir(
                 &["-Cmetadata=b", "-Cmetadata=a"],
                 "version",
                 &["digest".into()]
             )
         );
+        assert_eq!(lib.parent(), Some(dir));
         let name = lib.file_name().unwrap().to_str().unwrap();
         let hash = name.strip_prefix("foo-sccache-").unwrap();
         assert_eq!(hash.len(), 16);
@@ -3972,56 +4034,39 @@ LLVM version: 15.0.2
         ] {
             let mut args = metadata.to_vec();
             args.push(extra);
-            assert_ne!(lib, marker(&args, "version", &["digest".into()]));
+            assert_ne!(lib, private_dir(&args, "version", &["digest".into()]));
         }
-        assert_ne!(lib, marker(&metadata, "other version", &["digest".into()]));
-        assert_ne!(lib, marker(&metadata, "version", &["other digest".into()]));
+        assert_ne!(
+            lib,
+            private_dir(&metadata, "other version", &["digest".into()])
+        );
+        assert_ne!(
+            lib,
+            private_dir(&metadata, "version", &["other digest".into()])
+        );
     }
 
     #[test]
-    fn test_incremental_session_observation() {
+    fn test_incremental_private_directory_cold_detection() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let session = incremental_session(root, &[], "version", &[]);
-        let folder = root.join("foo-library");
-        fs::create_dir_all(folder.join("s-abandoned-working")).unwrap();
-        fs::create_dir_all(root.join("foo-harness/s-other-unit")).unwrap();
-        fs::create_dir_all(root.join("other-library/s-other-crate")).unwrap();
-        fs::write(root.join("foo-marker-file"), b"").unwrap();
-        fs::write(folder.join("s-file"), b"").unwrap();
+        let unit = incremental_session(root, &[], "version", &[]);
+        let harness = incremental_session(root, &["--test"], "version", &[]);
+        assert!(!unit.has_finalized_session().unwrap());
 
-        assert!(!session.has_session());
-        let before = session.snapshot();
-        fs::create_dir(folder.join("s-first")).unwrap();
-        assert!(session.store_after_compile(before));
-        let marker = session.marker_path();
-        assert_eq!(fs::read_to_string(&marker).unwrap(), "foo-library");
-        assert!(session.has_session());
+        fs::create_dir_all(harness.path().join("foo-test-id/s-finalized")).unwrap();
+        fs::create_dir_all(root.join("foo-original-id/s-finalized")).unwrap();
+        let crate_dir = unit.path().join("foo-lib-id");
+        fs::create_dir_all(crate_dir.join("s-abandoned-working")).unwrap();
+        fs::write(crate_dir.join("s-file"), b"").unwrap();
+        assert!(!unit.has_finalized_session().unwrap());
+        assert!(harness.has_finalized_session().unwrap());
 
-        fs::remove_file(&marker).unwrap();
-        let before = session.snapshot();
-        fs::remove_dir(folder.join("s-first")).unwrap();
-        fs::create_dir(folder.join("s-second")).unwrap();
-        assert!(!session.store_after_compile(before));
-        assert!(session.has_session());
-        assert!(!session.store_after_compile(session.snapshot()));
-        fs::remove_dir(folder.join("s-second")).unwrap();
-        assert!(!session.has_session());
-
-        fs::write(marker, "foo-library/../foo-harness").unwrap();
-        assert!(!session.has_session());
-    }
-
-    #[test]
-    fn test_incremental_session_observation_rejects_ambiguous_changes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("incremental");
-        let session = incremental_session(&root, &[], "version", &[]);
-        let before = session.snapshot();
-        fs::create_dir_all(root.join("foo-library/s-first")).unwrap();
-        fs::create_dir_all(root.join("foo-harness/s-second")).unwrap();
-        assert!(!session.store_after_compile(before));
-        assert!(!session.marker_path().exists());
+        let other_id = unit.path().join("foo-other-id");
+        fs::create_dir_all(other_id.join("s-finalized")).unwrap();
+        assert!(unit.has_finalized_session().unwrap());
+        fs::remove_dir_all(other_id).unwrap();
+        assert!(!unit.has_finalized_session().unwrap());
     }
 
     #[test]
@@ -4746,6 +4791,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![FAKE_DIGEST.to_owned()],
             dist_archive: None,
+            bypass_incremental: false,
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
@@ -4866,6 +4912,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
                 compiler_shlibs_digests: vec!["abcd1234".to_owned()],
                 dist_archive: None,
+                bypass_incremental: false,
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
                 parsed_args: ParsedArguments {
@@ -4958,6 +5005,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: Some("/toolchains/rust.tar.gz".into()),
+            bypass_incremental: false,
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
@@ -5110,6 +5158,7 @@ foo.rs:
             target_libdir: f.tempdir.path().join("sysroot/lib/rustlib/fake-target/lib"),
             compiler_shlibs_digests: vec![],
             dist_archive: None,
+            bypass_incremental: false,
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args,
@@ -5198,6 +5247,7 @@ foo.rs:
                 target_libdir: cwd.join("sysroot/lib/rustlib/fake-target/lib"),
                 compiler_shlibs_digests: vec![],
                 dist_archive: None,
+                bypass_incremental: false,
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
                 parsed_args,
@@ -5228,7 +5278,10 @@ foo.rs:
             .compilation
             .generate_compile_commands(&mut dist::PathTransformer::new(), false)
             .unwrap();
-        assert!(local.get_arguments().contains(&"incremental=b".into()));
+        let session = incremental_session(&cwd.join("b"), &[], TEST_RUSTC_VERSION, &[]);
+        let mut rewritten = OsString::from("incremental=");
+        rewritten.push(session.path());
+        assert!(local.get_arguments().contains(&rewritten));
         #[cfg(feature = "dist-client")]
         {
             assert!(dist.is_none());

@@ -32,10 +32,14 @@ change the mode.
 - `cache-no-bypass` always looks up eligible invocations and applies the same
   cold-session rule to writes.
 
-sccache records observed sessions in small marker files in the incremental
-directory. `cargo clean -p` removes a package's markers along with its sessions.
-Cache hits restore the normal rustc outputs and leave the incremental sessions
-alone. Incremental and non-incremental builds use separate entries, regardless
+In either cache mode, sccache runs eligible units with a private session
+directory named `DIR/<crate_name>-sccache-<unit hash>`. The first compile into
+an unused directory is cold. Switching between `off` and a cache mode switches
+between Cargo's session location and the private directory. The two cache
+modes share that private directory. `cargo clean -p` removes a package's private
+directories along with its other sessions. Cache hits restore the normal rustc
+outputs without creating or modifying session directories.
+Incremental and non-incremental builds use separate entries, regardless
 of the name of the incremental directory. Cargo forwards variables such as
 `CARGO_INCREMENTAL` to registry dependency compiles, where their values
 participate in non-incremental cache keys. Incremental builds run locally.
@@ -44,6 +48,6 @@ and debuginfo enabled run uncached.
 
 In `--show-stats`, incremental lookups count under Rust hits and misses.
 `Incremental: not stored, session reused` counts successful misses that
-reused a session or whose session could not be confirmed cold. Under
-`Non-cacheable reasons`, `incremental session` counts bypasses of known local
-sessions.
+started with a finalized session or whose session directory could not be read.
+Under `Non-cacheable reasons`, `incremental session` counts bypasses of known
+local sessions.

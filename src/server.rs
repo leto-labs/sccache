@@ -1690,6 +1690,18 @@ where
                             stats.cache_hits.increment(&kind, &lang);
                             stats.cache_read_hit_duration += duration;
                         }
+                        CompileResult::CacheBypass(reason, duration) => {
+                            debug!(
+                                "[{}]: compile result: bypassed cache ({reason})",
+                                out_pretty
+                            );
+                            stats.record_not_cacheable(reason, None);
+                            stats.compilations += 1;
+                            stats.compiler_write_duration += duration;
+                            if !out.status.success() {
+                                stats.compile_fails += 1;
+                            }
+                        }
                         CompileResult::CacheMiss(miss_type, dt, duration, future) => {
                             debug!("[{}]: compile result: cache miss", out_pretty);
                             dist_type = dt;
