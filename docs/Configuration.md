@@ -15,6 +15,9 @@ rust_incremental = "off"
 # Codegen on first-build misses in either incremental cache mode.
 rust_incremental_first_build = "plain"
 
+# Cache metadata-only Rust test, bin and proc-macro targets with "check".
+rust_cache_linked = "off"
+
 # Remove stale Rust incremental sessions after this many days. Set 0 to disable.
 incremental_prune_days = 7
 
@@ -217,6 +220,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_ALLOW_CORE_DUMPS` to enable core dumps by the server
 * `SCCACHE_RUST_INCREMENTAL` overrides the server's `rust_incremental` setting. Values are `off` (default), `cache`, and `cache-no-bypass`. Restart the server to change modes. See [incremental compilation](Rust.md#incremental-compilation).
 * `SCCACHE_RUST_INCREMENTAL_FIRST_BUILD` overrides the server's `rust_incremental_first_build` setting. Values are `plain` (default) and `incremental`. Restart the server to change the setting. See [incremental compilation](Rust.md#incremental-compilation).
+* `SCCACHE_RUST_CACHE_LINKED` overrides the server's `rust_cache_linked` setting. Values are `off` (default), `check`, `proc-macro`, `tests`, and `all`. The last three currently warn at startup and use `check`. Restart the server to change the setting. See [metadata-only target caching](Rust.md#metadata-only-target-caching).
 * `SCCACHE_INCREMENTAL_PRUNE_DAYS` overrides `incremental_prune_days`. The default is 7 days. Set `0` to disable. The server reads this setting at startup. The local incremental fast path reads the client's setting. See [incremental compilation](Rust.md#incremental-compilation).
 * `SCCACHE_MISS_EXPLAIN` overrides the top-level `miss_explain` setting. Use an absolute path to a JSON Lines file. sccache creates the parent directory if needed and does not expand `~` or `%h`. An empty value disables the log. The log is disabled by default. Restart the server to change it. See [explaining cross-worktree misses](Rust.md#explain-cross-worktree-cache-misses).
 * `SCCACHE_SHUTDOWN_DRAIN_SECS` overrides `server.shutdown_drain_secs`. The server closes its listener and waits up to this many seconds for established connections and cache writes. It logs the remaining connection count at info level every 10 seconds. The default is 10 seconds. Set `0` to skip the wait. The server reads this setting at startup.

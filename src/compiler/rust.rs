@@ -21,7 +21,9 @@ use crate::compiler::{
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
-use crate::config::{RustIncremental, RustIncrementalFirstBuild, RustIncrementalSettings};
+use crate::config::{
+    RustCacheLinked, RustIncremental, RustIncrementalFirstBuild, RustIncrementalSettings,
+};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -359,6 +361,7 @@ pub struct ParsedArguments {
     crate_name: String,
     /// The crate types that will be generated
     crate_types: CrateTypes,
+    linked_check: Option<&'static str>,
     /// If dependency info is being emitted, the name of the dep info file.
     dep_info: Option<PathBuf>,
     /// If profile info is being emitted, the path of the profile.
@@ -980,22 +983,24 @@ where
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        self.parse_arguments_with_rust_incremental(
+        self.parse_arguments_with_rust_options(
             arguments,
             cwd,
             env_vars,
             RustIncrementalSettings::default(),
+            RustCacheLinked::Off,
         )
     }
 
-    fn parse_arguments_with_rust_incremental(
+    fn parse_arguments_with_rust_options(
         &self,
         arguments: &[OsString],
         cwd: &Path,
         _env_vars: &[(OsString, OsString)],
         settings: RustIncrementalSettings,
+        rust_cache_linked: RustCacheLinked,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match parse_arguments(arguments, cwd, settings.mode) {
+        match parse_arguments(arguments, cwd, settings.mode, rust_cache_linked) {
             CompilerArguments::Ok(args) => {
                 CompilerArguments::Ok(Box::new(RustHasher {
                     executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
@@ -1762,14 +1767,21 @@ fn parse_arguments(
     arguments: &[OsString],
     cwd: &Path,
     mode: RustIncremental,
+    rust_cache_linked: RustCacheLinked,
 ) -> CompilerArguments<ParsedArguments> {
-    parse_argument_iter(ExpandResponseFile::new(cwd, arguments), cwd, mode)
+    parse_argument_iter(
+        ExpandResponseFile::new(cwd, arguments),
+        cwd,
+        mode,
+        rust_cache_linked,
+    )
 }
 
 fn parse_argument_iter(
     arguments: impl Iterator<Item = OsString>,
     cwd: &Path,
     mode: RustIncremental,
+    rust_cache_linked: RustCacheLinked,
 ) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
@@ -1781,6 +1793,8 @@ fn parse_argument_iter(
         rlib: false,
         staticlib: false,
     };
+    let mut linked_crate_type: Option<&'static str> = None;
+    let mut is_test = false;
     let mut extra_filename = None;
     let mut externs = vec![];
     let mut crate_link_paths = vec![];
@@ -1833,13 +1847,30 @@ fn parse_argument_iter(
                 staticlib,
                 others,
             })) => {
-                // We can't cache non-rlib/staticlib crates, because rustc invokes the
-                // system linker to link them, and we don't know about all the linker inputs.
+                if let Some(kind) = linked_crate_type {
+                    cannot_cache!("crate-type", kind.to_owned());
+                }
                 if !others.is_empty() {
                     let mut others: Vec<&str> = others.iter().map(String::as_str).collect();
-                    others.sort_unstable();
-                    let others_string = others.join(",");
-                    cannot_cache!("crate-type", others_string)
+                    let kind = match others.as_slice() {
+                        ["bin"] => Some("bin"),
+                        ["proc-macro"] => Some("proc-macro"),
+                        _ => None,
+                    };
+                    // Defer the decision for bin and proc-macro until we know whether
+                    // rustc will invoke the linker.
+                    if let Some(kind) = kind
+                        && rust_cache_linked != RustCacheLinked::Off
+                        && !rlib
+                        && !staticlib
+                        && !crate_types.rlib
+                        && !crate_types.staticlib
+                    {
+                        linked_crate_type = Some(kind);
+                    } else {
+                        others.sort_unstable();
+                        cannot_cache!("crate-type", others.join(","));
+                    }
                 }
                 crate_types.rlib |= rlib;
                 crate_types.staticlib |= staticlib;
@@ -1911,6 +1942,7 @@ fn parse_argument_iter(
                         input = Some(val.clone());
                     }
                     Argument::UnknownFlag(ref flag) => {
+                        is_test |= flag == "--test";
                         if let Some(short) = flag.to_str().and_then(|s| s.strip_prefix('-')) {
                             let suffix = short.trim_start_matches(['g', 'O', 'v', 'V', 'h']);
                             debuginfo |= short[..short.len() - suffix.len()].contains('g');
@@ -1937,6 +1969,16 @@ fn parse_argument_iter(
         }
     }
 
+    let linked_check_enabled = rust_cache_linked != RustCacheLinked::Off
+        && emit
+            .as_ref()
+            .is_some_and(|emit| emit.contains("metadata") && !emit.contains("link"));
+    if let Some(kind) = linked_crate_type
+        && !linked_check_enabled
+    {
+        cannot_cache!("crate-type", kind.to_owned());
+    }
+
     // Unwrap required values.
     macro_rules! req {
         ($x:ident) => {
@@ -1959,14 +2001,14 @@ fn parse_argument_iter(
     if !emit.is_empty() && !emit.contains("link") && !emit.contains("metadata") {
         return CompilerArguments::NotCompilation;
     }
-    // If it's not an rlib and not a staticlib then crate-type wasn't passed,
-    // so it will usually be inferred as a binary, though the `#![crate_type`
-    // annotation may dictate otherwise - either way, we don't know what to do.
-    if let CrateTypes {
-        rlib: false,
-        staticlib: false,
-    } = crate_types
-    {
+    let library = crate_types.rlib || crate_types.staticlib;
+    let linked_check = if linked_check_enabled {
+        // --test implies an executable even when Cargo omits --crate-type.
+        linked_crate_type.or((is_test && !library).then_some("test"))
+    } else {
+        None
+    };
+    if !library && linked_check.is_none() {
         cannot_cache!("crate-type", NO_CRATE_TYPE_PASSED.to_owned())
     }
     // We won't cache invocations that are outputting anything but
@@ -1992,12 +2034,12 @@ fn parse_argument_iter(
 
     // Figure out the dep-info filename, if emitting dep-info.
     let dep_info = if emit.contains("dep-info") {
-        let mut dep_info = crate_name.clone();
-        if let Some(extra_filename) = extra_filename.clone() {
-            dep_info.push_str(&extra_filename[..]);
-        }
-        dep_info.push_str(".d");
-        Some(dep_info)
+        let suffix = if linked_check.is_some() {
+            extra_filename_from_args(&args)
+        } else {
+            extra_filename.as_deref().unwrap_or_default()
+        };
+        Some(format!("{crate_name}{suffix}.d"))
     } else {
         None
     };
@@ -2047,6 +2089,7 @@ fn parse_argument_iter(
         arguments: args,
         output_dir,
         crate_types,
+        linked_check,
         externs,
         crate_link_paths,
         staticlibs,
@@ -2062,34 +2105,36 @@ fn parse_argument_iter(
     })
 }
 
+fn extra_filename_from_args(arguments: &[Argument<ArgData>]) -> &str {
+    arguments
+        .iter()
+        .rev()
+        .find_map(|arg| match arg.get_data() {
+            Some(CodeGen(ArgCodegen { opt, value }))
+                if opt == "extra-filename" || opt == "extra_filename" =>
+            {
+                value.as_deref()
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
 impl ParsedArguments {
+    fn metadata_filename(&self) -> String {
+        let suffix = extra_filename_from_args(&self.arguments);
+        format!("lib{}{suffix}.rmeta", self.crate_name)
+    }
+
     fn metadata_output(&self) -> Option<PathBuf> {
-        if !self.crate_types.rlib
-            || !self.emit.contains("metadata")
-            || self
+        let library_metadata = self.crate_types.rlib
+            && self.emit.contains("metadata")
+            && !self
                 .arguments
                 .iter()
-                .any(|arg| matches!(arg, Argument::UnknownFlag(flag) if flag == "--test"))
-        {
-            return None;
-        }
-        let extra_filename = self
-            .arguments
-            .iter()
-            .rev()
-            .find_map(|arg| match arg.get_data() {
-                Some(CodeGen(ArgCodegen { opt, value }))
-                    if opt == "extra-filename" || opt == "extra_filename" =>
-                {
-                    value.as_deref()
-                }
-                _ => None,
-            })
-            .unwrap_or_default();
-        Some(
-            self.output_dir
-                .join(format!("lib{}{extra_filename}.rmeta", self.crate_name)),
-        )
+                .any(|arg| matches!(arg, Argument::UnknownFlag(flag) if flag == "--test"));
+        (self.linked_check.is_some() || library_metadata)
+            .then(|| self.output_dir.join(self.metadata_filename()))
     }
 }
 
@@ -2137,6 +2182,7 @@ pub(crate) fn local_incremental_command(
     cwd: &Path,
     env_vars: &[(OsString, OsString)],
     configured_basedirs: &[Vec<u8>],
+    rust_cache_linked: RustCacheLinked,
 ) -> Result<Option<LocalIncrementalCommand>> {
     if !arguments.iter().any(|arg| {
         arg.starts_with("@")
@@ -2148,9 +2194,12 @@ pub(crate) fn local_incremental_command(
         return Ok(None);
     }
     let raw: Vec<_> = ExpandResponseFile::new(cwd, arguments).collect();
-    let CompilerArguments::Ok(parsed) =
-        parse_argument_iter(raw.iter().cloned(), cwd, RustIncremental::Cache)
-    else {
+    let CompilerArguments::Ok(parsed) = parse_argument_iter(
+        raw.iter().cloned(),
+        cwd,
+        RustIncremental::Cache,
+        rust_cache_linked,
+    ) else {
         return Ok(None);
     };
     let Some(session) = IncrementalSession::from_parsed(&parsed) else {
@@ -2305,6 +2354,7 @@ impl ParsedArguments {
         let crate_types: Vec<_> = [
             self.crate_types.rlib.then_some("rlib"),
             self.crate_types.staticlib.then_some("staticlib"),
+            self.linked_check,
         ]
         .into_iter()
         .flatten()
@@ -2536,13 +2586,21 @@ where
             .flat_map(|(arg, val)| iter::once(arg).chain(val))
             .collect();
         let dep_info_key_arguments = flat_os_string_arguments.clone();
-        let outputs = get_compiler_outputs(
-            creator,
-            &self.executable,
-            flat_os_string_arguments,
-            &cwd,
-            &env_vars,
-        );
+        let outputs = async {
+            if self.parsed_args.linked_check.is_some() {
+                // --print file-names gives the binary name even when rustc only emits metadata.
+                Ok(vec![self.parsed_args.metadata_filename()])
+            } else {
+                get_compiler_outputs(
+                    creator,
+                    &self.executable,
+                    flat_os_string_arguments,
+                    &cwd,
+                    &env_vars,
+                )
+                .await
+            }
+        };
 
         // Hash the contents of the externs listed on the commandline.
         trace!(
@@ -4005,7 +4063,12 @@ mod test {
 
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        parse_arguments(&arguments, ".".as_ref(), RustIncremental::Off)
+        parse_arguments(
+            &arguments,
+            ".".as_ref(),
+            RustIncremental::Off,
+            RustCacheLinked::Off,
+        )
     }
 
     macro_rules! parses {
@@ -4226,6 +4289,96 @@ LLVM version: 15.0.2
         );
     }
 
+    fn parse_linked_check(
+        stage: RustCacheLinked,
+        emit: &str,
+        extra: &[&str],
+    ) -> CompilerArguments<ParsedArguments> {
+        let args = [
+            "foo.rs",
+            "--crate-name=foo",
+            "--out-dir=out",
+            "--emit",
+            emit,
+        ]
+        .into_iter()
+        .chain(extra.iter().copied())
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        parse_arguments(&args, Path::new("."), RustIncremental::Cache, stage)
+    }
+
+    #[test_case("--test", NO_CRATE_TYPE_PASSED, true ; "test metadata")]
+    #[test_case("--test", NO_CRATE_TYPE_PASSED, false ; "test link")]
+    #[test_case("--crate-type=bin", "bin", true ; "bin metadata")]
+    #[test_case("--crate-type=bin", "bin", false ; "bin link")]
+    #[test_case("--crate-type=proc-macro", "proc-macro", true ; "proc macro metadata")]
+    #[test_case("--crate-type=proc-macro", "proc-macro", false ; "proc macro link")]
+    fn test_parse_linked_check(unit: &str, reason: &str, metadata_only: bool) {
+        use RustCacheLinked::{All, Check, Off, ProcMacro, Tests};
+
+        let emit = if metadata_only {
+            "dep-info,metadata"
+        } else {
+            "dep-info,metadata,link"
+        };
+        for stage in [Off, Check, ProcMacro, Tests, All] {
+            let parsed = parse_linked_check(stage, emit, &[unit]);
+            if stage != Off && metadata_only {
+                assert!(matches!(parsed, CompilerArguments::Ok(_)), "{parsed:?}");
+            } else {
+                assert_eq!(
+                    parsed,
+                    CompilerArguments::CannotCache("crate-type", Some(reason.into()))
+                );
+            }
+        }
+    }
+
+    #[test_case("--test", &[], "" ; "test without suffix")]
+    #[test_case("--crate-type=bin", &["-Cextra-filename=-abc"], "-abc" ; "bin with suffix")]
+    #[test_case("--crate-type=proc-macro", &["-Cextra-filename=-first", "-Cextra_filename=-last"], "-last" ; "proc macro last suffix")]
+    fn test_linked_check_metadata_output(unit: &str, extra: &[&str], suffix: &str) {
+        let args = [&[unit], extra].concat();
+        let CompilerArguments::Ok(parsed) =
+            parse_linked_check(RustCacheLinked::Check, "dep-info,metadata", &args)
+        else {
+            panic!("expected cacheable metadata-only target");
+        };
+        assert_eq!(
+            parsed.metadata_output(),
+            Some(Path::new("out").join(format!("libfoo{suffix}.rmeta")))
+        );
+        assert_eq!(
+            parsed.dep_info,
+            Some(PathBuf::from(format!("foo{suffix}.d")))
+        );
+    }
+
+    #[test_case("dep-info,metadata", &["--crate-type=dylib"], "crate-type", Some("dylib") ; "dylib")]
+    #[test_case("dep-info,metadata", &["--crate-type=cdylib"], "crate-type", Some("cdylib") ; "cdylib")]
+    #[test_case("dep-info,metadata", &["--crate-type=proc-macro,bin"], "crate-type", Some("bin,proc-macro") ; "multiple types")]
+    #[test_case("dep-info,metadata", &["--crate-type=bin,lib"], "crate-type", Some("bin") ; "mixed library and bin")]
+    #[test_case("dep-info,metadata", &["--crate-type=lib", "--crate-type=bin"], "crate-type", Some("bin") ; "bin after lib")]
+    #[test_case("dep-info,metadata", &["--crate-type=bin", "--crate-type=lib"], "crate-type", Some("bin") ; "lib after bin")]
+    #[test_case("dep-info,metadata", &[], "crate-type", Some(NO_CRATE_TYPE_PASSED) ; "inferred crate type")]
+    #[test_case("dep-info,metadata,obj", &["--test"], "unsupported --emit", None ; "unsupported emit")]
+    #[test_case("dep-info,metadata", &["--test", "-o", "out/meta"], "-o", None ; "explicit output file")]
+    #[test_case("dep-info,metadata", &["--test", "--emit=link"], "more than one --emit", None ; "repeated emit")]
+    #[test_case("dep-info,metadata", &["--test", "-Cincremental=inc", "-Csave-temps"], "incremental with save-temps", None ; "incremental with save temps")]
+    #[test_case("dep-info,metadata", &["--crate-type=bin", "-Cincremental=inc", "-Csplit-debuginfo=unpacked", "-g"], "incremental with unpacked split debuginfo", None ; "incremental with unpacked debuginfo")]
+    fn test_linked_check_refusals(
+        emit: &str,
+        extra: &[&str],
+        reason: &'static str,
+        detail: Option<&str>,
+    ) {
+        assert_eq!(
+            parse_linked_check(RustCacheLinked::All, emit, extra),
+            CompilerArguments::CannotCache(reason, detail.map(str::to_owned)),
+        );
+    }
+
     const RUST_LIB_ARGS: &[&str] = &[
         "foo.rs",
         "--crate-name=foo",
@@ -4244,7 +4397,7 @@ LLVM version: 15.0.2
             .chain(extra)
             .map(OsString::from)
             .collect::<Vec<_>>();
-        parse_arguments(&args, cwd, mode)
+        parse_arguments(&args, cwd, mode, RustCacheLinked::Off)
     }
 
     #[test_case("lib", "metadata", &[], Some("libfoo.rmeta") ; "lib check")]
@@ -4274,9 +4427,12 @@ LLVM version: 15.0.2
         .chain(extra_args.iter().copied())
         .map(OsString::from)
         .collect::<Vec<_>>();
-        let CompilerArguments::Ok(parsed) =
-            parse_arguments(&args, Path::new("."), RustIncremental::Cache)
-        else {
+        let CompilerArguments::Ok(parsed) = parse_arguments(
+            &args,
+            Path::new("."),
+            RustIncremental::Cache,
+            RustCacheLinked::Off,
+        ) else {
             panic!("expected compile arguments");
         };
         assert_eq!(
@@ -4319,12 +4475,13 @@ LLVM version: 15.0.2
             .map(OsString::from);
             let settings = RustIncrementalSettings { mode, first_build };
             let parsed =
-                Compiler::<Arc<Mutex<MockCommandCreator>>>::parse_arguments_with_rust_incremental(
+                Compiler::<Arc<Mutex<MockCommandCreator>>>::parse_arguments_with_rust_options(
                     &rustc,
                     &args,
                     cwd,
                     &[],
                     settings,
+                    RustCacheLinked::Off,
                 );
             let CompilerArguments::Ok(hasher) = parsed else {
                 panic!("expected incremental arguments to parse");
@@ -4514,10 +4671,16 @@ LLVM version: 15.0.2
         }
     }
 
-    #[test_case(&["--crate-type=lib", "-Cmetadata=fd92c3"] ; "joined")]
-    #[test_case(&["--crate-type", "lib", "-C", "metadata=fd92c3"] ; "separate")]
-    #[test_case(&["--crate-type=lib", "-Cmetadata=fd92c3", "--test"] ; "test")]
-    fn test_client_incremental_path_matches_server(cargo_args: &[&str]) {
+    #[test_case(RustCacheLinked::Off, "--emit=dep-info,metadata,link", &["--crate-type=lib", "-Cmetadata=fd92c3"] ; "joined")]
+    #[test_case(RustCacheLinked::Off, "--emit=dep-info,metadata,link", &["--crate-type", "lib", "-C", "metadata=fd92c3"] ; "separate")]
+    #[test_case(RustCacheLinked::Off, "--emit=dep-info,metadata,link", &["--crate-type=lib", "-Cmetadata=fd92c3", "--test"] ; "test")]
+    #[test_case(RustCacheLinked::Check, "--emit=dep-info,metadata", &["--test"] ; "test metadata")]
+    #[test_case(RustCacheLinked::Check, "--emit=dep-info,metadata", &["--crate-type=bin"] ; "bin metadata")]
+    fn test_client_incremental_path_matches_server(
+        stage: RustCacheLinked,
+        emit: &str,
+        cargo_args: &[&str],
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         for incremental in [
             &["-C", "incremental=inc"][..],
@@ -4530,7 +4693,7 @@ LLVM version: 15.0.2
                 "foo",
                 "--edition=2021",
                 "src/lib.rs",
-                "--emit=dep-info,metadata,link",
+                emit,
                 "--out-dir",
                 "target/debug/deps",
                 "-C",
@@ -4541,16 +4704,17 @@ LLVM version: 15.0.2
             argv.extend_from_slice(incremental);
             let argv: Vec<_> = argv.into_iter().map(OsString::from).collect();
             let CompilerArguments::Ok(parsed) =
-                parse_arguments(&argv, tmp.path(), RustIncremental::Cache)
+                parse_arguments(&argv, tmp.path(), RustIncremental::Cache, stage)
             else {
                 panic!("expected Cargo arguments to parse");
             };
             let server = IncrementalSession::from_parsed(&parsed).unwrap();
             fs::create_dir_all(server.path().join("foo-id/s-old")).unwrap();
 
-            let local = local_incremental_command(Path::new("rustc"), &argv, tmp.path(), &[], &[])
-                .unwrap()
-                .unwrap();
+            let local =
+                local_incremental_command(Path::new("rustc"), &argv, tmp.path(), &[], &[], stage)
+                    .unwrap()
+                    .unwrap();
             assert_eq!(local.session.path(), server.path());
             assert_eq!(
                 &local.arguments[..argv.len() - incremental.len()],
@@ -5349,6 +5513,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     rlib: true,
                     staticlib: false,
                 },
+                linked_check: None,
                 dep_info: None,
                 emit,
                 color_mode: ColorMode::Auto,
@@ -5546,6 +5711,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                         rlib: true,
                         staticlib: false,
                     },
+                    linked_check: None,
                     dep_info: None,
                     emit: ["link".to_string()].into_iter().collect(),
                     color_mode: ColorMode::Auto,
@@ -5640,6 +5806,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     rlib: true,
                     staticlib: false,
                 },
+                linked_check: None,
                 dep_info: Some("foo-abc.d".into()),
                 emit,
                 color_mode: ColorMode::Auto,
@@ -5755,7 +5922,12 @@ foo.rs:
             .iter()
             .map(|a| a.as_ref().to_owned())
             .collect::<Vec<OsString>>();
-        let parsed_args = match parse_arguments(&oargs, cwd, RustIncremental::CacheNoBypass) {
+        let parsed_args = match parse_arguments(
+            &oargs,
+            cwd,
+            RustIncremental::CacheNoBypass,
+            RustCacheLinked::Off,
+        ) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
@@ -5818,7 +5990,8 @@ foo.rs:
             args.extend_from_slice(&["--emit=link", "--out-dir=out", "-Cincremental=inc"]);
             args.extend_from_slice(extra);
             let args: Vec<_> = args.into_iter().map(OsString::from).collect();
-            let CompilerArguments::Ok(parsed) = parse_arguments(&args, cwd, RustIncremental::Cache)
+            let CompilerArguments::Ok(parsed) =
+                parse_arguments(&args, cwd, RustIncremental::Cache, RustCacheLinked::Off)
             else {
                 panic!("arguments did not parse");
             };
@@ -6861,7 +7034,7 @@ foo.rs:
             .unwrap();
         let arg = format!("@{}", td.path().join("args").display());
         let args: Vec<OsString> = vec![OsString::from(arg)];
-        let result = parse_arguments(&args, td.path(), RustIncremental::Off);
+        let result = parse_arguments(&args, td.path(), RustIncremental::Off, RustCacheLinked::Off);
         let parsed = match result {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {:?}", o),
@@ -6878,7 +7051,7 @@ foo.rs:
         // to missing --out-dir / --emit etc.
         let cwd = Path::new("/nonexistent");
         let args: Vec<OsString> = vec![OsString::from("@missing_file")];
-        let result = parse_arguments(&args, cwd, RustIncremental::Off);
+        let result = parse_arguments(&args, cwd, RustIncremental::Off, RustCacheLinked::Off);
         assert!(matches!(result, CompilerArguments::CannotCache(..)));
     }
 

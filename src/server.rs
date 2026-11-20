@@ -22,7 +22,9 @@ use crate::compiler::{
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
-use crate::config::{Config, RustIncrementalSettings, default_incremental_prune_days};
+use crate::config::{
+    Config, RustCacheLinked, RustIncrementalSettings, default_incremental_prune_days,
+};
 use crate::dist;
 use crate::jobserver::Client;
 pub use crate::miss_explain::MissExplainStats;
@@ -768,7 +770,11 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let pool = runtime.handle().clone();
         let mut service =
             SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info)
-                .with_rust_incremental(config.rust_incremental, config.incremental_prune_days());
+                .with_rust_options(
+                    config.rust_incremental,
+                    config.rust_cache_linked.effective(),
+                    config.incremental_prune_days(),
+                );
         service.background_cache_writes = true;
 
         SccacheServer {
@@ -994,6 +1000,7 @@ where
     effective_cache_mode: CacheMode,
 
     rust_incremental: RustIncrementalSettings,
+    rust_cache_linked: RustCacheLinked,
     pub(crate) miss_explain: Option<Arc<MissExplain>>,
     pub(crate) incremental_prune_days: u64,
 
@@ -1120,6 +1127,7 @@ where
                         preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
                         cache_mode: me.effective_cache_mode,
                         rust_incremental: me.rust_incremental,
+                        rust_cache_linked: me.rust_cache_linked,
                         miss_explain: me.miss_explain.is_some(),
                         incremental_prune_days: me.incremental_prune_days,
                         max_size: me.storage.max_size().await.unwrap_or(None),
@@ -1225,6 +1233,7 @@ where
             storage,
             effective_cache_mode,
             rust_incremental: RustIncrementalSettings::default(),
+            rust_cache_linked: RustCacheLinked::default(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1237,12 +1246,14 @@ where
         }
     }
 
-    pub(crate) fn with_rust_incremental(
+    pub(crate) fn with_rust_options(
         mut self,
         settings: RustIncrementalSettings,
+        rust_cache_linked: RustCacheLinked,
         prune_days: u64,
     ) -> Self {
         self.rust_incremental = settings;
+        self.rust_cache_linked = rust_cache_linked;
         self.incremental_prune_days = prune_days;
         self
     }
@@ -1263,6 +1274,7 @@ where
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncrementalSettings::default(),
+            rust_cache_linked: RustCacheLinked::default(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1305,6 +1317,7 @@ where
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncrementalSettings::default(),
+            rust_cache_linked: RustCacheLinked::default(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1674,11 +1687,12 @@ where
                 debug!("check_compiler: Supported compiler");
                 // Now check that we can handle this compiler with
                 // the provided commandline.
-                match c.parse_arguments_with_rust_incremental(
+                match c.parse_arguments_with_rust_options(
                     &cmd,
                     &cwd,
                     &env_vars,
                     self.rust_incremental,
+                    self.rust_cache_linked,
                 ) {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {:?}", cmd);

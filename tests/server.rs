@@ -241,6 +241,22 @@ exec rustc "$@"
         }
     }
 
+    #[test]
+    fn test_managed_server_warns_for_unimplemented_rust_cache_linked_stage() {
+        let fixture = Fixture::new(5, false, 0);
+        let config = fixture.path("config");
+        let contents = fs::read_to_string(&config).unwrap();
+        fs::write(config, format!("rust_cache_linked = 'tests'\n{contents}")).unwrap();
+
+        let server = fixture.start_server();
+        fixture.stop_server();
+        server
+            .wait()
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("not implemented yet, using check"));
+    }
+
     #[test_case(None ; "stop RPC")]
     #[test_case(Some(libc::SIGTERM) ; "SIGTERM")]
     #[test_case(Some(libc::SIGINT) ; "SIGINT")]
