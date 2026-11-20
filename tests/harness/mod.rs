@@ -201,6 +201,7 @@ pub fn sccache_client_cfg(
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     }
 }

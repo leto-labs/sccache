@@ -29,7 +29,7 @@ use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
-use crate::config::RustIncrementalSettings;
+use crate::config::{RustCacheLinked, RustIncrementalSettings};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -515,12 +515,13 @@ where
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>>;
-    fn parse_arguments_with_rust_incremental(
+    fn parse_arguments_with_rust_options(
         &self,
         arguments: &[OsString],
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
         _settings: RustIncrementalSettings,
+        _rust_cache_linked: RustCacheLinked,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
         self.parse_arguments(arguments, cwd, env_vars)
     }

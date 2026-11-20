@@ -807,6 +807,26 @@ pub enum RustIncremental {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum RustCacheLinked {
+    #[default]
+    Off,
+    Check,
+    ProcMacro,
+    Tests,
+    All,
+}
+
+impl RustCacheLinked {
+    pub(crate) fn effective(self) -> Self {
+        match self {
+            Self::Off => Self::Off,
+            Self::Check | Self::ProcMacro | Self::Tests | Self::All => Self::Check,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RustIncrementalFirstBuild {
     #[default]
     Plain,
@@ -907,6 +927,7 @@ pub struct FileConfig {
     pub client_side_mode: bool,
     pub rust_incremental: RustIncremental,
     pub rust_incremental_first_build: RustIncrementalFirstBuild,
+    pub rust_cache_linked: RustCacheLinked,
     pub incremental_prune_days: Option<u64>,
 }
 
@@ -953,6 +974,7 @@ pub struct EnvConfig {
     client_side_mode: Option<bool>,
     rust_incremental: Option<RustIncremental>,
     rust_incremental_first_build: Option<RustIncrementalFirstBuild>,
+    rust_cache_linked: Option<RustCacheLinked>,
     incremental_prune_days: Option<u64>,
 }
 
@@ -1422,6 +1444,19 @@ fn config_from_env() -> Result<EnvConfig> {
         Err(err) => return Err(err).context("Invalid SCCACHE_RUST_INCREMENTAL_FIRST_BUILD"),
     };
 
+    let rust_cache_linked = match env::var("SCCACHE_RUST_CACHE_LINKED") {
+        Ok(value) => Some(match value.as_str() {
+            "off" => RustCacheLinked::Off,
+            "check" => RustCacheLinked::Check,
+            "proc-macro" => RustCacheLinked::ProcMacro,
+            "tests" => RustCacheLinked::Tests,
+            "all" => RustCacheLinked::All,
+            _ => bail!("SCCACHE_RUST_CACHE_LINKED must be off, check, proc-macro, tests, or all"),
+        }),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => return Err(err).context("Invalid SCCACHE_RUST_CACHE_LINKED"),
+    };
+
     let incremental_prune_days = match env::var("SCCACHE_INCREMENTAL_PRUNE_DAYS") {
         Ok(value) => Some(
             value
@@ -1442,6 +1477,7 @@ fn config_from_env() -> Result<EnvConfig> {
         miss_explain: env::var_os("SCCACHE_MISS_EXPLAIN").map(PathBuf::from),
         rust_incremental,
         rust_incremental_first_build,
+        rust_cache_linked,
         incremental_prune_days,
         cache,
         disk_reflink,
@@ -1548,6 +1584,7 @@ pub struct Config {
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
     pub rust_incremental: RustIncrementalSettings,
+    pub rust_cache_linked: RustCacheLinked,
     pub incremental_prune_days: Option<u64>,
 }
 
@@ -1584,6 +1621,7 @@ impl Config {
             client_side_mode: file_client_side_mode,
             rust_incremental: file_rust_incremental,
             rust_incremental_first_build: file_first_build,
+            rust_cache_linked: file_rust_cache_linked,
             incremental_prune_days: file_incremental_prune_days,
         } = file_conf;
         conf_caches.merge(cache);
@@ -1601,6 +1639,7 @@ impl Config {
             client_side_mode: env_client_side_mode,
             rust_incremental: env_rust_incremental,
             rust_incremental_first_build: env_first_build,
+            rust_cache_linked: env_rust_cache_linked,
             incremental_prune_days: env_incremental_prune_days,
         } = env_conf;
         let server = ServerConfig {
@@ -1679,6 +1718,7 @@ impl Config {
                 mode: env_rust_incremental.unwrap_or(file_rust_incremental),
                 first_build: env_first_build.unwrap_or(file_first_build),
             },
+            rust_cache_linked: env_rust_cache_linked.unwrap_or(file_rust_cache_linked),
             incremental_prune_days: env_incremental_prune_days.or(file_incremental_prune_days),
         })
     }
@@ -2100,6 +2140,35 @@ fn test_disk_reflink_config() {
 }
 
 #[test]
+fn test_rust_cache_linked_config() {
+    let env_var = "SCCACHE_RUST_CACHE_LINKED";
+    let mode = |env, file| {
+        temp_env::with_var(env_var, env, || {
+            let env = config_from_env().unwrap();
+            let file = toml::from_str(file).unwrap();
+            Config::from_env_and_file_configs(env, file)
+                .unwrap()
+                .rust_cache_linked
+        })
+    };
+    assert_eq!(mode(None, ""), RustCacheLinked::Off);
+    assert_eq!(
+        mode(None, "rust_cache_linked = 'check'"),
+        RustCacheLinked::Check
+    );
+    for (value, expected) in [
+        ("off", RustCacheLinked::Off),
+        ("check", RustCacheLinked::Check),
+        ("proc-macro", RustCacheLinked::ProcMacro),
+        ("tests", RustCacheLinked::Tests),
+        ("all", RustCacheLinked::All),
+    ] {
+        assert_eq!(mode(Some(value), "rust_cache_linked = 'check'"), expected);
+    }
+    assert!(temp_env::with_var(env_var, Some("invalid"), config_from_env).is_err());
+}
+
+#[test]
 fn config_overrides() {
     let env_conf = EnvConfig {
         server: Default::default(),
@@ -2137,6 +2206,7 @@ fn config_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2172,6 +2242,7 @@ fn config_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2235,6 +2306,7 @@ fn config_overrides() {
             basedirs: vec![],
             client_side_mode: false,
             rust_incremental: Default::default(),
+            rust_cache_linked: Default::default(),
             incremental_prune_days: None,
         }
     );
@@ -2254,6 +2326,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2267,6 +2340,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2284,6 +2358,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2297,6 +2372,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2314,6 +2390,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2327,6 +2404,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2344,6 +2422,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2357,6 +2436,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2378,6 +2458,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2391,6 +2472,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2408,6 +2490,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2421,6 +2504,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2438,6 +2522,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2451,6 +2536,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2468,6 +2554,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2481,6 +2568,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2496,6 +2584,7 @@ fn config_basedirs_overrides() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2509,6 +2598,7 @@ fn config_basedirs_overrides() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -2850,6 +2940,7 @@ fn test_env_basedirs_with_spaces() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
@@ -2885,6 +2976,7 @@ fn test_env_basedirs_with_spaces() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
@@ -3591,6 +3683,7 @@ key_prefix = "cosprefix"
             client_side_mode: false,
             rust_incremental: Default::default(),
             rust_incremental_first_build: Default::default(),
+            rust_cache_linked: Default::default(),
             incremental_prune_days: None,
         }
     );
@@ -3690,6 +3783,7 @@ size = "7g"
             client_side_mode: false,
             rust_incremental: Default::default(),
             rust_incremental_first_build: Default::default(),
+            rust_cache_linked: Default::default(),
             incremental_prune_days: None,
         }
     );
@@ -3741,6 +3835,7 @@ fn test_integration_config_normalizes_and_strips() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3754,6 +3849,7 @@ fn test_integration_config_normalizes_and_strips() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3788,6 +3884,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3801,6 +3898,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3831,6 +3929,7 @@ fn test_integration_windows_path_normalization() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3844,6 +3943,7 @@ fn test_integration_windows_path_normalization() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3875,6 +3975,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3888,6 +3989,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3919,6 +4021,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3932,6 +4035,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3962,6 +4066,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -3975,6 +4080,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -4010,6 +4116,7 @@ fn test_integration_paths_with_dots_normalized() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -4023,6 +4130,7 @@ fn test_integration_paths_with_dots_normalized() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -4054,6 +4162,7 @@ fn test_integration_windows_mixed_slashes() {
         client_side_mode: None,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 
@@ -4067,6 +4176,7 @@ fn test_integration_windows_mixed_slashes() {
         client_side_mode: false,
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
+        rust_cache_linked: Default::default(),
         incremental_prune_days: None,
     };
 

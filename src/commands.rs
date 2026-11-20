@@ -113,7 +113,7 @@ async fn read_server_startup_status<R: AsyncReadExt + Unpin>(
 /// Re-execute the current executable as a background server, and wait
 /// for it to start up.
 #[cfg(not(windows))]
-fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup> {
+fn spawn_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup> {
     trace!("run_server_process");
     let tempdir = tempfile::Builder::new().prefix("sccache").tempdir()?;
     let socket_path = tempdir.path().join("sock");
@@ -203,7 +203,7 @@ fn redirect_error_log(f: File) -> Result<()> {
 
 /// Re-execute the current executable as a background server.
 #[cfg(windows)]
-fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup> {
+fn spawn_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup> {
     use futures::StreamExt;
     use std::mem;
     use std::os::windows::ffi::OsStrExt;
@@ -331,6 +331,22 @@ fn run_server_process(startup_timeout: Option<Duration>) -> Result<ServerStartup
     })
 }
 
+fn run_server_process(config: &Config) -> Result<ServerStartup> {
+    let startup = spawn_server_process(config.server_startup_timeout)?;
+    if matches!(startup, ServerStartup::Ok { .. }) {
+        warn_rust_cache_linked_fallback(config);
+    }
+    Ok(startup)
+}
+
+fn warn_rust_cache_linked_fallback(config: &Config) {
+    if config.rust_cache_linked != config.rust_cache_linked.effective() {
+        eprintln!(
+            "sccache: configured rust_cache_linked stage is not implemented yet, using check"
+        );
+    }
+}
+
 /// Attempt to connect to an sccache server listening on `addr`, or start one if no server is running.
 fn connect_or_start_server(
     addr: &crate::net::SocketAddr,
@@ -349,7 +365,7 @@ fn connect_or_start_server(
         {
             // If the connection was refused we probably need to start
             // the server.
-            match run_server_process(config.server_startup_timeout)? {
+            match run_server_process(config)? {
                 ServerStartup::Ok { addr: actual_addr } => {
                     if addr.to_string() != actual_addr {
                         // bail as the next connect_with_retry will fail
@@ -793,6 +809,7 @@ where
     let cache_mode = runtime.block_on(storage.check())?;
     let conn_arc = storage.conn();
     let rust_incremental = storage.rust_incremental();
+    let rust_cache_linked = storage.rust_cache_linked();
     let incremental_prune_days = storage.incremental_prune_days();
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = server::WaitUntilZero::new();
@@ -805,7 +822,7 @@ where
         tx,
         info,
     )
-    .with_rust_incremental(rust_incremental, incremental_prune_days);
+    .with_rust_options(rust_incremental, rust_cache_linked, incremental_prune_days);
     let compile = Compile {
         exe: exe_path.as_os_str().to_owned(),
         cwd: cwd.as_os_str().to_owned(),
@@ -853,7 +870,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
     // Config isn't required for all commands, but if it's broken then we should flag
     // it early and loudly.
     let config = &Config::load()?;
-    let startup_timeout = config.server_startup_timeout;
 
     match cmd {
         Command::ShowStats(fmt, advanced) => {
@@ -903,6 +919,9 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         Command::InternalStartServer => {
             trace!("Command::InternalStartServer");
+            if env::var_os("SCCACHE_STARTUP_NOTIFY").is_none() {
+                warn_rust_cache_linked_fallback(config);
+            }
             if env::var("SCCACHE_ERROR_LOG").is_ok() {
                 let f = create_error_log()?;
                 #[cfg(not(windows))]
@@ -921,8 +940,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         Command::StartServer => {
             trace!("Command::StartServer");
             println!("sccache: Starting the server...");
-            let startup =
-                run_server_process(startup_timeout).context("failed to start server process")?;
+            let startup = run_server_process(config).context("failed to start server process")?;
             match startup {
                 ServerStartup::Ok { addr } => {
                     println!("sccache: Listening on address {addr}");
@@ -1050,6 +1068,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &cwd,
                     &env_vars,
                     &config.basedirs,
+                    config.rust_cache_linked.effective(),
                 )?
             {
                 let exe_path = which_in(&exe, env::var_os("PATH"), &cwd)?;

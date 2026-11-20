@@ -16,6 +16,26 @@ If you are using Rust 1.18 or later, you can ask cargo to wrap all compilation w
 
 To compute the cache key of a crate, sccache runs `rustc --emit=dep-info` to list its source files, and `rustc --print file-names` to list its outputs. The server remembers what both found, and reuses it for a later compile of the crate with the same compiler, arguments, working directory, environment, externs, static libraries and target spec, as long as every listed source file still has the same contents. This lasts for the life of the server; nothing is written to the cache. As with the preprocessor cache, a file that was not listed does not invalidate it: for instance, adding `foo/mod.rs` next to an existing `foo.rs` keeps reusing the cached result instead of failing with an ambiguous module error.
 
+## Metadata-only target caching
+
+Set `rust_cache_linked = "check"` at the top level of the server config or
+set `SCCACHE_RUST_CACHE_LINKED=check` when starting the server. The environment
+variable takes precedence. Restart the server to change the mode. The default
+is `off`.
+
+The stages are cumulative.
+
+| Mode | Target coverage |
+| --- | --- |
+| `off` | Default Rust caching rules |
+| `check` | Also caches tests, binaries, examples, benches and proc-macros when `--emit` includes `metadata` and omits `link` |
+| `proc-macro` | Reserved for linked proc-macros |
+| `tests` | Reserved for linked test harnesses |
+| `all` | Reserved for linked binaries, examples and build scripts |
+
+The reserved stages warn at startup and use `check`. The `check` stage derives
+the `.rmeta` filename directly, including empty metadata files for tests and
+binaries. These lookups appear as Rust hits and misses in `--show-stats`.
 
 ## Incremental compilation
 
@@ -36,15 +56,17 @@ environment selects `cache` when the configured mode is `off`.
   cold-session rule to writes.
 
 Set `SCCACHE_RUST_INCREMENTAL=cache` in the build environment as well as on
-the server to bypass cache traffic before connecting. Keep the client's
-basedirs settings aligned with the server's when using path remapping.
+the server to bypass cache traffic before connecting. For metadata-only
+targets enabled by `rust_cache_linked`, also set the same linked cache mode
+in the build environment. Keep the client's basedirs settings aligned with
+the server's when using path remapping.
 Warm compiles that bypass in the client do not appear in server statistics.
 
-In either cache mode, a cache miss for a Rust library with a known metadata
+In either cache mode, a cache miss for a Rust target with a known metadata
 output path, no existing `.rmeta` and no finalized session compiles without
 `-C incremental` by default. This avoids cold incremental overhead and defers
 session creation until the first rebuild. Cargo keeps the previous `.rmeta`,
-including metadata-only builds from `cargo check`. A library with existing
+including metadata-only builds from `cargo check`. A target with existing
 metadata, or whose metadata path cannot be determined, compiles incrementally.
 Such a plain compile also gets `-C lto=off` unless the command sets `-C lto`:
 incremental compiles skip rustc's thin local LTO across codegen units, and
@@ -77,7 +99,7 @@ the daemon and runs rustc directly.
 Invocations with and without `-C incremental` use separate entries,
 regardless of the incremental directory name. An incremental invocation uses
 the same key whether its cold compile runs plain or incremental. Both produce
-complete libraries, and cache hits reuse whichever output was stored.
+the requested outputs, and cache hits reuse whichever output was stored.
 Dependents hash the exact metadata they compile against, and rustc validates
 upstream crates by SVH when reusing a dependent's incremental session.
 Cargo forwards variables such as `CARGO_INCREMENTAL` and

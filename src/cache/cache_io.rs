@@ -817,8 +817,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn raw_cache_entry_hit_replaces_inode() {
+    #[test_case::test_case(4097 ; "object")]
+    #[test_case::test_case(0 ; "empty metadata")]
+    fn raw_cache_entry_hit_replaces_inode(size: usize) {
         use std::os::unix::fs::MetadataExt;
 
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -830,12 +831,36 @@ mod tests {
         fs::write(&path, b"session metadata").unwrap();
         fs::hard_link(&path, &session).unwrap();
         let archive = dir.path().join("entry.zip");
-        fs::write(&archive, raw_entry(&[4097]).finish().unwrap()).unwrap();
+        fs::write(&archive, raw_entry(&[size]).finish().unwrap()).unwrap();
+        let (key, payload) = raw_member(size);
+        #[cfg(target_os = "linux")]
+        if size == 0 {
+            use std::os::unix::fs::PermissionsExt;
+
+            let empty = dir.path().join("empty.rmeta");
+            fs::write(&empty, &payload).unwrap();
+            fs::set_permissions(&empty, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let objects = CacheWrite::open_objects([FileObjectSource {
+                key: key.clone(),
+                path: empty,
+                optional: false,
+            }])
+            .unwrap();
+            assert!(
+                CacheWrite::try_reflink_objects(
+                    &File::create(&archive).unwrap(),
+                    &objects,
+                    &[],
+                    &[]
+                )
+                .unwrap()
+            );
+        }
         let reader = CacheRead::from_file(fs::File::open(archive).unwrap(), true).unwrap();
         runtime
             .block_on(reader.extract_objects(
                 [FileObjectSource {
-                    key: raw_member(4097).0,
+                    key,
                     path: path.clone(),
                     optional: false,
                 }],
@@ -843,7 +868,7 @@ mod tests {
             ))
             .unwrap();
 
-        assert_eq!(fs::read(&path).unwrap(), raw_member(4097).1);
+        assert_eq!(fs::read(&path).unwrap(), payload);
         assert_eq!(fs::read(&session).unwrap(), b"session metadata");
         assert_ne!(
             fs::metadata(&path).unwrap().ino(),

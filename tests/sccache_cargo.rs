@@ -1213,6 +1213,185 @@ fn incremental_stats(test: &SccacheTest, hits: u64, misses: u64) -> Result<serde
     Ok(stats.clone())
 }
 
+#[test_case("off", false, false ; "off")]
+#[test_case("check", false, false ; "check")]
+#[test_case("check", true, false ; "incremental check")]
+#[test_case("check", true, true ; "client side incremental check")]
+#[serial]
+fn test_rust_cargo_linked_check(stage: &str, incremental: bool, client_side: bool) -> Result<()> {
+    let test = SccacheTest::new(Some(&[(
+        "SCCACHE_CLIENT_SIDE",
+        if client_side { "1" } else { "0" }.into(),
+    )]))?;
+    let root = real_tempdir(&test)?;
+    let [a, b] = ["a", "b"].map(|name| root.join(name));
+    let incremental_mode = if incremental { "cache" } else { "off" };
+    restart_sccache(
+        &test,
+        Some(vec![
+            ("SCCACHE_RUST_CACHE_LINKED".into(), stage.into()),
+            ("SCCACHE_RUST_INCREMENTAL".into(), incremental_mode.into()),
+        ]),
+    )?;
+    let cargo = |checkout: &Path, cmd| {
+        let mut cargo = incremental_cargo(&test, checkout, cmd);
+        cargo
+            .env("SCCACHE_BASEDIRS", checkout)
+            .env("SCCACHE_RUST_CACHE_LINKED", "off")
+            .env("CARGO_INCREMENTAL", if incremental { "1" } else { "0" });
+        cargo
+    };
+
+    let cacheable = if stage == "off" { 1 } else { 5 };
+    for (checkout, hits, misses) in [(&a, 0, cacheable), (&b, cacheable, 0)] {
+        fs::create_dir_all(checkout.join("src"))?;
+        fs::create_dir_all(checkout.join("tests"))?;
+        fs::write(
+            checkout.join("Cargo.toml"),
+            "[package]\nname = 'linked-check'\nversion = '0.1.0'\nedition = '2021'\n\
+             [workspace]\n[lib]\nname = 'linked_lib'\n\
+             [[bin]]\nname = 'linked_bin'\npath = 'src/main.rs'\n\
+             [profile.dev]\nsplit-debuginfo = 'off'\n",
+        )?;
+        fs::write(
+            checkout.join("src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n\
+             #[test] fn unit_test() { assert_eq!(answer(), 42); }\n",
+        )?;
+        fs::write(
+            checkout.join("src/main.rs"),
+            "fn main() { println!(\"{}\", linked_lib::answer()); }\n",
+        )?;
+        fs::write(
+            checkout.join("tests/integration.rs"),
+            "#[test] fn integration_test() { assert_eq!(linked_lib::answer(), 42); }\n",
+        )?;
+
+        zero_incremental_stats()?;
+        cargo(checkout, "check")
+            .arg("--all-targets")
+            .assert()
+            .try_success()?;
+        let stats = incremental_stats(&test, hits, misses)?;
+        assert_eq!(stats["cache_writes"], misses);
+        for (reason, refused) in [("crate-type", 3), ("crate-type (bin)", 1)] {
+            assert_eq!(
+                stats["not_cached"][reason].as_u64().unwrap_or_default(),
+                if stage == "off" { refused } else { 0 },
+                "{stats}"
+            );
+        }
+        if incremental {
+            for name in ["linked_lib", "linked_bin", "integration"] {
+                assert!(incremental_crate_dirs(checkout, name)?.is_empty());
+            }
+        }
+    }
+
+    let mut empty_metadata = 0;
+    for entry in fs::read_dir(b.join("target/debug/deps"))? {
+        let entry = entry?;
+        if entry.path().extension().is_some_and(|ext| ext == "rmeta")
+            && entry.metadata()?.len() == 0
+        {
+            empty_metadata += 1;
+        }
+    }
+    assert_eq!(empty_metadata, 4);
+    if stage != "off" {
+        if incremental {
+            for (edit, misses) in [(1, 1), (2, 0)] {
+                fs::write(
+                    b.join("src/main.rs"),
+                    format!(
+                        "// edit {edit}\nfn main() {{ println!(\"{{}}\", linked_lib::answer()); }}\n"
+                    ),
+                )?;
+                zero_incremental_stats()?;
+                let mut check = cargo(&b, "check");
+                if client_side {
+                    check
+                        .env("SCCACHE_RUST_INCREMENTAL", "cache")
+                        .env("SCCACHE_RUST_CACHE_LINKED", "check");
+                }
+                check.args(["--bin", "linked_bin"]).assert().try_success()?;
+                let stats = incremental_stats(&test, 0, misses)?;
+                assert_eq!(stats["cache_writes"], misses);
+                assert_eq!(
+                    stats["not_cached"]["incremental session"]
+                        .as_u64()
+                        .unwrap_or_default(),
+                    u64::from(edit == 2 && !client_side),
+                    "{stats}"
+                );
+                if edit == 2 && client_side {
+                    assert_eq!(stats["compile_requests"], 0, "{stats}");
+                }
+                assert_eq!(private_incremental_dirs(&b, "linked_bin")?.len(), 1);
+            }
+        }
+        cargo(&b, "test")
+            .assert()
+            .try_success()?
+            .try_stdout(predicate::str::contains("test unit_test ... ok"))?
+            .try_stdout(predicate::str::contains("test integration_test ... ok"))?;
+        cargo(&b, "run")
+            .assert()
+            .try_success()?
+            .try_stdout("42\n")?;
+    }
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_rust_metadata_only_proc_macro() -> Result<()> {
+    let test = SccacheTest::new(None)?;
+    let root = real_tempdir(&test)?;
+    let config = root.join("sccache.toml");
+    fs::write(&config, "rust_cache_linked = 'proc-macro'\n")?;
+    stop_sccache()?;
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("--start-server")
+        .env("SCCACHE_DIR", root.join("cache"))
+        .env("SCCACHE_CONF", &config)
+        .env_remove("SCCACHE_RUST_CACHE_LINKED")
+        .assert()
+        .try_success()?
+        .try_stderr(predicate::str::contains("not implemented yet, using check"))?;
+
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let [a, b] = ["a", "b"].map(|name| root.join(name));
+    for dir in [&a, &b] {
+        fs::create_dir_all(dir.join("out"))?;
+        fs::write(
+            dir.join("identity.rs"),
+            "extern crate proc_macro;\n\
+             #[proc_macro] pub fn identity(input: proc_macro::TokenStream) -> proc_macro::TokenStream { input }\n",
+        )?;
+        Command::new(SCCACHE_BIN.as_os_str())
+            .arg(&rustc)
+            .args([
+                "--crate-name=identity",
+                "--crate-type=proc-macro",
+                "--emit=dep-info,metadata",
+                "--out-dir=out",
+                "identity.rs",
+            ])
+            .current_dir(dir)
+            .env("SCCACHE_BASEDIRS", dir)
+            .env("SCCACHE_RUST_CACHE_LINKED", "off")
+            .assert()
+            .try_success()?;
+        assert!(dir.join("out/identity.d").is_file());
+    }
+    incremental_stats(&test, 1, 1)?;
+    let original = fs::read(a.join("out/libidentity.rmeta"))?;
+    assert!(!original.is_empty());
+    assert_eq!(fs::read(b.join("out/libidentity.rmeta"))?, original);
+    Ok(())
+}
+
 #[test_case(None ; "default")]
 #[test_case(Some("1") ; "upstream allow")]
 #[serial]
