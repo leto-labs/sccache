@@ -1710,6 +1710,10 @@ fn is_incremental_argument(argument: &Argument<ArgData>) -> bool {
     matches!(argument.get_data(), Some(CodeGen(ArgCodegen { opt, .. })) if opt == "incremental")
 }
 
+fn is_lto_argument(argument: &Argument<ArgData>) -> bool {
+    matches!(argument.get_data(), Some(CodeGen(ArgCodegen { opt, .. })) if opt == "lto")
+}
+
 fn rust_compile_command(
     executable: &Path,
     arguments: &[Argument<ArgData>],
@@ -1718,16 +1722,25 @@ fn rust_compile_command(
     incremental: Option<&IncrementalSession>,
 ) -> Result<RustCompileCommand> {
     let mut spawn_arguments = Vec::new();
+    let mut dropped_incremental = false;
     for arg in arguments {
         if is_incremental_argument(arg) {
             if let Some(session) = incremental {
                 let mut value = OsString::from("incremental=");
                 value.push(session.path());
                 spawn_arguments.extend([arg.to_os_string(), value]);
+            } else {
+                dropped_incremental = true;
             }
         } else {
             spawn_arguments.extend(arg.iter_os_strings());
         }
+    }
+    // An incremental compile skips rustc's thin local LTO across codegen units.
+    // Without this, the plain compile replacing it would do that extra work,
+    // which above opt-level 0 costs more than the incremental compile it saves.
+    if dropped_incremental && !arguments.iter().any(is_lto_argument) {
+        spawn_arguments.extend([OsString::from("-C"), OsString::from("lto=off")]);
     }
     let (arguments, response_file) =
         arguments_for_spawn(executable, &spawn_arguments, COMMAND_LINE_LIMIT)?;
@@ -4359,7 +4372,12 @@ LLVM version: 15.0.2
         assert!(
             plain_arguments
                 .iter()
-                .all(|arg| arg != "-C" && arg != "--codegen" && !arg.starts_with("incremental="))
+                .all(|arg| arg != "--codegen" && !arg.starts_with("incremental="))
+        );
+        assert!(
+            plain_arguments
+                .windows(2)
+                .any(|pair| pair[0] == "-C" && pair[1] == "lto=off")
         );
 
         let session = incremental_session(&cwd.join("inc"), &[]);
@@ -4367,7 +4385,9 @@ LLVM version: 15.0.2
         rewritten.push(session.path());
         let legacy = hash(&mut *new_hasher(emit, RustIncremental::Cache, Incremental));
         assert_eq!(first_build.key, legacy.key);
-        assert!(compile(&legacy).get_arguments().contains(&rewritten));
+        let legacy_arguments = compile(&legacy).get_arguments();
+        assert!(legacy_arguments.contains(&rewritten));
+        assert!(!legacy_arguments.iter().any(|arg| arg == "lto=off"));
 
         fixture.touch("out/libfoo.rmeta").unwrap();
         let rebuild = hash(&mut *hasher);
@@ -5788,6 +5808,36 @@ foo.rs:
             )
             .wait()
             .unwrap()
+    }
+
+    #[test]
+    fn test_plain_first_build_turns_off_thin_local_lto() {
+        let cwd = Path::new("/");
+        let plain_args = |extra: &[&str]| {
+            let mut args = vec!["foo.rs", "--crate-name=foo", "--crate-type=lib"];
+            args.extend_from_slice(&["--emit=link", "--out-dir=out", "-Cincremental=inc"]);
+            args.extend_from_slice(extra);
+            let args: Vec<_> = args.into_iter().map(OsString::from).collect();
+            let CompilerArguments::Ok(parsed) = parse_arguments(&args, cwd, RustIncremental::Cache)
+            else {
+                panic!("arguments did not parse");
+            };
+            let command =
+                rust_compile_command(Path::new("rustc"), &parsed.arguments, cwd, &[], None)
+                    .unwrap();
+            CompileCommand::<Arc<Mutex<MockCommandCreator>>>::get_arguments(&command)
+        };
+        let lto_values = |args: Vec<OsString>| -> Vec<OsString> {
+            args.windows(2)
+                .filter(|pair| pair[0] == "-C" && pair[1].to_string_lossy().starts_with("lto"))
+                .map(|pair| pair[1].clone())
+                .collect()
+        };
+        assert_eq!(lto_values(plain_args(&[])), [OsString::from("lto=off")]);
+        assert_eq!(
+            lto_values(plain_args(&["-C", "lto=fat"])),
+            [OsString::from("lto=fat")]
+        );
     }
 
     #[test]
