@@ -29,19 +29,25 @@ The stages are cumulative.
 | `off` | Default Rust caching rules |
 | `check` | Also caches tests, binaries, examples, benches and proc-macros when `--emit` includes `metadata` and omits `link` |
 | `proc-macro` | Also caches eligible linked proc-macros |
-| `tests` | Also caches eligible linked unit and integration test harnesses |
-| `all` | Also caches eligible linked binaries, examples and build scripts |
+| `tests` | Also caches eligible linked unit and integration test harnesses, including custom integration tests with `harness = false` |
+| `all` | Also caches eligible linked binaries, examples, build scripts and custom benches without `--cfg test` |
 
-The `check` stage derives the `.rmeta` filename directly, including empty
-metadata files for tests and binaries. These lookups appear as Rust hits and misses in `--show-stats`.
+The `check` stage also covers metadata-only invocations that omit
+`--crate-type`. It derives `lib<crate><extra-filename>.rmeta` directly,
+including empty metadata files for tests and binaries. These lookups appear as
+Rust hits and misses in `--show-stats`.
 
 ### Linked outputs
 
 Linked caching supports native Linux GNU targets with a GNU-style linker
 that supports `--dependency-file`. It covers `--crate-type proc-macro`,
 Cargo's `--test` invocations without an explicit crate type, and
-`--crate-type bin`, according to the selected stage. `cdylib` and `dylib`
-compile uncached.
+`--crate-type bin`, according to the selected stage. For linked invocations
+that omit both `--crate-type` and `--test`, `--cfg test` selects the `tests`
+stage. Other implicit binaries require `all`. The executable is
+`<out-dir>/<crate><extra-filename>`. Linked hits and misses count under Rust
+in `--show-stats`. Implicit binaries excluded by the selected stage count
+under the `crate-type` non-cacheable reason. `cdylib` and `dylib` compile uncached.
 
 sccache restores the output and its mode through a temporary-file rename,
 including with the [disk cache's reflink support](Local.md#reflink-cache-hits).
