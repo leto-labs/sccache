@@ -77,6 +77,25 @@ fn ignore_all_server_io_errors() -> bool {
     }
 }
 
+fn warn_if_server_disconnected(error: &Error) -> bool {
+    let disconnected = error.downcast_ref::<io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionRefused
+                | io::ErrorKind::ConnectionAborted
+        )
+    });
+    if disconnected {
+        eprintln!(
+            "sccache: warning: The server looks like it shut down unexpectedly, compiling locally instead"
+        );
+    }
+    disconnected
+}
+
 async fn read_server_startup_status<R: AsyncReadExt + Unpin>(
     mut server: R,
 ) -> Result<ServerStartup> {
@@ -552,29 +571,15 @@ where
                     }
                     Ok(Response::CompileFinished(result)) => break Some(result),
                     Ok(_) => bail!("unexpected response from server"),
-                    Err(e) => {
-                        match e.downcast_ref::<io::Error>() {
-                            Some(io_e) if io_e.kind() == io::ErrorKind::UnexpectedEof => {
-                                eprintln!(
-                                    "sccache: warning: The server looks like it shut down \
-                                     unexpectedly, compiling locally instead"
-                                );
-                            }
-                            _ => {
-                                //TODO: something better here?
-                                if ignore_all_server_io_errors() {
-                                    eprintln!(
-                                        "sccache: warning: error reading compile response from server \
-                                         compiling locally instead"
-                                    );
-                                } else {
-                                    return Err(e)
-                                        .context("error reading compile response from server");
-                                }
-                            }
-                        }
+                    Err(e) if warn_if_server_disconnected(&e) => break None,
+                    Err(_) if ignore_all_server_io_errors() => {
+                        eprintln!(
+                            "sccache: warning: error reading compile response from server \
+                             compiling locally instead"
+                        );
                         break None;
                     }
+                    Err(e) => return Err(e).context("error reading compile response from server"),
                 }
             }
         }
@@ -714,7 +719,11 @@ where
 {
     trace!("do_compile");
     let exe_path = which_in(exe, path, cwd)?;
-    let res = request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars)?;
+    let res = match request_compile(&mut conn, &exe_path, &cmdline, cwd, env_vars) {
+        Ok(response) => response,
+        Err(e) if warn_if_server_disconnected(&e) => CompileResponse::UnhandledCompile,
+        Err(e) => return Err(e),
+    };
     handle_compile_response(
         creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, stdout, stderr,
     )
@@ -742,8 +751,25 @@ where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
     trace!("do_compile_client_side");
-    let Response::StorageHandshake(handshake) = conn.request(Request::StorageHandshake)? else {
-        bail!("unexpected storage handshake response");
+    let handshake = match conn.request(Request::StorageHandshake) {
+        Ok(Response::StorageHandshake(handshake)) => handshake,
+        Ok(_) => bail!("unexpected storage handshake response"),
+        Err(e) if warn_if_server_disconnected(&e) => {
+            let exe_path = which_in(exe, path, cwd)?;
+            return handle_compile_result(
+                C::new(jobserver),
+                runtime,
+                CompileResponse::UnhandledCompile,
+                None,
+                false,
+                &exe_path,
+                cmdline,
+                cwd,
+                stdout,
+                stderr,
+            );
+        }
+        Err(e) => return Err(e),
     };
     if handshake.miss_explain {
         return do_compile(
@@ -1090,6 +1116,8 @@ mod test {
     };
     use crate::net::Connection;
     use std::sync::{Arc, Mutex};
+    #[cfg(unix)]
+    use test_case::test_case;
 
     fn make_runtime() -> Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -1114,6 +1142,145 @@ mod test {
             output.get("effective_cache_mode"),
             Some(&serde_json::Value::String("ReadOnly".to_owned()))
         );
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum CompileServerReply {
+        ResetDuringRequest,
+        NoResponse,
+        TruncatedResponse,
+        DuringHandshake,
+        CompileError,
+    }
+
+    #[cfg(unix)]
+    #[test_case(CompileServerReply::ResetDuringRequest; "reset during request")]
+    #[test_case(CompileServerReply::NoResponse; "closed without response")]
+    #[test_case(CompileServerReply::TruncatedResponse; "truncated response")]
+    #[test_case(CompileServerReply::DuringHandshake; "closed during storage handshake")]
+    #[test_case(CompileServerReply::CompileError; "server compile error")]
+    fn compile_server_disconnect_falls_back(reply: CompileServerReply) {
+        use crate::util::write_length_prefixed_bincode;
+        use std::io::Read;
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut header = [0; 4];
+            stream.read_exact(&mut header).unwrap();
+            if matches!(reply, CompileServerReply::ResetDuringRequest) {
+                socket2::SockRef::from(&stream)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+                return;
+            }
+            let mut request = vec![0; u32::from_be_bytes(header) as usize];
+            stream.read_exact(&mut request).unwrap();
+            let request = crate::protocol::decode_request(&request).unwrap();
+            if matches!(reply, CompileServerReply::DuringHandshake) {
+                assert!(matches!(request, Request::StorageHandshake));
+            } else {
+                assert!(matches!(request, Request::Compile(_)));
+            }
+            if matches!(
+                reply,
+                CompileServerReply::TruncatedResponse | CompileServerReply::CompileError
+            ) {
+                write_length_prefixed_bincode(
+                    &mut stream,
+                    Response::Compile(CompileResponse::CompileStarted),
+                )
+                .unwrap();
+                if matches!(reply, CompileServerReply::TruncatedResponse) {
+                    stream.write_all(&20_u32.to_be_bytes()).unwrap();
+                    stream.write_all(&[0; 2]).unwrap();
+                } else {
+                    write_length_prefixed_bincode(
+                        &mut stream,
+                        Response::CompileFinished(CompileFinished {
+                            retcode: Some(1),
+                            signal: None,
+                            stdout: vec![],
+                            stderr: b"compiler error from server\n".to_vec(),
+                            color_mode: ColorMode::Off,
+                        }),
+                    )
+                    .unwrap();
+                }
+            }
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("input.rs"),
+            r#"fn main() { println!("local compile"); }"#,
+        )
+        .unwrap();
+        let jobserver = Client::new_num(1);
+        let mut runtime = make_runtime();
+        let conn = ServerConnection::new(Box::new(stream)).unwrap();
+        let exe = Path::new("rustc");
+        let args = ["input.rs", "-o", "output"].map(OsString::from).to_vec();
+        let path = env::var_os("PATH");
+        let mut stdout = vec![];
+        let mut stderr = vec![];
+        let code = if matches!(reply, CompileServerReply::DuringHandshake) {
+            do_compile_client_side::<ProcessCommandCreator>(
+                &jobserver,
+                &mut runtime,
+                conn,
+                exe,
+                args,
+                dir.path(),
+                path,
+                vec![],
+                &mut stdout,
+                &mut stderr,
+            )
+        } else {
+            let env_vars = if matches!(reply, CompileServerReply::ResetDuringRequest) {
+                // Exceed the socket buffers so the server can reset before the request is sent.
+                vec![("PADDING".into(), "x".repeat(4 * 1024 * 1024).into())]
+            } else {
+                vec![]
+            };
+            do_compile(
+                <ProcessCommandCreator as CommandCreatorSync>::new(&jobserver),
+                &mut runtime,
+                conn,
+                exe,
+                args,
+                dir.path(),
+                path,
+                env_vars,
+                &mut stdout,
+                &mut stderr,
+            )
+        };
+        server.join().unwrap();
+        let output = dir.path().join("output");
+        if matches!(reply, CompileServerReply::CompileError) {
+            assert_eq!(code.unwrap(), 1);
+            assert_eq!(stderr, b"compiler error from server\n");
+            assert!(!output.exists());
+        } else {
+            assert_eq!(code.unwrap(), 0);
+            let result = process::Command::new(output).output().unwrap();
+            assert!(result.status.success());
+            assert_eq!(result.stdout, b"local compile\n");
+        }
     }
 
     /// A `Connection` that immediately returns EOF on reads and discards writes.
