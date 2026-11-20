@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::cache::{
-    Cache, CacheMode, CacheRead, CacheStorage, CacheWrite, GetPathResult, PreprocessorCacheStorage,
+    Cache, CacheMode, CacheRead, CacheStorage, CacheWrite, GetPathResult, OpenCacheObject,
+    PreprocessorCacheStorage,
 };
 use crate::compiler::PreprocessorCacheEntry;
 use crate::lru_disk_cache::{Error as LruError, LruDiskCache, ReadSeek, Result as LruResult};
@@ -28,6 +29,7 @@ use std::time::{Duration, Instant};
 use crate::errors::*;
 
 use super::lazy_disk_cache::LazyDiskCache;
+use super::storage::put_packed_objects;
 use super::utils::normalize_key;
 use crate::config::PreprocessorCacheModeConfig;
 
@@ -105,50 +107,93 @@ impl DiskCache {
         self.pool
             .spawn_blocking(move || {
                 let start = Instant::now();
-                let uses_weights = has_raw_objects != Some(false)
-                    && lru.lock().unwrap().get_or_init()?.uses_weights();
-                let weight = if uses_weights
-                    && has_raw_objects.unwrap_or_else(|| {
-                        CacheRead::from(io::Cursor::new(data.clone()))
-                            .is_ok_and(|entry| entry.has_raw_objects())
-                    }) {
-                    estimate_weight(&data).ok()
-                } else {
-                    None
-                };
-                let mut entry = lru
-                    .lock()
-                    .unwrap()
-                    .get_or_init()?
-                    .prepare_add(key, weight.unwrap_or(data.len() as u64))?;
-                let written = entry.as_file_mut().write_all(&data);
-                let mut lru = lru.lock().unwrap();
-                let lru = lru.get().unwrap();
-                if let Err(error) = written {
-                    lru.cancel_add(entry);
-                    return Err(error.into());
-                }
-                lru.commit_weighted(entry, weight)?;
+                store_bytes(&lru, key, data, has_raw_objects)?;
                 Ok(start.elapsed())
             })
             .await?
     }
 }
 
-fn estimate_weight(data: &[u8]) -> io::Result<u64> {
+fn store_bytes(
+    lru: &Mutex<LazyDiskCache>,
+    key: PathBuf,
+    data: Bytes,
+    has_raw_objects: Option<bool>,
+) -> Result<()> {
+    let uses_weights =
+        has_raw_objects != Some(false) && lru.lock().unwrap().get_or_init()?.uses_weights();
+    let weight = if uses_weights
+        && has_raw_objects.unwrap_or_else(|| {
+            CacheRead::from(io::Cursor::new(data.clone()))
+                .is_ok_and(|entry| entry.has_raw_objects())
+        }) {
+        estimate_weight(data.as_ref()).ok()
+    } else {
+        None
+    };
+    let mut entry = lru
+        .lock()
+        .unwrap()
+        .get_or_init()?
+        .prepare_add(key, weight.unwrap_or(data.len() as u64))?;
+    let written = entry.as_file_mut().write_all(&data);
+    let mut lru = lru.lock().unwrap();
+    let lru = lru.get().unwrap();
+    if let Err(error) = written {
+        lru.cancel_add(entry);
+        return Err(error.into());
+    }
+    Ok(lru.commit_weighted(entry, weight)?)
+}
+
+#[cfg(target_os = "linux")]
+fn try_store_reflink(
+    lru: &Mutex<LazyDiskCache>,
+    key: &Path,
+    objects: &[OpenCacheObject],
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<bool> {
+    use std::io::Seek;
+
+    let (mut entry, uses_weights) = {
+        let mut lru = lru.lock().unwrap();
+        let lru = lru.get_or_init()?;
+        (lru.prepare_add(key, 0)?, lru.uses_weights())
+    };
+    let file = entry.as_file_mut();
+    let written = CacheWrite::try_reflink_objects(file, objects, stdout, stderr);
+    let weight = if matches!(written, Ok(true)) && uses_weights && !objects.is_empty() {
+        file.rewind().and_then(|()| estimate_weight(file)).ok()
+    } else {
+        None
+    };
+    let mut lru = lru.lock().unwrap();
+    let lru = lru.get().unwrap();
+    if matches!(written, Ok(true)) {
+        lru.commit_weighted(entry, weight)?;
+    } else {
+        lru.cancel_add(entry);
+    }
+    written
+}
+
+fn estimate_weight(mut data: impl Read) -> io::Result<u64> {
     const EXTENT: usize = 128 * 1024;
     const SECTOR: usize = 4096;
 
     let mut zstd = zstd::bulk::Compressor::new(1)?;
     let mut compressed = Vec::with_capacity(zstd::zstd_safe::compress_bound(EXTENT));
+    let mut chunk = Vec::with_capacity(EXTENT);
     let mut weight = 0;
     // Chunk the ZIP from offset zero so its headers and raw data share the same
     // boundaries as they do in the file being compressed by btrfs.
-    for chunk in data.chunks(EXTENT) {
-        let len = zstd.compress_to_buffer(chunk, &mut compressed)?;
+    while data.by_ref().take(EXTENT as u64).read_to_end(&mut chunk)? > 0 {
+        let len = zstd.compress_to_buffer(&chunk, &mut compressed)?;
         weight += len
             .next_multiple_of(SECTOR)
             .min(chunk.len().next_multiple_of(SECTOR));
+        chunk.clear();
     }
     Ok(weight as u64)
 }
@@ -295,6 +340,39 @@ impl CacheStorage for DiskCache {
         self.store(key, data.into(), Some(has_raw_objects)).await
     }
 
+    async fn put_objects(
+        &self,
+        key: &str,
+        objects: Vec<OpenCacheObject>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Duration> {
+        #[cfg(target_os = "linux")]
+        if self.reflink {
+            if self.rw_mode == CacheMode::ReadOnly {
+                bail!("Cannot write to a read-only cache");
+            }
+            let start = Instant::now();
+            let lru = self.lru.clone();
+            let key = make_key_path(key);
+            return self
+                .pool
+                .spawn_blocking(move || {
+                    if !try_store_reflink(&lru, &key, &objects, &stdout, &stderr)? {
+                        let mut entry = CacheWrite::pack_objects(objects, true)?;
+                        let has_raw_objects = entry.has_raw_objects();
+                        entry.put_stdout(&stdout)?;
+                        entry.put_stderr(&stderr)?;
+                        store_bytes(&lru, key, entry.finish()?.into(), Some(has_raw_objects))?;
+                    }
+                    Ok(start.elapsed())
+                })
+                .await?;
+        }
+        put_packed_objects(self, key, objects, stdout, stderr, pool).await
+    }
+
     fn write_raw_objects(&self) -> bool {
         self.reflink
     }
@@ -402,13 +480,16 @@ mod tests {
 
         let mut bytes = vec![0; 1024 * 1024];
         rand::rngs::StdRng::seed_from_u64(7).fill_bytes(&mut bytes);
-        assert_eq!(estimate_weight(&bytes).unwrap(), bytes.len() as u64);
+        assert_eq!(
+            estimate_weight(bytes.as_slice()).unwrap(),
+            bytes.len() as u64
+        );
     }
 
     #[test]
     fn raw_weight_estimate_rounds_zero_extents_to_one_sector_each() {
         assert_eq!(
-            estimate_weight(&vec![0; 1024 * 1024 + 1]).unwrap(),
+            estimate_weight(&vec![0; 1024 * 1024 + 1][..]).unwrap(),
             9 * 4096
         );
     }
@@ -436,6 +517,65 @@ mod tests {
             .unwrap();
         let disk = disk_cache(&root, &runtime, CacheMode::ReadWrite).with_reflink(true);
         assert!(!disk.write_raw_objects());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cache_entry_store_reflink_failure_falls_back() {
+        use crate::cache::FileObjectSource;
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::NamedTempFile::new_in("/dev/shm")
+            .or_else(|_| tempfile::NamedTempFile::new_in("/tmp"))
+            .unwrap();
+        if other.as_file().metadata().unwrap().dev() == dir.path().metadata().unwrap().dev() {
+            eprintln!("skipping cross-filesystem store fallback check: same device");
+            return;
+        }
+        let local = dir.path().join("output");
+        std::fs::write(&local, [1; 4096]).unwrap();
+        std::fs::write(other.path(), [2; 4097]).unwrap();
+        let sources = [local, other.path().to_owned()].map(|path| FileObjectSource {
+            key: path.file_name().unwrap().to_str().unwrap().to_owned(),
+            path,
+            optional: false,
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut disk = disk_cache(&dir.path().join("cache"), &runtime, CacheMode::ReadWrite);
+        disk.reflink = true;
+        runtime.block_on(async {
+            let packed = CacheWrite::from_objects(sources.clone(), runtime.handle(), true)
+                .await
+                .unwrap()
+                .finish()
+                .unwrap();
+            disk.put_objects(
+                KEY,
+                CacheWrite::open_objects(sources).unwrap(),
+                vec![],
+                vec![],
+                runtime.handle(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(disk.get_raw(KEY).await.unwrap().unwrap(), packed);
+            assert_eq!(
+                disk.current_size().await.unwrap(),
+                Some(packed.len() as u64)
+            );
+            assert_eq!(
+                walkdir::WalkDir::new(disk.lru.lock().unwrap().path())
+                    .into_iter()
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.file_type().is_file())
+                    .count(),
+                2
+            );
+        });
+        eprintln!("verified cross-filesystem fallback, archive bytes and LRU size");
     }
 
     enum Stored {

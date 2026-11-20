@@ -345,27 +345,40 @@ fn reflink_object(
     head: u64,
     tail: u64,
 ) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
     use std::os::unix::fs::FileExt;
 
-    let range = libc::file_clone_range {
-        src_fd: source.as_raw_fd().into(),
-        src_offset: offset,
-        src_length: head,
-        dest_offset: 0,
-    };
     let tail_offset = offset.checked_add(head).ok_or(io::ErrorKind::InvalidData)?;
-    // SAFETY: FICLONERANGE reads the initialized range and both fds stay open.
-    let result = unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONERANGE, &raw const range) };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
-    }
+    clone_range(source, offset, output, 0, head)?;
     if tail > 0 {
         // The duplicate source fd shares the ZIP reader's seek position.
         let mut bytes = [0; RAW_ALIGNMENT as usize];
         let bytes = &mut bytes[..tail as usize];
         source.read_exact_at(bytes, tail_offset)?;
         output.write_all_at(bytes, head)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn clone_range(
+    source: &File,
+    src_offset: u64,
+    output: &File,
+    dest_offset: u64,
+    length: u64,
+) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let range = libc::file_clone_range {
+        src_fd: source.as_raw_fd().into(),
+        src_offset,
+        src_length: length,
+        dest_offset,
+    };
+    // SAFETY: FICLONERANGE reads the initialized range and both fds stay open.
+    let result = unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONERANGE, &raw const range) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
     }
     Ok(())
 }
@@ -393,7 +406,7 @@ fn is_path_null(path: &Path) -> bool {
     stem.eq_ignore_ascii_case("NUL")
 }
 
-pub(crate) struct OpenCacheObject {
+pub struct OpenCacheObject {
     key: String,
     file: fs::File,
 }
@@ -454,23 +467,25 @@ impl CacheWrite {
         pool: &tokio::runtime::Handle,
         raw: bool,
     ) -> Result<CacheWrite> {
-        pool.spawn_blocking(move || {
-            let mut entry = CacheWrite::new();
-            for OpenCacheObject { key, mut file } in objects {
-                let mode = get_file_mode(&file)?;
-                let result = if raw {
-                    let large = file.metadata()?.len() >= zip::ZIP64_BYTES_THR;
-                    entry.put_raw_object(&key, &mut file, mode, large)
-                } else {
-                    entry.put_object(&key, &mut file, mode)
-                };
-                result.with_context(|| {
-                    format!("failed to put object {:?} in cache entry", file.path())
-                })?;
-            }
-            Ok(entry)
-        })
-        .await?
+        pool.spawn_blocking(move || Self::pack_objects(objects, raw))
+            .await?
+    }
+
+    pub(super) fn pack_objects(objects: Vec<OpenCacheObject>, raw: bool) -> Result<Self> {
+        let mut entry = Self::new();
+        for OpenCacheObject { key, mut file } in objects {
+            let mode = get_file_mode(&file)?;
+            let result = if raw {
+                let large = file.metadata()?.len() >= zip::ZIP64_BYTES_THR;
+                entry.put_raw_object(&key, &mut file, mode, large)
+            } else {
+                entry.put_object(&key, &mut file, mode)
+            };
+            result.with_context(|| {
+                format!("failed to put object {:?} in cache entry", file.path())
+            })?;
+        }
+        Ok(entry)
     }
 
     /// Add an object containing the contents of `from` to this cache entry at `name`.
@@ -479,17 +494,25 @@ impl CacheWrite {
     where
         T: Read,
     {
+        Self::put_object_into(&mut self.zip, name, from, mode)
+    }
+
+    fn put_object_into<W: Write + Seek, R: Read>(
+        zip: &mut ZipWriter<W>,
+        name: &str,
+        from: &mut R,
+        mode: Option<u32>,
+    ) -> Result<()> {
         // We're going to declare the compression method as "stored",
         // but we're actually going to store zstd-compressed blobs.
-        self.zip
-            .start_file(name, Self::object_options(mode))
+        zip.start_file(name, Self::object_options(mode))
             .context("Failed to start cache entry object")?;
 
         let compression_level = std::env::var("SCCACHE_CACHE_ZSTD_LEVEL")
             .ok()
             .and_then(|value| value.parse::<i32>().ok())
             .unwrap_or(3);
-        zstd::stream::copy_encode(from, &mut self.zip, compression_level)?;
+        zstd::stream::copy_encode(from, zip, compression_level)?;
         Ok(())
     }
 
@@ -500,17 +523,25 @@ impl CacheWrite {
         mode: Option<u32>,
         large: bool,
     ) -> Result<()> {
-        self.zip
-            .start_file(
-                format!("raw/{name}"),
-                Self::object_options(mode)
-                    .with_alignment(RAW_ALIGNMENT)
-                    .large_file(large),
-            )
-            .context("Failed to start cache entry object")?;
+        Self::start_raw_object(&mut self.zip, name, mode, large)?;
         io::copy(from, &mut self.zip)?;
         self.has_raw_objects = true;
         Ok(())
+    }
+
+    fn start_raw_object<W: Write + Seek>(
+        zip: &mut ZipWriter<W>,
+        name: &str,
+        mode: Option<u32>,
+        large: bool,
+    ) -> Result<()> {
+        zip.start_file(
+            format!("raw/{name}"),
+            Self::object_options(mode)
+                .with_alignment(RAW_ALIGNMENT)
+                .large_file(large),
+        )
+        .context("Failed to start cache entry object")
     }
 
     pub(super) fn has_raw_objects(&self) -> bool {
@@ -537,11 +568,72 @@ impl CacheWrite {
     }
 
     fn put_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        Self::put_bytes_into(&mut self.zip, name, bytes)
+    }
+
+    fn put_bytes_into<W: Write + Seek>(
+        zip: &mut ZipWriter<W>,
+        name: &str,
+        mut bytes: &[u8],
+    ) -> Result<()> {
         if !bytes.is_empty() {
-            let mut cursor = Cursor::new(bytes);
-            return self.put_object(name, &mut cursor, None);
+            Self::put_object_into(zip, name, &mut bytes, None)?;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn try_reflink_objects(
+        mut output: &File,
+        objects: &[OpenCacheObject],
+        stdout: &[u8],
+        stderr: &[u8],
+    ) -> Result<bool> {
+        use std::os::unix::fs::FileExt;
+
+        let mut zip = ZipWriter::new(ReflinkZipFile {
+            file: output,
+            cloned_remaining: std::cell::Cell::new(0),
+        });
+        let alignment = u64::from(RAW_ALIGNMENT);
+        let mut buf = vec![0; 128 * 1024];
+        for OpenCacheObject { key, file } in objects {
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Ok(false);
+            }
+            let len = metadata.len();
+            let mode = get_file_mode(file)?;
+            Self::start_raw_object(&mut zip, key, mode, len >= zip::ZIP64_BYTES_THR)?;
+
+            let offset = output.stream_position()?;
+            let head = len - len % alignment;
+            if head > 0 {
+                if let Err(error) = clone_range(file.file(), 0, output, offset, head) {
+                    debug!("Disk cache store reflink failed, copying objects: {error}");
+                    return Ok(false);
+                }
+                // CRC the cloned bytes so a later write to the source can't
+                // make the checksum disagree with the archive.
+                zip.get_ref().unwrap().cloned_remaining.set(head);
+                let mut copied = 0;
+                while copied < head {
+                    let size = (head - copied).min(buf.len() as u64) as usize;
+                    let chunk = &mut buf[..size];
+                    output.read_exact_at(chunk, offset + copied)?;
+                    zip.write_all(chunk)?;
+                    copied += size as u64;
+                }
+            }
+
+            let tail = &mut buf[..(len - head) as usize];
+            file.file().read_exact_at(tail, head)?;
+            zip.write_all(tail)?;
+        }
+        Self::put_bytes_into(&mut zip, "stdout", stdout)?;
+        Self::put_bytes_into(&mut zip, "stderr", stderr)?;
+        zip.finish().context("Failed to finish cache entry zip")?;
+        Ok(true)
     }
 
     /// Finish writing data to the cache entry writer, and return the data.
@@ -551,6 +643,38 @@ impl CacheWrite {
             .finish()
             .context("Failed to finish cache entry zip")?;
         Ok(cur.into_inner())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ReflinkZipFile<'a> {
+    file: &'a File,
+    cloned_remaining: std::cell::Cell<u64>,
+}
+
+#[cfg(target_os = "linux")]
+impl Write for ReflinkZipFile<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let remaining = self.cloned_remaining.get();
+        if remaining == 0 {
+            return self.file.write(buf);
+        }
+        // ZipWriter still counts and checksums these bytes.
+        let skip = remaining.min(buf.len() as u64);
+        self.file.seek_relative(skip as i64)?;
+        self.cloned_remaining.set(remaining - skip);
+        Ok(skip as usize)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Seek for ReflinkZipFile<'_> {
+    fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+        self.file.seek(pos)
     }
 }
 
@@ -597,6 +721,56 @@ mod tests {
             assert_eq!(mode & 0o777, 0o755);
             assert_eq!(output, payload);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cache_entry_reflink_store_matches_packed_bytes_and_is_copy_on_write() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        if let Err(error) = super::super::disk::probe_reflink(dir.path()) {
+            eprintln!("skipping store-side reflink check: FICLONE failed: {error}");
+            return;
+        }
+        let sources = RAW_SIZES.map(|size| {
+            let (key, payload) = raw_member(size);
+            let path = dir.path().join(&key);
+            fs::write(&path, &payload).unwrap();
+            FileObjectSource {
+                key,
+                path,
+                optional: false,
+            }
+        });
+        let mut packed =
+            CacheWrite::pack_objects(CacheWrite::open_objects(sources.clone()).unwrap(), true)
+                .unwrap();
+        packed.put_stdout(b"compiler stdout").unwrap();
+        packed.put_stderr(b"compiler stderr").unwrap();
+        let expected = packed.finish().unwrap();
+        let held = CacheWrite::open_objects(sources.clone()).unwrap();
+        let large = sources.last().unwrap();
+        let original = dir.path().join("original");
+        fs::rename(&large.path, &original).unwrap();
+        fs::write(&large.path, b"replacement").unwrap();
+
+        let archive = NamedTempFile::new_in(dir.path()).unwrap();
+        assert!(
+            CacheWrite::try_reflink_objects(
+                archive.as_file(),
+                &held,
+                b"compiler stdout",
+                b"compiler stderr"
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read(archive.path()).unwrap(), expected);
+        let source = fs::OpenOptions::new().write(true).open(&original).unwrap();
+        assert_shared_extents(source.file(), 1024 * 1024);
+        source.file().write_all_at(&[0x55; 4096], 0).unwrap();
+        assert_eq!(fs::read(archive.path()).unwrap(), expected);
+        eprintln!("verified byte-identical raw ZIPs and copy-on-write from the held inode");
     }
 
     #[test]
