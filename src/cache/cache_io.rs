@@ -15,7 +15,7 @@ use crate::errors::*;
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::io::{Cursor, Read, Seek, Write};
+use std::io::{self, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 use zip::read::{ArchiveOffset, Config as ZipReadConfig};
@@ -180,7 +180,21 @@ impl CacheRead {
                 // happening in parallel don't see a partially-written file.
                 // Rustc can hard-link its outputs to an incremental session.
                 // Replacing the destination also leaves that session intact.
-                let mut tmp = NamedTempFile::new_in(dir)?;
+                let mut tmp = match NamedTempFile::new_in(dir) {
+                    Ok(tmp) => tmp,
+                    Err(err) => {
+                        if !optional || self.zip.index_for_name(&key).is_some() {
+                            self.extract_object_to_new_file(&key, &path)
+                                .with_context(|| {
+                                    format!(
+                                        "Failed to restore {} after tempfile error: {err}",
+                                        path.display()
+                                    )
+                                })?;
+                        }
+                        continue;
+                    }
+                };
                 match self.get_object(&key, &mut tmp) {
                     Ok(mode) => {
                         tmp.persist(&path)?;
@@ -195,6 +209,20 @@ impl CacheRead {
             Ok(())
         })
         .await?
+    }
+
+    fn extract_object_to_new_file(&mut self, key: &str, path: &Path) -> Result<()> {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        // A concurrent writer may have recreated the name after unlink.
+        let mut file = fs::File::create_new(path)?;
+        if let Some(mode) = self.get_object(key, &mut file)? {
+            set_file_mode(path, mode)?;
+        }
+        Ok(())
     }
 }
 
@@ -395,6 +423,45 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_extract_object_to_dev_fd_pipe() {
+        use std::os::fd::AsRawFd;
+        use tokio::io::AsyncReadExt;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (sender, mut reader) = tokio::net::unix::pipe::pipe().unwrap();
+            let sender = sender.into_blocking_fd().unwrap();
+            let path = PathBuf::from(format!("/dev/fd/{}", sender.as_raw_fd()));
+            // FreeBSD may run without fdescfs mounted.
+            if !path.exists() {
+                return;
+            }
+
+            let mut cache_data = CacheWrite::new();
+            cache_data.put_bytes("object", b"cache data").unwrap();
+            let cache_read = CacheRead::from(Cursor::new(cache_data.finish().unwrap())).unwrap();
+            let objects = vec![FileObjectSource {
+                key: "object".into(),
+                path,
+                optional: false,
+            }];
+            cache_read
+                .extract_objects(objects, runtime.handle())
+                .await
+                .unwrap();
+            drop(sender);
+
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await.unwrap();
+            assert_eq!(output, b"cache data");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_extract_object_to_dev_fd_requires_atomic_restore() {
         use std::os::fd::AsRawFd;
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -451,14 +518,14 @@ mod tests {
         }];
 
         if unwritable {
-            fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-            if NamedTempFile::new_in(&out_dir).is_ok() {
-                fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-                eprintln!(
-                    "Skipping unwritable directory case: process can create a file in mode 0555"
-                );
+            let uid = std::process::Command::new("id").arg("-u").output().unwrap();
+            assert!(uid.status.success());
+            // Root can modify a directory with mode 0555.
+            if uid.stdout == b"0\n" {
+                eprintln!("Skipping unwritable-directory permissions check as root");
                 return;
             }
+            fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
         }
         let result = runtime.block_on(cache_read.extract_objects(objects, runtime.handle()));
         if unwritable {
@@ -473,6 +540,36 @@ mod tests {
         }
         assert_eq!(fs::read(&session).unwrap(), b"session data");
         assert_eq!(fs::metadata(&session).unwrap().ino(), old_inode);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_extract_without_tempfile_creates_fresh_inode() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let output = tmp.path().join("output");
+        let link = tmp.path().join("linked-output");
+        fs::write(&output, b"old data").unwrap();
+        fs::hard_link(&output, &link).unwrap();
+        let inode = fs::metadata(&link).unwrap().ino();
+
+        let mut cache_data = CacheWrite::new();
+        cache_data.put_bytes("object", b"cache data").unwrap();
+        let mut cache_read = CacheRead::from(Cursor::new(cache_data.finish().unwrap())).unwrap();
+        cache_read
+            .extract_object_to_new_file("object", &output)
+            .unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"cache data");
+        assert_ne!(fs::metadata(&output).unwrap().ino(), inode);
+        assert_eq!(fs::read(&link).unwrap(), b"old data");
+
+        let dir = tmp.path().join("directory");
+        fs::create_dir(&dir).unwrap();
+        cache_read
+            .extract_object_to_new_file("object", &dir)
+            .unwrap_err();
+        assert!(dir.is_dir());
     }
 
     #[cfg(windows)]
