@@ -1,6 +1,6 @@
 use crate::cache::{CacheMode, GetPathResult};
 use crate::compiler::ColorMode;
-use crate::config::{PreprocessorCacheModeConfig, RustIncremental};
+use crate::config::{PreprocessorCacheModeConfig, RustIncremental, default_incremental_prune_days};
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::ffi::OsString;
@@ -130,6 +130,8 @@ pub struct StorageHandshakeInfo {
     pub rust_incremental: RustIncremental,
     #[serde(skip)]
     pub miss_explain: bool,
+    #[serde(skip, default = "default_incremental_prune_days")]
+    pub incremental_prune_days: u64,
 }
 
 // Older peers ignore trailing bytes. Keep extensions at the end of the
@@ -161,8 +163,12 @@ pub(crate) fn encode_response(response: &Response) -> bincode::Result<Vec<u8>> {
         }
         Response::StorageHandshake(info) => {
             bincode::serialize_into(&mut frame, &info.rust_incremental)?;
-            if info.miss_explain {
+            let custom_prune_days = info.incremental_prune_days != default_incremental_prune_days();
+            if info.miss_explain || custom_prune_days {
                 bincode::serialize_into(&mut frame, &info.miss_explain)?;
+            }
+            if custom_prune_days {
+                bincode::serialize_into(&mut frame, &info.incremental_prune_days)?;
             }
         }
         _ => {}
@@ -181,7 +187,11 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                 let (mode, remaining) = decode_frame(extension)?;
                 info.rust_incremental = mode;
                 if !remaining.is_empty() {
-                    info.miss_explain = bincode::deserialize(remaining)?;
+                    let (miss_explain, remaining) = decode_frame(remaining)?;
+                    info.miss_explain = miss_explain;
+                    if !remaining.is_empty() {
+                        info.incremental_prune_days = bincode::deserialize(remaining)?;
+                    }
                 }
             }
             _ => {}
@@ -358,31 +368,39 @@ mod tests {
             panic!("expected storage handshake");
         };
         assert_eq!(info.rust_incremental, RustIncremental::Off);
+        assert_eq!(info.incremental_prune_days, 7);
         assert_eq!(info.cache_mode, CacheMode::ReadOnly);
         assert_eq!(info.max_size, Some(200));
         assert!(!info.miss_explain);
         info.rust_incremental = RustIncremental::CacheNoBypass;
-        let previous_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
-        let Response::StorageHandshake(previous) = decode_response(&previous_frame).unwrap() else {
-            panic!("expected storage handshake");
-        };
-        assert_eq!(previous.rust_incremental, RustIncremental::CacheNoBypass);
-        assert!(!previous.miss_explain);
-
+        let incremental_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
         info.miss_explain = true;
-        let new_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
-        assert!(previous_frame.starts_with(&old_frame));
-        assert!(new_frame.starts_with(&previous_frame));
-        for (response, expected, miss_explain) in [
+        let explain_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
+        info.incremental_prune_days = 0;
+        let new_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
+        info.miss_explain = false;
+        let pruning_only_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
+        assert!(incremental_frame.starts_with(&old_frame));
+        assert!(explain_frame.starts_with(&incremental_frame));
+        assert!(new_frame.starts_with(&explain_frame));
+        assert!(pruning_only_frame.starts_with(&incremental_frame));
+
+        let mode = RustIncremental::CacheNoBypass;
+        for (response, expected, miss_explain, prune_days) in [
             (
                 bincode::deserialize(&new_frame).unwrap(),
                 RustIncremental::Off,
                 false,
+                7,
             ),
+            (decode_response(&incremental_frame).unwrap(), mode, false, 7),
+            (decode_response(&explain_frame).unwrap(), mode, true, 7),
+            (decode_response(&new_frame).unwrap(), mode, true, 0),
             (
-                decode_response(&new_frame).unwrap(),
-                RustIncremental::CacheNoBypass,
-                true,
+                decode_response(&pruning_only_frame).unwrap(),
+                mode,
+                false,
+                0,
             ),
         ] {
             let Response::StorageHandshake(info) = response else {
@@ -390,6 +408,7 @@ mod tests {
             };
             assert_eq!(info.rust_incremental, expected);
             assert_eq!(info.miss_explain, miss_explain);
+            assert_eq!(info.incremental_prune_days, prune_days);
             assert_eq!(info.cache_mode, CacheMode::ReadOnly);
         }
     }

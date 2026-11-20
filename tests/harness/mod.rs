@@ -195,6 +195,7 @@ pub fn sccache_client_cfg(
         basedirs: vec![],
         client_side_mode: false,
         rust_incremental: Default::default(),
+        incremental_prune_days: None,
     }
 }
 

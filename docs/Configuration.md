@@ -9,6 +9,9 @@ server_startup_timeout_ms = 10000
 # Cache incremental Rust compiles: "off", "cache", or "cache-no-bypass".
 rust_incremental = "off"
 
+# Remove stale Rust incremental sessions after this many days. Set 0 to disable.
+incremental_prune_days = 7
+
 # Base directories to strip from source paths during cache key
 # computation.
 #
@@ -199,6 +202,7 @@ Note that some env variables may need sccache server restart to take effect.
 
 * `SCCACHE_ALLOW_CORE_DUMPS` to enable core dumps by the server
 * `SCCACHE_RUST_INCREMENTAL` overrides the server's `rust_incremental` setting. Values are `off` (default), `cache`, and `cache-no-bypass`. Restart the server to change modes. See [incremental compilation](Rust.md#incremental-compilation).
+* `SCCACHE_INCREMENTAL_PRUNE_DAYS` overrides `incremental_prune_days`. The default is 7 days. Set `0` to disable. The server reads this setting at startup. The local incremental fast path reads the client's setting. See [incremental compilation](Rust.md#incremental-compilation).
 * `SCCACHE_MISS_EXPLAIN` sets a server-side JSON lines log for Rust cache misses. Unset by default. Restart the server to change it. See [explaining cross-worktree misses](Rust.md#explain-cross-worktree-cache-misses).
 * `SCCACHE_CONF` configuration file path
 * `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths, or a value that is not valid UTF-8, will cause an error and prevent the server from start. The variable is also read from the environment of each compile, where it takes precedence over both for that compile: an empty value turns base directories off, and a relative path or a value that is not valid UTF-8 is ignored with a warning.

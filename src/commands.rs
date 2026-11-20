@@ -764,6 +764,7 @@ where
     let cache_mode = runtime.block_on(storage.check())?;
     let conn_arc = storage.conn();
     let rust_incremental = storage.rust_incremental();
+    let incremental_prune_days = storage.incremental_prune_days();
     let (tx, _rx) = futures::channel::mpsc::channel(1);
     let (_, info) = server::WaitUntilZero::new();
     let service = server::SccacheService::<C>::new(
@@ -775,7 +776,7 @@ where
         tx,
         info,
     )
-    .with_rust_incremental(rust_incremental);
+    .with_rust_incremental(rust_incremental, incremental_prune_days);
     let compile = Compile {
         exe: exe_path.as_os_str().to_owned(),
         cwd: cwd.as_os_str().to_owned(),
@@ -1023,6 +1024,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             {
                 let exe_path = which_in(&exe, env::var_os("PATH"), &cwd)?;
                 let mut runtime = new_client_runtime()?;
+                local.session.refresh_mtime();
                 let result = handle_compile_result(
                     ProcessCommandCreator::new(&jobserver),
                     &mut runtime,
@@ -1036,6 +1038,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &mut io::stderr(),
                 );
                 local.session.refresh_mtime();
+                local.session.prune(config.incremental_prune_days());
                 return result.context("failed to execute incremental compile");
             }
             let conn = connect_or_start_server(&get_addr(), startup_timeout)?;

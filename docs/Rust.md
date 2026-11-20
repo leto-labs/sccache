@@ -49,8 +49,16 @@ recognize active sessions. `cargo clean -p` removes a package's private
 directories along with its other sessions. Cache hits restore the normal rustc
 outputs without creating or modifying session directories.
 Upgrading from `leto-0.19.0-3` or `leto-0.19.0-4` changes the private names.
-The old sessions are left for cleanup, and each unit starts cold the first
-time it compiles in the new directory.
+Each unit starts cold the first time it compiles in the new directory.
+
+After a compile in a private session, sccache can prune older private and
+flat session directories for the same crate in that incremental directory.
+The sweep runs at most once per hour per crate and incremental directory.
+It keeps the current session and directories with a lock file modified
+within the past hour. `incremental_prune_days` (overridden by
+`SCCACHE_INCREMENTAL_PRUNE_DAYS`) sets the minimum age. The default is 7 days,
+and `0` disables pruning. These rules also apply when the client bypasses
+the daemon and runs rustc directly.
 
 Incremental and non-incremental builds use separate entries, regardless
 of the name of the incremental directory. Cargo forwards variables such as

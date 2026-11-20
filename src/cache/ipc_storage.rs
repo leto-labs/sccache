@@ -57,6 +57,10 @@ impl IpcStorage {
         self.handshake.rust_incremental
     }
 
+    pub(crate) fn incremental_prune_days(&self) -> u64 {
+        self.handshake.incremental_prune_days
+    }
+
     async fn rpc(&self, req: Request) -> Result<Response> {
         let conn = Arc::clone(&self.conn);
         tokio::task::spawn_blocking(move || conn.lock().unwrap().request(req))
