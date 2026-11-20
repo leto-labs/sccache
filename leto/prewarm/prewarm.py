@@ -326,7 +326,7 @@ def run(project, clean):
             status["last_warmed_commit"] = marker.read_text().strip() if marker.exists() else None
             validate_checkout(checkout)
             config = read_config(configdir / "leto-prewarm" / f"{project}.conf")
-            settings = {**os.environ, **config}
+            settings = {**os.environ, "SCCACHE_CLIENT_SIDE": "1", **config}
             if clean:
                 if checkout.exists():
                     clean_checkout(checkout, cargo_env(checkout, settings))

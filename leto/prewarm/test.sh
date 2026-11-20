@@ -46,7 +46,7 @@ if [[ "$*" == '--show-stats --stats-format=json' ]]; then
   exit
 fi
 [[ ${1##*/} == rustc ]]
-printf '%s\n' "$*" >>"$FIXTURE_CONTROL/sccache.log"
+printf '%s|%s\n' "${SCCACHE_CLIENT_SIDE:-}" "$*" >>"$FIXTURE_CONTROL/sccache.log"
 if [[ -e "$FIXTURE_CONTROL/hold" && " $* " == *' --crate-name fixture '* ]]; then
   printf '%s\n' "$BASHPID" >"$FIXTURE_CONTROL/rustc.pid"
   while [[ -e "$FIXTURE_CONTROL/hold" ]]; do sleep 0.1; done
@@ -59,7 +59,8 @@ cat >"$repo/scripts/cargo.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ! -v CARGO_MAKEFLAGS && ! -v MAKEFLAGS && ! -v MFLAGS ]]
-printf '%s|%s|%s\n' "$*" "${FIXTURE_EXTRA:-}" "${SCCACHE_BASEDIRS:-}" >>"$FIXTURE_CONTROL/cargo.log"
+printf '%s|%s|%s|%s\n' "$*" "${FIXTURE_EXTRA:-}" "${SCCACHE_BASEDIRS:-}" "${SCCACHE_CLIENT_SIDE:-}" \
+  >>"$FIXTURE_CONTROL/cargo.log"
 export RUSTC_WRAPPER
 RUSTC_WRAPPER=$(command -v sccache)
 exec cargo "$@"
@@ -161,17 +162,17 @@ process_stopped() {
   ps -o state= -p "$1" | grep -qx T
 }
 
-run
+SCCACHE_CLIENT_SIDE=0 run
 status_is warmed "$tip"
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 2 ]] || fail "expected both Cargo commands"
-grep -Fxq "check --workspace --all-targets -j 1|value from project config|$checkout" \
-  "$FIXTURE_CONTROL/cargo.log" || fail "expected project env and checkout-based normalization"
-grep -Fxq "test --workspace --no-run -j 1|value from project config|$checkout" \
+grep -Fxq "check --workspace --all-targets -j 1|value from project config|$checkout|1" \
+  "$FIXTURE_CONTROL/cargo.log" || fail "expected project env, checkout-based normalization and client-side mode"
+grep -Fxq "test --workspace --no-run -j 1|value from project config|$checkout|1" \
   "$FIXTURE_CONTROL/cargo.log" || fail "missing default test build"
-grep -q -- '--crate-name fixture' "$FIXTURE_CONTROL/sccache.log" || fail "fixture compiler did not use the stub"
+grep -Eq '^1[|].*--crate-name fixture' "$FIXTURE_CONTROL/sccache.log" || fail "sccache did not get client-side mode"
 grep -Eq 'shared sccache delta \{"compile_requests": [1-9]' "$log" || fail "missing stats delta"
 [[ ! -e "$repo/target" ]] || fail "canonical repo received build output"
-printf 'ok - first run builds with project env, private jobs, stats and disk status\n'
+printf 'ok - first run builds in client-side mode with project env, private jobs, stats and disk status\n'
 
 run
 status_is unchanged "$tip"
@@ -181,13 +182,16 @@ printf 'ok - unchanged tip skips Cargo\n'
 printf '[env.SCCACHE_BASEDIRS]\nvalue = ""\nrelative = true\n' >"$repo/.cargo/config.toml"
 change_tip 2
 git -C "$repo" pack-refs --all
-run
+printf 'SCCACHE_CLIENT_SIDE=0\n' >>"$config"
+SCCACHE_CLIENT_SIDE=1 run
 status_is warmed "$tip"
 [[ $(git -C "$checkout" rev-parse HEAD) == "$tip" ]] || fail "checkout did not advance"
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 4 ]] || fail "new tip did not build"
-tail -n 2 "$FIXTURE_CONTROL/cargo.log" | grep -Fxq 'check --workspace --all-targets -j 1|value from project config|' \
-  || fail "overrode the checkout's Cargo config"
-printf 'ok - new packed branch tip builds and respects Cargo config\n'
+tail -n 2 "$FIXTURE_CONTROL/cargo.log" | grep -Fxq 'check --workspace --all-targets -j 1|value from project config||0' \
+  || fail "Cargo did not get the client-side override or its configured basedirs"
+grep -Eq '^0[|].*--crate-name fixture' "$FIXTURE_CONTROL/sccache.log" || fail "sccache did not get the client-side override"
+sed -i '/^SCCACHE_CLIENT_SIDE=/d' "$config"
+printf 'ok - new packed branch tip builds and respects Cargo config and the client-side override\n'
 
 last_warmed=$tip
 change_tip 3
