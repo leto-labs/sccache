@@ -27,12 +27,12 @@ use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
 use crate::protocol::{
-    Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
+    self, Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
 };
 use crate::util;
 #[cfg(feature = "dist-client")]
 use anyhow::Context as _;
-use bytes::{Bytes, BytesMut, buf::BufMut};
+use bytes::{Bytes, BytesMut};
 use filetime::FileTime;
 use fs::metadata;
 use fs_err as fs;
@@ -1916,8 +1916,6 @@ pub struct ServerStats {
     pub cache_hits: PerLanguageCount,
     /// The count of cache misses for handled compile requests (per language).
     pub cache_misses: PerLanguageCount,
-    /// Incremental compiles that did not confirm a cold session.
-    pub rust_incremental_not_stored: u64,
     /// The count of cache misses because the cache took too long to respond.
     pub cache_timeouts: u64,
     /// The count of errors reading cache entries.
@@ -1949,6 +1947,9 @@ pub struct ServerStats {
     pub dist_errors: u64,
     /// Multi-level cache statistics (if multi-level caching is enabled)
     pub multi_level: Option<crate::cache::multilevel::MultiLevelStats>,
+    /// Incremental compiles that did not confirm a cold session.
+    #[serde(skip)]
+    pub rust_incremental_not_stored: u64,
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -1961,7 +1962,6 @@ impl std::ops::AddAssign for ServerStats {
         self.cache_errors += rhs.cache_errors;
         self.cache_hits += rhs.cache_hits;
         self.cache_misses += rhs.cache_misses;
-        self.rust_incremental_not_stored += rhs.rust_incremental_not_stored;
         self.cache_timeouts += rhs.cache_timeouts;
         self.cache_read_errors += rhs.cache_read_errors;
         self.non_cacheable_compilations += rhs.non_cacheable_compilations;
@@ -1988,12 +1988,14 @@ impl std::ops::AddAssign for ServerStats {
             (a, None) => a,
             (None, b) => b,
         };
+        self.rust_incremental_not_stored += rhs.rust_incremental_not_stored;
     }
 }
 
 /// Info and stats about the server.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ServerInfo {
+    #[serde(with = "server_info_stats")]
     pub stats: ServerStats,
     pub cache_location: String,
     pub cache_size: Option<u64>,
@@ -2001,6 +2003,46 @@ pub struct ServerInfo {
     pub use_preprocessor_cache_mode: bool,
     pub version: String,
     pub basedirs: Vec<String>,
+}
+
+mod server_info_stats {
+    use super::ServerStats;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    struct StatsJson<T> {
+        #[serde(flatten)]
+        stats: T,
+        #[serde(default)]
+        rust_incremental_not_stored: u64,
+    }
+
+    pub fn serialize<S: Serializer>(stats: &ServerStats, serializer: S) -> Result<S::Ok, S::Error> {
+        if serializer.is_human_readable() {
+            StatsJson {
+                stats,
+                rust_incremental_not_stored: stats.rust_incremental_not_stored,
+            }
+            .serialize(serializer)
+        } else {
+            stats.serialize(serializer)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<ServerStats, D::Error> {
+        if deserializer.is_human_readable() {
+            let StatsJson {
+                mut stats,
+                rust_incremental_not_stored,
+            } = StatsJson::<ServerStats>::deserialize(deserializer)?;
+            stats.rust_incremental_not_stored = rust_incremental_not_stored;
+            Ok(stats)
+        } else {
+            ServerStats::deserialize(deserializer)
+        }
+    }
 }
 
 /// Status of the dist client.
@@ -2024,7 +2066,6 @@ impl Default for ServerStats {
             cache_errors: PerLanguageCount::new(),
             cache_hits: PerLanguageCount::new(),
             cache_misses: PerLanguageCount::new(),
-            rust_incremental_not_stored: 0,
             cache_timeouts: u64::default(),
             cache_read_errors: u64::default(),
             non_cacheable_compilations: u64::default(),
@@ -2040,6 +2081,7 @@ impl Default for ServerStats {
             dist_compiles: HashMap::new(),
             dist_errors: u64::default(),
             multi_level: None,
+            rust_incremental_not_stored: 0,
         }
     }
 }
@@ -2476,28 +2518,22 @@ impl<R, B> Message<R, B> {
 }
 
 struct BincodeCodec;
-impl<T> tokio_serde::Serializer<T> for BincodeCodec
-where
-    T: serde::Serialize,
-{
+impl tokio_serde::Serializer<Response> for BincodeCodec {
     type Error = Error;
 
-    fn serialize(self: Pin<&mut Self>, item: &T) -> std::result::Result<Bytes, Self::Error> {
-        let mut bytes = BytesMut::new();
-        bincode::serialize_into((&mut bytes).writer(), item)?;
-        Ok(bytes.freeze())
+    fn serialize(self: Pin<&mut Self>, item: &Response) -> std::result::Result<Bytes, Self::Error> {
+        Ok(protocol::encode_response(item)?.into())
     }
 }
 
-impl<T> tokio_serde::Deserializer<T> for BincodeCodec
-where
-    T: serde::de::DeserializeOwned,
-{
+impl tokio_serde::Deserializer<Request> for BincodeCodec {
     type Error = Error;
 
-    fn deserialize(self: Pin<&mut Self>, buf: &BytesMut) -> std::result::Result<T, Self::Error> {
-        let ret = bincode::deserialize(buf)?;
-        Ok(ret)
+    fn deserialize(
+        self: Pin<&mut Self>,
+        buf: &BytesMut,
+    ) -> std::result::Result<Request, Self::Error> {
+        Ok(protocol::decode_request(buf)?)
     }
 }
 
