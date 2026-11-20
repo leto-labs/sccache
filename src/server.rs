@@ -1057,6 +1057,7 @@ where
                         miss_explain: me.miss_explain.is_some(),
                         incremental_prune_days: me.incremental_prune_days,
                         max_size: me.storage.max_size().await.unwrap_or(None),
+                        write_raw_objects: me.storage.write_raw_objects(),
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
                 }
@@ -1255,6 +1256,9 @@ where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut builder = length_delimited::Builder::new();
+        if self.storage.write_raw_objects() {
+            builder.max_frame_length(128 * 1024 * 1024);
+        }
         if let Ok(max_frame_length_str) = env::var("SCCACHE_MAX_FRAME_LENGTH") {
             if let Ok(max_frame_length) = max_frame_length_str.parse::<usize>() {
                 builder.max_frame_length(max_frame_length);

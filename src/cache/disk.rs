@@ -90,7 +90,12 @@ impl DiskCache {
         self
     }
 
-    async fn store(&self, key: &str, data: Bytes, has_raw_objects: bool) -> Result<Duration> {
+    async fn store(
+        &self,
+        key: &str,
+        data: Bytes,
+        has_raw_objects: Option<bool>,
+    ) -> Result<Duration> {
         if self.rw_mode == CacheMode::ReadOnly {
             return Err(anyhow!("Cannot write to a read-only cache"));
         }
@@ -100,8 +105,13 @@ impl DiskCache {
         self.pool
             .spawn_blocking(move || {
                 let start = Instant::now();
-                let weight = if has_raw_objects && lru.lock().unwrap().get_or_init()?.uses_weights()
-                {
+                let uses_weights = has_raw_objects != Some(false)
+                    && lru.lock().unwrap().get_or_init()?.uses_weights();
+                let weight = if uses_weights
+                    && has_raw_objects.unwrap_or_else(|| {
+                        CacheRead::from(io::Cursor::new(data.clone()))
+                            .is_ok_and(|entry| entry.has_raw_objects())
+                    }) {
                     estimate_weight(&data).ok()
                 } else {
                     None
@@ -282,7 +292,7 @@ impl CacheStorage for DiskCache {
         trace!("DiskCache::put({})", key);
         let has_raw_objects = entry.has_raw_objects();
         let data = entry.finish()?;
-        self.store(key, data.into(), has_raw_objects).await
+        self.store(key, data.into(), Some(has_raw_objects)).await
     }
 
     fn write_raw_objects(&self) -> bool {
@@ -291,7 +301,8 @@ impl CacheStorage for DiskCache {
 
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
         trace!("DiskCache::put_raw({}, {} bytes)", key, data.len());
-        self.store(key, data, false).await
+        self.store(key, data, (!self.reflink).then_some(false))
+            .await
     }
 
     async fn check(&self) -> Result<CacheMode> {

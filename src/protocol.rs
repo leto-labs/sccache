@@ -135,6 +135,8 @@ pub struct StorageHandshakeInfo {
     pub miss_explain: bool,
     #[serde(skip, default = "default_incremental_prune_days")]
     pub incremental_prune_days: u64,
+    #[serde(skip)]
+    pub write_raw_objects: bool,
 }
 
 // Older peers ignore trailing bytes. Keep extensions at the end of the
@@ -169,6 +171,7 @@ pub(crate) fn encode_response(response: &Response) -> bincode::Result<Vec<u8>> {
             bincode::serialize_into(&mut frame, &info.miss_explain)?;
             bincode::serialize_into(&mut frame, &info.incremental_prune_days)?;
             bincode::serialize_into(&mut frame, &info.rust_incremental.first_build)?;
+            bincode::serialize_into(&mut frame, &info.write_raw_objects)?;
         }
         _ => {}
     }
@@ -196,7 +199,11 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                         let (prune_days, remaining) = decode_frame(remaining)?;
                         info.incremental_prune_days = prune_days;
                         if !remaining.is_empty() {
-                            info.rust_incremental.first_build = bincode::deserialize(remaining)?;
+                            let (first_build, remaining) = decode_frame(remaining)?;
+                            info.rust_incremental.first_build = first_build;
+                            if !remaining.is_empty() {
+                                info.write_raw_objects = bincode::deserialize(remaining)?;
+                            }
                         }
                     }
                 }
@@ -383,6 +390,7 @@ mod tests {
         assert_eq!(info.cache_mode, CacheMode::ReadOnly);
         assert_eq!(info.max_size, Some(200));
         assert!(!info.miss_explain);
+        assert!(!info.write_raw_objects);
 
         let mode = CacheNoBypass;
         let mut mode_only = old_frame.clone();
@@ -401,6 +409,7 @@ mod tests {
         info.rust_incremental.first_build = Incremental;
         info.miss_explain = false;
         info.incremental_prune_days = 7;
+        info.write_raw_objects = true;
         let incremental_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
         assert!(incremental_frame.starts_with(&mode_only));
 
@@ -411,6 +420,25 @@ mod tests {
         let (legacy_explain, remaining) = decode_frame::<bool>(remaining).unwrap();
         assert!(legacy_explain);
         assert_eq!(bincode::deserialize::<u64>(remaining).unwrap(), 0);
+        let legacy_frame = &incremental_frame[..incremental_frame.len() - 1];
+        assert_eq!(
+            bincode::deserialize::<RustIncrementalFirstBuild>(
+                &incremental_frame[explain_and_prune.len()..]
+            )
+            .unwrap(),
+            Incremental
+        );
+
+        let Response::StorageHandshake(info) = decode_response(legacy_frame).unwrap() else {
+            panic!("expected storage handshake");
+        };
+        assert!(!info.write_raw_objects);
+        assert_eq!(info.rust_incremental.first_build, Incremental);
+
+        let Response::StorageHandshake(info) = decode_response(&incremental_frame).unwrap() else {
+            panic!("expected storage handshake");
+        };
+        assert!(info.write_raw_objects);
 
         for (response, mode, first_build, miss_explain, prune_days) in [
             (

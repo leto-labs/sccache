@@ -605,9 +605,10 @@ fn test_rust_cargo_basedirs_other_checkout() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
+#[test_case(false; "server compilation")]
+#[test_case(true; "client compilation")]
 #[serial]
-fn test_rust_cargo_disk_reflink_other_checkout() -> Result<()> {
+fn test_rust_cargo_disk_reflink_other_checkout(client_side: bool) -> Result<()> {
     use std::io::Write;
     use std::os::fd::AsRawFd;
 
@@ -624,8 +625,13 @@ fn test_rust_cargo_disk_reflink_other_checkout() -> Result<()> {
         return Ok(());
     }
 
-    let test_info = SccacheTest::new(None)?;
+    let test_info = SccacheTest::new(Some(&[(
+        "SCCACHE_CLIENT_SIDE",
+        if client_side { "1" } else { "0" }.into(),
+    )]))?;
     let root = real_tempdir(&test_info)?;
+    let cache_dir = root.join("cache");
+    let weighted = cache_dir_uses_btrfs_zstd(&cache_dir)?;
     let [a, b] = ["a", "b"].map(|name| root.join(name));
     let config = root.join("sccache.toml");
     let log = root.join("server.log");
@@ -638,32 +644,97 @@ fn test_rust_cargo_disk_reflink_other_checkout() -> Result<()> {
                 "SCCACHE_BASEDIRS".into(),
                 std::env::join_paths([&a, &b])?.into_string().unwrap(),
             ),
-            ("SCCACHE_LOG".into(), "info".into()),
+            ("SCCACHE_LOG".into(), "debug".into()),
             ("SCCACHE_ERROR_LOG".into(), log.to_str().unwrap().into()),
         ]),
     )?;
-    write_out_dir_crate(&a)?;
+    let payload_size = if client_side { 9 * 1024 * 1024 } else { 262144 };
+    let write_crate = |checkout: &Path| -> Result<()> {
+        write_out_dir_crate(checkout)?;
+        writeln!(
+            fs::OpenOptions::new()
+                .append(true)
+                .open(checkout.join("src/lib.rs"))?,
+            "pub static PAYLOAD: [u8; {payload_size}] = [42; {payload_size}];"
+        )?;
+        Ok(())
+    };
+    write_crate(&a)?;
     let target_a = cargo_build(&test_info, &a)?;
-    let mut raw_entries = 0;
-    for entry in walkdir::WalkDir::new(root.join("cache")) {
-        let entry = entry?;
-        if entry.file_type().is_file() && entry.file_name() != "CACHEDIR.TAG" {
-            let zip = zip::ZipArchive::new(fs::File::open(entry.path())?)?;
-            assert!(
-                zip.file_names()
-                    .any(|name| name.unwrap().starts_with("raw/"))
-            );
-            raw_entries += 1;
-        }
-    }
-    assert_eq!(raw_entries, 2);
-
     Command::new(SCCACHE_BIN.as_os_str())
         .arg("--zero-stats")
         .assert()
         .try_success()?;
-    write_out_dir_crate(&b)?;
+    let mut raw_entries = 0;
+    let mut weighted_entries = 0;
+    let mut stored_rlib = None;
+    for entry in walkdir::WalkDir::new(cache_dir) {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.file_name() != "CACHEDIR.TAG" {
+            let file = fs::File::open(entry.path())?;
+            let mut zip = zip::ZipArchive::new(&file)?;
+            assert!(
+                zip.file_names()
+                    .any(|name| name.unwrap().starts_with("raw/"))
+            );
+            let mut has_weight = false;
+            if weighted {
+                let mut weight = [0; 8];
+                // SAFETY: The file is open and weight is writable for eight bytes.
+                let len = unsafe {
+                    libc::fgetxattr(
+                        file.as_raw_fd(),
+                        c"user.sccache.weight".as_ptr(),
+                        weight.as_mut_ptr().cast(),
+                        weight.len(),
+                    )
+                };
+                if len == 8 {
+                    let weight = u64::from_le_bytes(weight);
+                    assert!(weight > 0 && weight < file.metadata()?.len());
+                    weighted_entries += 1;
+                    has_weight = true;
+                }
+            }
+            for index in 0..zip.len() {
+                let member = zip.by_index(index)?;
+                if let Some(name) = member.name()?.strip_prefix("raw/")
+                    && name.starts_with("libout_dir_test-")
+                    && name.ends_with(".rlib")
+                {
+                    assert!(member.size() >= payload_size);
+                    assert!(
+                        !weighted || has_weight,
+                        "expected a weight for the large rlib"
+                    );
+                    assert!(stored_rlib.is_none());
+                    let offset = member
+                        .data_start()
+                        .context("cached rlib has no data offset")?;
+                    stored_rlib = Some((name.to_owned(), entry.into_path(), offset));
+                    break;
+                }
+            }
+            raw_entries += 1;
+        }
+    }
+    assert_eq!(raw_entries, 2);
+    let (rlib, entry, offset) = stored_rlib.context("cached rlib missing")?;
+    let source = walkdir::WalkDir::new(&target_a)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|entry| entry.file_name() == rlib.as_str())
+        .context("rlib missing in checkout A")?;
+    let source = source.path().strip_prefix(&target_a)?;
+
+    write_crate(&b)?;
     let target_b = cargo_build(&test_info, &b)?;
+    assert_eq!(
+        shared_extent_at(&fs::File::open(target_b.join(source))?, 0)?,
+        shared_extent_at(&fs::File::open(&entry)?, offset)?,
+        "checkout B and the cache must share a physical extent after the hit"
+    );
 
     let mut rlibs = 0;
     for entry in walkdir::WalkDir::new(&target_b) {
@@ -689,8 +760,110 @@ fn test_rust_cargo_disk_reflink_other_checkout() -> Result<()> {
         .try_success()?;
     let log = fs::read_to_string(log)?;
     assert!(!log.contains("Disk cache reflink failed"), "{log}");
-    eprintln!("verified {rlibs} byte-equal rlibs, two Rust hits and no reflink fallback");
+    assert_eq!(log.contains("handle_client: storage_put_raw"), client_side);
+    eprintln!(
+        "verified {raw_entries} raw entries ({weighted_entries} weighted), \
+         {rlibs} byte-equal rlibs, two Rust hits, and a shared FIEMAP extent in B and cache"
+    );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn shared_extent_at(file: &fs::File, offset: u64) -> Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    #[repr(C)]
+    struct Fiemap {
+        start: u64,
+        length: u64,
+        flags: u32,
+        mapped_extents: u32,
+        extent_count: u32,
+        reserved: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Extent {
+        logical: u64,
+        physical: u64,
+        length: u64,
+        reserved64: [u64; 2],
+        flags: u32,
+        reserved: [u32; 3],
+    }
+
+    #[repr(C)]
+    struct Request {
+        header: Fiemap,
+        extent: Extent,
+    }
+
+    let mut request = Request {
+        header: Fiemap {
+            start: offset,
+            length: 4096,
+            flags: 1, // FIEMAP_FLAG_SYNC
+            mapped_extents: 0,
+            extent_count: 1,
+            reserved: 0,
+        },
+        extent: Extent::default(),
+    };
+    // SAFETY: The request follows the Linux FIEMAP layout with space for one extent.
+    let result = unsafe {
+        libc::ioctl(
+            file.as_raw_fd(),
+            libc::_IOWR::<Fiemap>(u32::from(b'f'), 11),
+            &raw mut request,
+        )
+    };
+    if result == -1 {
+        return Err(std::io::Error::last_os_error()).context("FIEMAP");
+    }
+    assert_eq!(request.header.mapped_extents, 1);
+    let extent = request.extent;
+    assert!((extent.logical..extent.logical + extent.length).contains(&offset));
+    assert_ne!(extent.flags & 0x2000, 0, "FIEMAP_EXTENT_SHARED");
+    // Encoded ranges refer to the compressed extent as a whole.
+    const FIEMAP_EXTENT_ENCODED: u32 = 8;
+    if extent.flags & FIEMAP_EXTENT_ENCODED != 0 {
+        Ok(extent.physical)
+    } else {
+        Ok(extent.physical + (offset - extent.logical))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cache_dir_uses_btrfs_zstd(path: &Path) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    let dir = fs::File::open(path)?;
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: The open fd and out pointer are valid. Success initializes stat.
+    let stat = unsafe {
+        if libc::fstatfs(dir.as_raw_fd(), stat.as_mut_ptr()) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        stat.assume_init()
+    };
+    if stat.f_type != libc::BTRFS_SUPER_MAGIC || stat.f_bsize != 4096 {
+        return Ok(false);
+    }
+    // SAFETY: The directory is open and the string literals have static storage.
+    if unsafe {
+        libc::fsetxattr(
+            dir.as_raw_fd(),
+            c"btrfs.compression".as_ptr(),
+            b"zstd".as_ptr().cast(),
+            4,
+            0,
+        )
+    } == -1
+    {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(true)
 }
 
 /// With `SCCACHE_BASEDIRS_REMAP_PATHS`, the outputs a hit restores in the second checkout
