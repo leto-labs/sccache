@@ -172,8 +172,23 @@ Set `rust_incremental_first_build = "incremental"` in the server config or
 `SCCACHE_RUST_INCREMENTAL_FIRST_BUILD=incremental` when starting the server
 to use incremental codegen on the first miss as well. The default is `plain`.
 
-Incremental compiles in either cache mode use a private session directory
-named `DIR/<crate_name>-sccache-<unit hash>`. Switching from `off` to a cache
+The client also uses its incremental mode and first-build settings when it
+runs rustc for an uncached compile, including after losing the server
+connection. In either cache mode with `plain`, a binary, example, test,
+proc-macro, or metadata-only build starts plain if its expected rustc output
+is missing. The first rebuild with an existing output creates a session in
+Cargo's original incremental directory. The warm-session client bypass still
+uses its private directory.
+
+Rustc leaves the incremental directory path untracked, so its value has no
+effect on the output. A plain compile produces a complete artifact.
+Binaries and tests have no dependent crates. For proc-macros, rustc
+validates the dependency's stable version hash (SVH) when reusing a
+dependent's session, as it does for libraries. The plain command uses
+`-C lto=off` to match incremental codegen unless the invocation sets LTO.
+
+Cache-eligible incremental compiles in either cache mode use a private
+session directory named `DIR/<crate_name>-sccache-<unit hash>`. Switching from `off` to a cache
 mode starts each unit cold the first time it compiles in its private directory.
 Switching back selects Cargo's original session location. Both cache modes
 share the private directory. sccache refreshes its modification time after

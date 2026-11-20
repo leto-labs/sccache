@@ -209,6 +209,7 @@ fn test_server_unsupported_compiler() {
         cwd,
         path,
         vec![],
+        Default::default(),
         &mut stdout,
         &mut stderr,
     );
@@ -288,6 +289,7 @@ fn test_server_compile() {
             cwd,
             path,
             vec![],
+            Default::default(),
             &mut stdout,
             &mut stderr
         )
@@ -382,6 +384,7 @@ fn compile_dep(
         f.tempdir.path(),
         Some(f.paths.clone()),
         vec![],
+        Default::default(),
         &mut stdout,
         &mut stderr.clone(),
     )

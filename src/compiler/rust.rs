@@ -72,6 +72,8 @@ use crate::errors::*;
 
 mod incremental;
 use incremental::IncrementalSession;
+mod local;
+pub(crate) use local::plain_first_build_arguments;
 
 pub(crate) const NO_CRATE_TYPE_PASSED: &str = "No crate-type passed";
 
@@ -2198,8 +2200,7 @@ fn extra_filename_from_args(arguments: &[Argument<ArgData>]) -> &str {
 
 impl ParsedArguments {
     fn metadata_filename(&self) -> String {
-        let suffix = extra_filename_from_args(&self.arguments);
-        format!("lib{}{suffix}.rmeta", self.crate_name)
+        metadata_filename(&self.crate_name, &self.arguments)
     }
 
     fn metadata_output(&self) -> Option<PathBuf> {
@@ -2212,6 +2213,11 @@ impl ParsedArguments {
         (self.linked_check.is_some() || library_metadata)
             .then(|| self.output_dir.join(self.metadata_filename()))
     }
+}
+
+fn metadata_filename(crate_name: &str, arguments: &[Argument<ArgData>]) -> String {
+    let suffix = extra_filename_from_args(arguments);
+    format!("lib{crate_name}{suffix}.rmeta")
 }
 
 impl RustHasher {
