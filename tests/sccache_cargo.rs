@@ -15,6 +15,7 @@ use predicates::prelude::*;
 use serial_test::serial;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use test_case::test_case;
 
 #[macro_use]
 extern crate log;
@@ -605,22 +606,28 @@ fn test_rust_cargo_basedirs_other_checkout() -> Result<()> {
 
 /// With `SCCACHE_BASEDIRS_REMAP_PATHS`, the outputs a hit restores in the second checkout
 /// do not name the first one.
-#[test]
+#[test_case(false ; "configured basedirs")]
+#[test_case(true ; "compile basedirs")]
 #[serial]
-fn test_rust_cargo_basedirs_remap_paths() -> Result<()> {
+fn test_rust_cargo_basedirs_remap_paths(compile_basedirs: bool) -> Result<()> {
     let mut test_info = SccacheTest::new(None)?;
     test_info
         .env
         .push(("SCCACHE_BASEDIRS_REMAP_PATHS", "1".into()));
     let tempdir = real_tempdir(&test_info)?;
     let [a, b] = ["a", "b"].map(|name| tempdir.join(name));
-    let basedirs = std::env::join_paths([&a, &b])?.into_string().unwrap();
-    restart_sccache(
-        &test_info,
-        Some(vec![("SCCACHE_BASEDIRS".into(), basedirs)]),
-    )?;
+    if !compile_basedirs {
+        let basedirs = std::env::join_paths([&a, &b])?.into_string().unwrap();
+        restart_sccache(
+            &test_info,
+            Some(vec![("SCCACHE_BASEDIRS".into(), basedirs)]),
+        )?;
+    }
     for checkout in [&a, &b] {
         write_out_dir_crate(checkout)?;
+        if compile_basedirs {
+            write_compile_basedirs_config(checkout)?;
+        }
         cargo_build(&test_info, checkout)?;
     }
 
@@ -830,11 +837,7 @@ fn test_rust_cargo_basedirs_per_build_mode(
     let [a, b] = ["a", "b"].map(|name| tempdir.join(name));
     for checkout in [&a, &b] {
         write_out_dir_crate(checkout)?;
-        fs::create_dir_all(checkout.join(".cargo"))?;
-        fs::write(
-            checkout.join(".cargo/config.toml"),
-            "[env]\nSCCACHE_BASEDIRS = { value = \"\", relative = true }\n",
-        )?;
+        write_compile_basedirs_config(checkout)?;
     }
 
     cargo_build(&test_info, &a)?;
@@ -857,5 +860,14 @@ fn test_rust_cargo_basedirs_per_build_mode(
                 .from_utf8(),
         )?
         .try_success()?;
+    Ok(())
+}
+
+fn write_compile_basedirs_config(checkout: &Path) -> Result<()> {
+    fs::create_dir_all(checkout.join(".cargo"))?;
+    fs::write(
+        checkout.join(".cargo/config.toml"),
+        "[env]\nSCCACHE_BASEDIRS = { value = \"\", relative = true }\n",
+    )?;
     Ok(())
 }

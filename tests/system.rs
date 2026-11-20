@@ -2518,17 +2518,21 @@ fn test_unreadable_preprocessor_cache_entry_is_a_miss() {
 /// the include files the entry records have to be checked in the tree being
 /// compiled. Two checkouts whose headers disagree cannot have the same object.
 /// See issue #2863.
-#[test]
+#[test_case("gcc", false ; "gcc with configured basedirs")]
+#[test_case("gcc", true ; "gcc with compile basedirs")]
+#[test_case("clang", false ; "clang with configured basedirs")]
+#[test_case("clang", true ; "clang with compile basedirs")]
 #[serial]
 #[cfg(all(unix, not(target_os = "macos")))]
-fn test_basedirs_preprocessor_cache_checks_own_tree() {
+fn test_basedirs_preprocessor_cache_checks_own_tree(name: &str, compile_basedirs: bool) {
     let _ = env_logger::try_init();
     let tempdir = tempfile::Builder::new()
         .prefix("sccache_system_test")
         .tempdir()
         .unwrap();
 
-    let Some(compiler) = find_gcc_or_clang() else {
+    let Some(compiler) = find_compilers().into_iter().find(|c| c.name == name) else {
+        warn!("No {name} found, skipping test");
         return;
     };
 
@@ -2562,26 +2566,30 @@ fn test_basedirs_preprocessor_cache_checks_own_tree() {
     }
 
     let mut sccache_cfg = sccache_client_cfg(tempdir.path(), true);
-    sccache_cfg.basedirs = trees
-        .iter()
-        .map(|tree| tree.to_str().unwrap().to_string())
-        .collect();
+    if !compile_basedirs {
+        sccache_cfg.basedirs = trees
+            .iter()
+            .map(|tree| tree.to_str().unwrap().to_string())
+            .collect();
+    }
     restart_local_daemon_with(tempdir.path(), &sccache_cfg);
     zero_stats();
 
     let compile = |tree: &Path| {
-        sccache_command()
-            .args(compile_cmdline(
-                compiler.name,
-                &compiler.exe,
-                "main.c",
-                "main.o",
-                vec![OsString::from(format!("-I{}", tree.join("inc").display()))],
-            ))
-            .current_dir(tree)
-            .envs(compiler.env_vars.clone())
-            .assert()
-            .success();
+        let mut cmd = sccache_command();
+        cmd.args(compile_cmdline(
+            compiler.name,
+            &compiler.exe,
+            "main.c",
+            "main.o",
+            vec![OsString::from(format!("-I{}", tree.join("inc").display()))],
+        ))
+        .current_dir(tree)
+        .envs(compiler.env_vars.clone());
+        if compile_basedirs {
+            cmd.env("SCCACHE_BASEDIRS", tree);
+        }
+        cmd.assert().success();
         fs::read(tree.join("main.o")).unwrap()
     };
 
@@ -2596,11 +2604,13 @@ fn test_basedirs_preprocessor_cache_checks_own_tree() {
         assert_eq!(2, info.stats.cache_misses.all());
     });
 
-    // And the cache still works: treea's object is in it.
-    fs::remove_file(trees[0].join("main.o")).unwrap();
+    let header_b = trees[1].join("inc/cfg.h");
+    fs::copy(trees[0].join("inc/cfg.h"), &header_b).unwrap();
+    filetime::set_file_times(header_b, backdated, backdated).unwrap();
+    fs::remove_file(trees[1].join("main.o")).unwrap();
     assert!(
-        object_a == compile(&trees[0]),
-        "treea's object came back changed"
+        object_a == compile(&trees[1]),
+        "treeb did not get treea's object file with the same cfg.h"
     );
     get_stats(|info| {
         assert_eq!(1, info.stats.cache_hits.all());
