@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the %i branch tip for sccache pre-warming
+
+[Timer]
+OnCalendar=*-*-* *:00/10:00
+RandomizedDelaySec=90s
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
