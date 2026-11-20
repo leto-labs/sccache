@@ -13,53 +13,72 @@
 use super::{ArgCodegen, CodeGen, ParsedArguments};
 use crate::compiler::args::Argument;
 use crate::util::{Digest, HashToDigest};
+use filetime::FileTime;
 use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Clone, Debug)]
-pub(super) struct IncrementalSession {
+pub(crate) struct IncrementalSession {
     path: PathBuf,
 }
 
 impl IncrementalSession {
-    pub(super) fn new(
-        args: &ParsedArguments,
-        dir: PathBuf,
-        version: &str,
-        compiler_shlibs_digests: &[String],
-    ) -> Self {
-        let mut metadata: Vec<_> = args
+    pub(super) fn from_parsed(args: &ParsedArguments) -> Option<Self> {
+        let metadata = args
             .arguments
             .iter()
             .filter_map(|arg| match arg.get_data() {
-                Some(CodeGen(ArgCodegen { opt, value })) if opt == "metadata" => Some(value),
+                Some(CodeGen(ArgCodegen {
+                    opt,
+                    value: Some(value),
+                })) if opt == "metadata" => Some(value.as_str()),
                 _ => None,
             })
             .collect();
-        metadata.sort_unstable();
         let is_test = args
             .arguments
             .iter()
             .any(|arg| matches!(arg, Argument::UnknownFlag(flag) if flag == "--test"));
-        let mut digest = Digest::new();
-        digest.delimiter(b"rust-incremental-dir");
-        (
+        let crate_types: Vec<_> = [
+            args.crate_types.rlib.then_some("rlib"),
+            args.crate_types.staticlib.then_some("staticlib"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        Some(Self::new(
+            args.incremental_dir.as_deref()?,
             &args.crate_name,
             metadata,
-            &args.crate_types,
+            &crate_types,
             is_test,
-            version,
-            compiler_shlibs_digests,
-        )
-            .hash(&mut HashToDigest {
-                digest: &mut digest,
-            });
+        ))
+    }
 
+    fn new(
+        dir: &Path,
+        crate_name: &str,
+        mut metadata: Vec<&str>,
+        crate_types: &[&str],
+        is_test: bool,
+    ) -> Self {
+        metadata.sort_unstable();
+        let mut digest = Digest::new();
+        digest.delimiter(b"rust-incremental-argv");
+        (crate_name, metadata, crate_types, is_test).hash(&mut HashToDigest {
+            digest: &mut digest,
+        });
         let hash = digest.finish();
-        let path = dir.join(format!("{}-sccache-{}", args.crate_name, &hash[..16]));
-        Self { path }
+        Self {
+            path: dir.join(format!("{crate_name}-sccache-{}", &hash[..16])),
+        }
+    }
+
+    pub(crate) fn refresh_mtime(&self) {
+        // Cleanup tools use the mtime of the top-level incremental directory entry.
+        let _ = filetime::set_file_mtime(&self.path, FileTime::now());
     }
 
     pub(super) fn path(&self) -> &Path {

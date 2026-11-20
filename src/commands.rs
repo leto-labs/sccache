@@ -15,8 +15,8 @@
 use crate::cache::{CacheMode, IpcStorage, Storage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry};
 use crate::cmdline::{Command, StatsFormat};
-use crate::compiler::{ColorMode, is_rmeta_artifact_notification};
-use crate::config::Config;
+use crate::compiler::{self, ColorMode, is_rmeta_artifact_notification};
+use crate::config::{Config, RustIncremental};
 use crate::jobserver::Client;
 use crate::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
@@ -964,8 +964,6 @@ pub fn run_command(cmd: Command) -> Result<i32> {
         }
         #[cfg(feature = "dist-client")]
         Command::PackageToolchain(executable, out) => {
-            use crate::compiler;
-
             trace!("Command::PackageToolchain({})", executable.display());
             let runtime = new_client_runtime()?;
             let jobserver = Client::new();
@@ -996,6 +994,33 @@ pub fn run_command(cmd: Command) -> Result<i32> {
             trace!("Command::Compile {{ {:?}, {:?}, {:?} }}", exe, cmdline, cwd);
 
             let jobserver = Client::from_env_fifo().unwrap_or_else(Client::new);
+            if config.rust_incremental == RustIncremental::Cache
+                && compiler::is_rustc_like(&exe)
+                && let Some(local) = compiler::local_incremental_command(
+                    Path::new(&exe),
+                    &cmdline,
+                    &cwd,
+                    &env_vars,
+                    &config.basedirs,
+                )?
+            {
+                let exe_path = which_in(&exe, env::var_os("PATH"), &cwd)?;
+                let mut runtime = new_client_runtime()?;
+                let result = handle_compile_result(
+                    ProcessCommandCreator::new(&jobserver),
+                    &mut runtime,
+                    CompileResponse::UnhandledCompile,
+                    None,
+                    false,
+                    &exe_path,
+                    local.arguments,
+                    &cwd,
+                    &mut io::stdout(),
+                    &mut io::stderr(),
+                );
+                local.session.refresh_mtime();
+                return result.context("failed to execute incremental compile");
+            }
             let conn = connect_or_start_server(&get_addr(), startup_timeout)?;
             if config.client_side_mode {
                 // Under make -jN each CLI process gets only 2 worker threads;

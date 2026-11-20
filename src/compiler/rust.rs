@@ -1674,8 +1674,7 @@ impl<T: CommandCreatorSync> CompileCommand<T> for RustCompileCommand {
     ) -> Result<process::Output> {
         let result = self.inner.execute(service, creator).await;
         if let Some(session) = &self.incremental {
-            // Cleanup tools use the mtime of the top-level incremental directory entry.
-            let _ = filetime::set_file_mtime(session.path(), FileTime::now());
+            session.refresh_mtime();
         }
         result
     }
@@ -1740,6 +1739,14 @@ fn parse_arguments(
     cwd: &Path,
     mode: RustIncremental,
 ) -> CompilerArguments<ParsedArguments> {
+    parse_argument_iter(ExpandResponseFile::new(cwd, arguments), cwd, mode)
+}
+
+fn parse_argument_iter(
+    arguments: impl Iterator<Item = OsString>,
+    cwd: &Path,
+    mode: RustIncremental,
+) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
     let mut emit: Option<HashSet<String>> = None;
@@ -1766,11 +1773,7 @@ fn parse_arguments(
     let mut save_temps = false;
     let mut grouped_codegen = false;
 
-    // Custom iterator to expand `@` arguments which stand for reading a file
-    // and interpreting it as a list of more arguments.
-    let it = ExpandResponseFile::new(cwd, arguments);
-
-    for (idx, arg) in ArgsIter::new(it, &ARGS[..]).enumerate() {
+    for (idx, arg) in ArgsIter::new(arguments, &ARGS[..]).enumerate() {
         let arg = try_or_cannot_cache!(arg, "argument parse");
         match arg.get_data() {
             Some(TooHardFlag) | Some(TooHardPath(_)) => {
@@ -2037,12 +2040,7 @@ fn parse_arguments(
 
 impl RustHasher {
     fn incremental_session(&self) -> Option<IncrementalSession> {
-        Some(IncrementalSession::new(
-            &self.parsed_args,
-            self.parsed_args.incremental_dir.clone()?,
-            &self.version,
-            &self.compiler_shlibs_digests,
-        ))
+        IncrementalSession::from_parsed(&self.parsed_args)
     }
 
     fn remap_arguments(
@@ -2070,6 +2068,75 @@ impl RustHasher {
         }
         arguments
     }
+}
+
+pub(crate) struct LocalIncrementalCommand {
+    pub arguments: Vec<OsString>,
+    pub session: IncrementalSession,
+    _response_file: Option<tempfile::NamedTempFile>,
+}
+
+pub(crate) fn local_incremental_command(
+    executable: &Path,
+    arguments: &[OsString],
+    cwd: &Path,
+    env_vars: &[(OsString, OsString)],
+    configured_basedirs: &[Vec<u8>],
+) -> Result<Option<LocalIncrementalCommand>> {
+    if !arguments.iter().any(|arg| {
+        arg.starts_with("@")
+            || arg
+                .as_encoded_bytes()
+                .windows(b"incremental=".len())
+                .any(|part| part == b"incremental=")
+    }) {
+        return Ok(None);
+    }
+    let raw: Vec<_> = ExpandResponseFile::new(cwd, arguments).collect();
+    let CompilerArguments::Ok(parsed) =
+        parse_argument_iter(raw.iter().cloned(), cwd, RustIncremental::Cache)
+    else {
+        return Ok(None);
+    };
+    let Some(session) = IncrementalSession::from_parsed(&parsed) else {
+        return Ok(None);
+    };
+    if !session.has_finalized_session().unwrap_or(false) {
+        return Ok(None);
+    }
+
+    let mut rewritten = Vec::new();
+    if basedirs_remap_paths(env_vars) {
+        let basedirs = super::request_basedirs(env_vars, configured_basedirs);
+        rewritten.extend(
+            basedirs_remap_arguments(cwd, &parsed.output_dir, &basedirs)
+                .iter()
+                .flat_map(|arg| arg.iter_os_strings()),
+        );
+    }
+    let consumed = std::cell::Cell::new(0);
+    let args = raw
+        .iter()
+        .cloned()
+        .inspect(|_| consumed.set(consumed.get() + 1));
+    let mut start = 0;
+    for arg in ArgsIter::new(args, &ARGS[..]) {
+        if arg.as_ref().is_ok_and(is_incremental_argument) {
+            let mut value = OsString::from("incremental=");
+            value.push(session.path());
+            rewritten.extend([OsString::from("-C"), value]);
+        } else {
+            rewritten.extend_from_slice(&raw[start..consumed.get()]);
+        }
+        start = consumed.get();
+    }
+    let (arguments, response_file) =
+        arguments_for_spawn(executable, &rewritten, COMMAND_LINE_LIMIT)?;
+    Ok(Some(LocalIncrementalCommand {
+        arguments,
+        session,
+        _response_file: response_file,
+    }))
 }
 
 fn cargo_incremental_env(var: &OsStr) -> bool {
@@ -2306,7 +2373,17 @@ where
             .iter()
             .map(|e| cwd.join(e))
             .collect::<Vec<_>>();
-        let extern_hashes = hash_all_externs(&abs_externs, pool);
+        let extern_hashes = async {
+            let start = time::Instant::now();
+            let result = hash_all_externs(&abs_externs, pool).await;
+            debug!(
+                "[{}]: hashing {} externs took {}",
+                self.parsed_args.crate_name,
+                abs_externs.len(),
+                fmt_duration_as_secs(&start.elapsed())
+            );
+            result
+        };
         // Hash the contents of the staticlibs listed on the commandline.
         trace!(
             "[{}]: hashing {} staticlibs",
@@ -3995,36 +4072,22 @@ LLVM version: 15.0.2
         }
     }
 
-    fn incremental_session(
-        dir: &Path,
-        extra: &[&str],
-        version: &str,
-        digests: &[String],
-    ) -> IncrementalSession {
-        let CompilerArguments::Ok(args) = parse_rust_lib(extra, dir, RustIncremental::Cache) else {
+    fn incremental_session(dir: &Path, extra: &[&str]) -> IncrementalSession {
+        let mut args = vec!["-Cincremental="];
+        args.extend_from_slice(extra);
+        let CompilerArguments::Ok(args) = parse_rust_lib(&args, dir, RustIncremental::Cache) else {
             panic!("expected Rust library arguments to parse");
         };
-        IncrementalSession::new(&args, dir.to_owned(), version, digests)
+        IncrementalSession::from_parsed(&args).unwrap()
     }
 
     #[test]
     fn test_incremental_directory_identity() {
         let dir = Path::new("incremental");
         let metadata = ["-Cmetadata=a", "--codegen=metadata=b"];
-        let private_dir = |args: &[&str], version: &str, digests: &[String]| {
-            incremental_session(dir, args, version, digests)
-                .path()
-                .to_owned()
-        };
-        let lib = private_dir(&metadata, "version", &["digest".into()]);
-        assert_eq!(
-            lib,
-            private_dir(
-                &["-Cmetadata=b", "-Cmetadata=a"],
-                "version",
-                &["digest".into()]
-            )
-        );
+        let private_dir = |args: &[&str]| incremental_session(dir, args).path().to_owned();
+        let lib = private_dir(&metadata);
+        assert_eq!(lib, private_dir(&["-Cmetadata=b", "-Cmetadata=a"]));
         assert_eq!(lib.parent(), Some(dir));
         let name = lib.file_name().unwrap().to_str().unwrap();
         let hash = name.strip_prefix("foo-sccache-").unwrap();
@@ -4039,24 +4102,64 @@ LLVM version: 15.0.2
         ] {
             let mut args = metadata.to_vec();
             args.push(extra);
-            assert_ne!(lib, private_dir(&args, "version", &["digest".into()]));
+            assert_ne!(lib, private_dir(&args));
         }
-        assert_ne!(
-            lib,
-            private_dir(&metadata, "other version", &["digest".into()])
-        );
-        assert_ne!(
-            lib,
-            private_dir(&metadata, "version", &["other digest".into()])
-        );
+    }
+
+    #[test_case(&["--crate-type=lib", "-Cmetadata=fd92c3"] ; "joined")]
+    #[test_case(&["--crate-type", "lib", "-C", "metadata=fd92c3"] ; "separate")]
+    #[test_case(&["--crate-type=lib", "-Cmetadata=fd92c3", "--test"] ; "test")]
+    fn test_client_incremental_path_matches_server(cargo_args: &[&str]) {
+        let tmp = tempfile::tempdir().unwrap();
+        for incremental in [
+            &["-C", "incremental=inc"][..],
+            &["-Cincremental=inc"],
+            &["--codegen", "incremental=inc"],
+            &["--codegen=incremental=inc"],
+        ] {
+            let mut argv = vec![
+                "--crate-name",
+                "foo",
+                "--edition=2021",
+                "src/lib.rs",
+                "--emit=dep-info,metadata,link",
+                "--out-dir",
+                "target/debug/deps",
+                "-C",
+                "debuginfo=2",
+                "--error-format=json",
+            ];
+            argv.extend_from_slice(cargo_args);
+            argv.extend_from_slice(incremental);
+            let argv: Vec<_> = argv.into_iter().map(OsString::from).collect();
+            let CompilerArguments::Ok(parsed) =
+                parse_arguments(&argv, tmp.path(), RustIncremental::Cache)
+            else {
+                panic!("expected Cargo arguments to parse");
+            };
+            let server = IncrementalSession::from_parsed(&parsed).unwrap();
+            fs::create_dir_all(server.path().join("foo-id/s-old")).unwrap();
+
+            let local = local_incremental_command(Path::new("rustc"), &argv, tmp.path(), &[], &[])
+                .unwrap()
+                .unwrap();
+            assert_eq!(local.session.path(), server.path());
+            assert_eq!(
+                &local.arguments[..argv.len() - incremental.len()],
+                &argv[..argv.len() - incremental.len()]
+            );
+            let mut expected = OsString::from("incremental=");
+            expected.push(server.path());
+            assert_eq!(local.arguments.last(), Some(&expected));
+        }
     }
 
     #[test]
     fn test_incremental_private_directory_cold_detection() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let unit = incremental_session(root, &[], "version", &[]);
-        let harness = incremental_session(root, &["--test"], "version", &[]);
+        let unit = incremental_session(root, &[]);
+        let harness = incremental_session(root, &["--test"]);
         assert!(!unit.has_finalized_session().unwrap());
         fs::write(unit.path(), b"obsolete file").unwrap();
         assert!(unit.has_finalized_session().is_err());
@@ -5290,7 +5393,7 @@ foo.rs:
             .compilation
             .generate_compile_commands(&mut dist::PathTransformer::new(), false)
             .unwrap();
-        let session = incremental_session(&cwd.join("b"), &[], TEST_RUSTC_VERSION, &[]);
+        let session = incremental_session(&cwd.join("b"), &[]);
         let mut rewritten = OsString::from("incremental=");
         rewritten.push(session.path());
         assert!(local.get_arguments().contains(&rewritten));

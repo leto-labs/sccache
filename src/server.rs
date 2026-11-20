@@ -16,9 +16,9 @@ use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
-    CacheControl, CacheStoreVeto, CompileResult, Compiler, CompilerArguments, CompilerHasher,
-    CompilerKind, CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED,
-    get_compiler_info,
+    CacheControl, CacheStoreVeto, CacheWriteFuture, CompileResult, Compiler, CompilerArguments,
+    CompilerHasher, CompilerKind, CompilerProxy, DistType, Language, MissType,
+    NO_CRATE_TYPE_PASSED, get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
@@ -705,9 +705,10 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let service =
+        let mut service =
             SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info)
                 .with_rust_incremental(rust_incremental);
+        service.background_cache_writes = true;
 
         SccacheServer {
             runtime,
@@ -873,6 +874,26 @@ impl<C> CompilerCacheEntry<C> {
         }
     }
 }
+#[derive(Default)]
+struct PendingCacheWrites {
+    keys: Mutex<HashMap<String, usize>>,
+    completed: tokio::sync::Notify,
+}
+
+impl PendingCacheWrites {
+    async fn wait(&self, key: Option<&str>) {
+        loop {
+            let keys = self.keys.lock().await;
+            if key.map_or_else(|| keys.is_empty(), |key| !keys.contains_key(key)) {
+                return;
+            }
+            let completed = self.completed.notified();
+            drop(keys);
+            completed.await;
+        }
+    }
+}
+
 /// Service implementation for sccache
 #[derive(Clone)]
 pub struct SccacheService<C>
@@ -881,6 +902,8 @@ where
 {
     /// Server statistics.
     stats: Arc<Mutex<ServerStats>>,
+    pending_cache_writes: Arc<PendingCacheWrites>,
+    background_cache_writes: bool,
 
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
@@ -1112,6 +1135,8 @@ where
     ) -> SccacheService<C> {
         SccacheService {
             stats: Arc::default(),
+            pending_cache_writes: Arc::default(),
+            background_cache_writes: false,
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode,
@@ -1141,6 +1166,8 @@ where
         let dist_client = DistClientContainer::new_disabled();
         SccacheService {
             stats: Arc::default(),
+            pending_cache_writes: Arc::default(),
+            background_cache_writes: false,
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
@@ -1166,6 +1193,8 @@ where
         let client = Client::new_num(1);
         SccacheService {
             stats: Arc::default(),
+            pending_cache_writes: Arc::default(),
+            background_cache_writes: false,
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
                 Box::new(DistClientConfig {
                     pool: rt.clone(),
@@ -1264,12 +1293,14 @@ where
 
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
+        self.pending_cache_writes.wait(None).await;
         let stats = self.stats.lock().await.clone();
         ServerInfo::new(stats, Some(&*self.storage)).await
     }
 
     /// Zero stats about the cache.
     async fn zero_stats(&self) {
+        self.pending_cache_writes.wait(None).await;
         *self.stats.lock().await = ServerStats::default();
     }
 
@@ -1826,29 +1857,69 @@ where
             }
 
             if let Some(cache_write) = cache_write {
-                match cache_write.await {
-                    Err(e) => {
-                        debug!("Error executing cache write: {}", e);
-                        me.stats.lock().await.cache_write_errors += 1;
-                    }
-                    //TODO: save cache stats!
-                    Ok(info) => {
-                        debug!(
-                            "[{}]: Cache write finished in {}",
-                            info.object_file_pretty,
-                            util::fmt_duration_as_secs(&info.duration)
-                        );
-                        let mut stats = me.stats.lock().await;
-                        stats.cache_writes += 1;
-                        stats.cache_write_duration += info.duration;
-                    }
-                }
+                me.start_cache_write(cache_write, kind == CompilerKind::Rust)
+                    .await;
             }
 
             Ok(res)
         })
         .map_err(anyhow::Error::new)
         .await?
+    }
+
+    pub(crate) async fn wait_for_cache_write(&self, key: &str) {
+        self.pending_cache_writes.wait(Some(key)).await;
+    }
+
+    async fn start_cache_write(&self, write: CacheWriteFuture, replaces_outputs: bool) {
+        // Other compilers can overwrite an inode that an open handle still refers to.
+        if !self.background_cache_writes || !replaces_outputs {
+            Self::finish_cache_write(&self.stats, write).await;
+            return;
+        }
+
+        let key = write.key.clone();
+        let pending = self.pending_cache_writes.clone();
+        *pending.keys.lock().await.entry(key.clone()).or_default() += 1;
+        let stats = self.stats.clone();
+        let active = self.info.clone();
+        self.rt.spawn(async move {
+            let _active = active;
+            if std::panic::AssertUnwindSafe(Self::finish_cache_write(&stats, write))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                error!("Cache write panicked");
+                stats.lock().await.cache_write_errors += 1;
+            }
+            let mut keys = pending.keys.lock().await;
+            let remaining = keys.get_mut(&key).expect("cache write registered");
+            *remaining -= 1;
+            if *remaining == 0 {
+                keys.remove(&key);
+            }
+            pending.completed.notify_waiters();
+        });
+    }
+
+    async fn finish_cache_write(stats: &Mutex<ServerStats>, write: CacheWriteFuture) {
+        match write.future.await {
+            Err(err) => {
+                debug!("Error executing cache write: {err:#}");
+                stats.lock().await.cache_write_errors += 1;
+            }
+            Ok(info) => {
+                debug!(
+                    "[{}]: Cache write finished in {}",
+                    info.object_file_pretty,
+                    util::fmt_duration_as_secs(&info.duration)
+                );
+                let mut stats = stats.lock().await;
+                stats.cache_writes += 1;
+                stats.cache_write_duration += info.duration;
+            }
+        }
     }
 }
 

@@ -670,6 +670,7 @@ where
             } else if cache_control == CacheControl::ForceRecache {
                 Ok(Cache::Recache)
             } else {
+                service.wait_for_cache_write(&key).await;
                 storage.get(&key).await
             }
         };
@@ -871,37 +872,38 @@ where
                     out_pretty,
                     fmt_duration_as_secs(&duration_compilation)
                 );
-                let start_create_artifact = Instant::now();
-                let mut entry =
-                    CacheWrite::from_objects(outputs, &pool, storage.write_raw_objects())
-                        .await
-                        .context("failed to zip up compiler outputs")?;
-
-                entry.put_stdout(&compiler_result.stdout)?;
-                entry.put_stderr(&compiler_result.stderr)?;
-                debug!(
-                    "[{}]: Created cache artifact in {}",
-                    out_pretty,
-                    fmt_duration_as_secs(&start_create_artifact.elapsed())
-                );
-
-                let out_pretty2 = out_pretty.clone();
-                // Try to finish storing the newly-written cache
-                // entry. We'll get the result back elsewhere.
+                // Hold these inodes before replying. A later compile can replace the paths.
+                let outputs = CacheWrite::open_objects(outputs);
+                let stdout = compiler_result.stdout.clone();
+                let stderr = compiler_result.stderr.clone();
+                let write_key = key.clone();
+                let out_pretty = out_pretty.clone();
                 let future = async move {
+                    let start_create_artifact = Instant::now();
+                    let mut entry =
+                        CacheWrite::from_open_objects(outputs?, &pool, storage.write_raw_objects())
+                            .await
+                            .context("failed to zip up compiler outputs")?;
+                    entry.put_stdout(&stdout)?;
+                    entry.put_stderr(&stderr)?;
+                    debug!(
+                        "[{}]: Created cache artifact in {}",
+                        out_pretty,
+                        fmt_duration_as_secs(&start_create_artifact.elapsed())
+                    );
+
                     let start = Instant::now();
-                    match storage.put(&key, entry).await {
-                        Ok(_) => {
-                            debug!("[{}]: Stored in cache successfully!", out_pretty2);
-                            Ok(CacheWriteInfo {
-                                object_file_pretty: out_pretty2,
-                                duration: start.elapsed(),
-                            })
-                        }
-                        Err(e) => Err(e),
-                    }
+                    storage.put(&write_key, entry).await?;
+                    debug!("[{}]: Stored in cache successfully!", out_pretty);
+                    Ok(CacheWriteInfo {
+                        object_file_pretty: out_pretty,
+                        duration: start.elapsed(),
+                    })
                 };
-                let future = Box::pin(future);
+                let future = CacheWriteFuture {
+                    key,
+                    future: Box::pin(future),
+                };
                 Ok((
                     CompileResult::CacheMiss(
                         miss_type,
@@ -1334,7 +1336,10 @@ pub enum CacheStoreVeto {
     RustIncrementalSession,
 }
 
-type CacheWriteFuture = Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>;
+pub struct CacheWriteFuture {
+    pub(crate) key: String,
+    pub(crate) future: Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>,
+}
 
 /// The result of a compilation or cache retrieval.
 pub enum CompileResult {
@@ -1436,7 +1441,7 @@ pub enum CacheControl {
 
 /// The basedirs for one compile: the `SCCACHE_BASEDIRS` in its environment if set,
 /// so each build can name its own checkout, otherwise the configured ones.
-fn request_basedirs<'a>(
+pub(crate) fn request_basedirs<'a>(
     env_vars: &[(OsString, OsString)],
     configured: &'a [Vec<u8>],
 ) -> Cow<'a, [Vec<u8>]> {
@@ -1480,7 +1485,7 @@ pub async fn write_temp_file(
 
 /// Returns true if the given path looks like a program known to have
 /// a rustc compatible interface.
-fn is_rustc_like<P: AsRef<Path>>(p: P) -> bool {
+pub(crate) fn is_rustc_like<P: AsRef<Path>>(p: P) -> bool {
     matches!(
         p.as_ref()
             .file_stem()
@@ -3191,7 +3196,7 @@ LLVM version: 6.0",
         match cached {
             CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
-                f.wait().unwrap();
+                f.future.wait().unwrap();
             }
             _ => panic!("Unexpected compile result: {:?}", cached),
         }
@@ -3322,7 +3327,7 @@ LLVM version: 6.0",
         match cached {
             CompileResult::CacheMiss(MissType::Normal, DistType::Ok(_), _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
-                f.wait().unwrap();
+                f.future.wait().unwrap();
             }
             _ => panic!("Unexpected compile result: {:?}", cached),
         }
@@ -3443,7 +3448,7 @@ LLVM version: 6.0",
         match cached {
             CompileResult::CacheMiss(MissType::CacheReadError, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
-                let _ = f.wait();
+                let _ = f.future.wait();
             }
             _ => panic!("Unexpected compile result: {:?}", cached),
         }
@@ -3633,7 +3638,7 @@ LLVM version: 6.0",
         match cached {
             CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
-                f.wait().unwrap();
+                f.future.wait().unwrap();
             }
             _ => panic!("Unexpected compile result: {:?}", cached),
         }
@@ -3661,7 +3666,7 @@ LLVM version: 6.0",
         match cached {
             CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
-                f.wait().unwrap();
+                f.future.wait().unwrap();
             }
             _ => panic!("Unexpected compile result: {:?}", cached),
         }
@@ -3953,7 +3958,7 @@ LLVM version: 6.0",
             match cached {
                 CompileResult::CacheMiss(MissType::ForcedRecache, DistType::Error, _, Ok(f)) => {
                     // wait on cache write future so we don't race with it!
-                    f.wait().unwrap();
+                    f.future.wait().unwrap();
                 }
                 _ => panic!("Unexpected compile result: {:?}", cached),
             }
