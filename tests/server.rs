@@ -241,12 +241,13 @@ exec rustc "$@"
         }
     }
 
-    #[test]
-    fn test_managed_server_warns_for_unimplemented_rust_cache_linked_stage() {
+    #[test_case("tests")]
+    #[test_case("all")]
+    fn test_managed_server_accepts_linked_rust_cache_stage(stage: &str) {
         let fixture = Fixture::new(5, false, 0);
         let config = fixture.path("config");
         let contents = fs::read_to_string(&config).unwrap();
-        fs::write(config, format!("rust_cache_linked = 'tests'\n{contents}")).unwrap();
+        fs::write(config, format!("rust_cache_linked = '{stage}'\n{contents}")).unwrap();
 
         let server = fixture.start_server();
         fixture.stop_server();
@@ -254,9 +255,7 @@ exec rustc "$@"
             .wait()
             .assert()
             .success()
-            .stderr(predicate::str::contains(
-                "not implemented yet, using proc-macro",
-            ));
+            .stderr(predicate::str::is_empty());
     }
 
     #[test_case(None ; "stop RPC")]
