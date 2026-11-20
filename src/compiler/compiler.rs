@@ -29,6 +29,7 @@ use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
+use crate::config::RustIncremental;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -92,6 +93,11 @@ where
         service: &server::SccacheService<T>,
         creator: &T,
     ) -> Result<process::Output>;
+
+    /// Capture state before a local compile and check it before storing successful outputs.
+    fn prepare_cache_store(&self) -> Option<CacheStoreCheck> {
+        None
+    }
 
     fn get_executable(&self) -> PathBuf;
     fn get_arguments(&self) -> Vec<OsString>;
@@ -509,6 +515,15 @@ where
         cwd: &Path,
         env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>>;
+    fn parse_arguments_with_rust_incremental(
+        &self,
+        arguments: &[OsString],
+        cwd: &Path,
+        env_vars: &[(OsString, OsString)],
+        _mode: RustIncremental,
+    ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
+        self.parse_arguments(arguments, cwd, env_vars)
+    }
     fn box_clone(&self) -> Box<dyn Compiler<T>>;
 }
 
@@ -777,7 +792,7 @@ where
                         .await;
                 }
 
-                let (cacheable, dist_type, compiler_result) = dist_or_local_compile(
+                let (cacheable, dist_type, compiler_result, veto) = dist_or_local_compile(
                     service,
                     dist_client,
                     creator,
@@ -823,6 +838,17 @@ where
                         compiler_result,
                     ));
                 }
+                if let Some(veto) = veto {
+                    return Ok((
+                        CompileResult::CacheMiss(
+                            miss_type,
+                            dist_type,
+                            duration_compilation,
+                            Err(veto),
+                        ),
+                        compiler_result,
+                    ));
+                }
                 debug!(
                     "[{}]: Compiled in {}, storing in cache",
                     out_pretty,
@@ -859,7 +885,12 @@ where
                 };
                 let future = Box::pin(future);
                 Ok((
-                    CompileResult::CacheMiss(miss_type, dist_type, duration_compilation, future),
+                    CompileResult::CacheMiss(
+                        miss_type,
+                        dist_type,
+                        duration_compilation,
+                        Ok(future),
+                    ),
                     compiler_result,
                 ))
             }
@@ -878,6 +909,21 @@ where
     fn language(&self) -> Language;
 }
 
+async fn run_local_compile<T: CommandCreatorSync>(
+    command: &dyn CompileCommand<T>,
+    service: &server::SccacheService<T>,
+    creator: &T,
+) -> Result<(process::Output, Option<CacheStoreVeto>)> {
+    let check_store = command.prepare_cache_store();
+    let output = command.execute(service, creator).await?;
+    let veto = if output.status.success() {
+        check_store.and_then(|check| check())
+    } else {
+        None
+    };
+    Ok((output, veto))
+}
+
 #[cfg(not(feature = "dist-client"))]
 async fn dist_or_local_compile<T>(
     service: &server::SccacheService<T>,
@@ -887,7 +933,7 @@ async fn dist_or_local_compile<T>(
     compilation: Box<dyn Compilation<T>>,
     _weak_toolchain_key: String,
     out_pretty: String,
-) -> Result<(Cacheable, DistType, process::Output)>
+) -> Result<(Cacheable, DistType, process::Output, Option<CacheStoreVeto>)>
 where
     T: CommandCreatorSync,
 {
@@ -897,10 +943,8 @@ where
         .context("Failed to generate compile commands")?;
 
     debug!("[{}]: Compiling locally", out_pretty);
-    compile_cmd
-        .execute(&service, &creator)
-        .await
-        .map(move |o| (cacheable, DistType::NoDist, o))
+    let (output, veto) = run_local_compile(&*compile_cmd, service, &creator).await?;
+    Ok((cacheable, DistType::NoDist, output, veto))
 }
 
 #[cfg(feature = "dist-client")]
@@ -912,7 +956,7 @@ async fn dist_or_local_compile<T>(
     compilation: Box<dyn Compilation<T>>,
     weak_toolchain_key: String,
     out_pretty: String,
-) -> Result<(Cacheable, DistType, process::Output)>
+) -> Result<(Cacheable, DistType, process::Output, Option<CacheStoreVeto>)>
 where
     T: CommandCreatorSync,
 {
@@ -931,10 +975,8 @@ where
         Some(dc) => dc,
         None => {
             debug!("[{}]: Compiling locally", out_pretty);
-            return compile_cmd
-                .execute(service, &creator)
-                .await
-                .map(move |o| (cacheable, DistType::NoDist, o));
+            let (output, veto) = run_local_compile(&*compile_cmd, service, &creator).await?;
+            return Ok((cacheable, DistType::NoDist, output, veto));
         }
     };
 
@@ -1097,7 +1139,7 @@ where
                 .splice(0..0, server_info.as_bytes().to_vec());
         }
 
-        Ok((DistType::Ok(server_id), jc.output.into()))
+        Ok((DistType::Ok(server_id), jc.output.into(), None))
     };
 
     use futures::TryFutureExt;
@@ -1121,13 +1163,11 @@ where
                     out_pretty2, errmsg
                 );
 
-                compile_cmd
-                    .execute(service, &creator)
-                    .await
-                    .map(|o| (DistType::Error, o))
+                let (output, veto) = run_local_compile(&*compile_cmd, service, &creator).await?;
+                Ok((DistType::Error, output, veto))
             }
         })
-        .map_ok(move |(dt, o)| (cacheable, dt, o))
+        .map_ok(move |(dt, o, veto)| (cacheable, dt, o, veto))
         .await
 }
 
@@ -1276,6 +1316,14 @@ pub struct CacheWriteInfo {
     pub duration: Duration,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CacheStoreVeto {
+    RustIncrementalSession,
+}
+
+pub type CacheStoreCheck = Box<dyn FnOnce() -> Option<CacheStoreVeto> + Send>;
+type CacheWriteFuture = Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>;
+
 /// The result of a compilation or cache retrieval.
 pub enum CompileResult {
     /// An error made the compilation not possible.
@@ -1285,12 +1333,12 @@ pub enum CompileResult {
     /// Result was not found in cache.
     ///
     /// The `CacheWriteFuture` will resolve when the result is finished
-    /// being stored in the cache.
+    /// being stored in the cache. A post-compile veto replaces the future.
     CacheMiss(
         MissType,
         DistType,
         Duration, // Compilation time
-        Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>,
+        std::result::Result<CacheWriteFuture, CacheStoreVeto>,
     ),
     /// Not in cache and do not cache the results of the compilation.
     NotCached(DistType, Duration),
@@ -3123,7 +3171,7 @@ LLVM version: 6.0",
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -3254,7 +3302,7 @@ LLVM version: 6.0",
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, DistType::Ok(_), _, f) => {
+            CompileResult::CacheMiss(MissType::Normal, DistType::Ok(_), _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -3375,7 +3423,7 @@ LLVM version: 6.0",
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
-            CompileResult::CacheMiss(MissType::CacheReadError, DistType::NoDist, _, f) => {
+            CompileResult::CacheMiss(MissType::CacheReadError, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
                 let _ = f.wait();
             }
@@ -3565,7 +3613,7 @@ LLVM version: 6.0",
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
-            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, f) => {
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -3593,7 +3641,7 @@ LLVM version: 6.0",
         // Ensure that the object file was created.
         assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
         match cached {
-            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, f) => {
+            CompileResult::CacheMiss(MissType::ForcedRecache, DistType::NoDist, _, Ok(f)) => {
                 // wait on cache write future so we don't race with it!
                 f.wait().unwrap();
             }
@@ -3885,7 +3933,7 @@ LLVM version: 6.0",
             // Ensure that the object file was created.
             assert!(fs::metadata(&obj).map(|m| m.len() > 0).unwrap());
             match cached {
-                CompileResult::CacheMiss(MissType::ForcedRecache, DistType::Error, _, f) => {
+                CompileResult::CacheMiss(MissType::ForcedRecache, DistType::Error, _, Ok(f)) => {
                     // wait on cache write future so we don't race with it!
                     f.wait().unwrap();
                 }

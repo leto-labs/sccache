@@ -788,6 +788,15 @@ impl Default for DistConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RustIncremental {
+    #[default]
+    Off,
+    Cache,
+    CacheNoBypass,
+}
+
 // TODO: fields only pub for tests
 #[derive(Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
@@ -799,6 +808,7 @@ pub struct FileConfig {
     /// Base directories to strip from paths for cache key computation.
     pub basedirs: Vec<String>,
     pub client_side_mode: bool,
+    pub rust_incremental: RustIncremental,
 }
 
 // If the file doesn't exist or we can't read it, log the issue and proceed. If the
@@ -839,6 +849,7 @@ pub struct EnvConfig {
     basedirs: Option<Vec<String>>,
     dist_cache_dir: Option<PathBuf>,
     client_side_mode: Option<bool>,
+    rust_incremental: Option<RustIncremental>,
 }
 
 fn string_from_env_var(env_var_name: &str) -> Option<String> {
@@ -1276,7 +1287,19 @@ fn config_from_env() -> Result<EnvConfig> {
     let dist_cache_dir = env::var_os("SCCACHE_DIST_CLIENT_CACHE_DIR").map(PathBuf::from);
     let client_side_mode = bool_from_env_var("SCCACHE_CLIENT_SIDE")?;
 
+    let rust_incremental = match env::var("SCCACHE_RUST_INCREMENTAL") {
+        Ok(value) => Some(match value.as_str() {
+            "off" => RustIncremental::Off,
+            "cache" => RustIncremental::Cache,
+            "cache-no-bypass" => RustIncremental::CacheNoBypass,
+            _ => bail!("SCCACHE_RUST_INCREMENTAL must be off, cache, or cache-no-bypass"),
+        }),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => return Err(err).context("Invalid SCCACHE_RUST_INCREMENTAL"),
+    };
+
     Ok(EnvConfig {
+        rust_incremental,
         cache,
         basedirs,
         dist_cache_dir,
@@ -1378,6 +1401,7 @@ pub struct Config {
     /// Similar to ccache's CCACHE_BASEDIR.
     pub basedirs: Vec<Vec<u8>>,
     pub client_side_mode: bool,
+    pub rust_incremental: RustIncremental,
 }
 
 impl Config {
@@ -1404,6 +1428,7 @@ impl Config {
             server_startup_timeout_ms,
             basedirs: file_basedirs,
             client_side_mode: file_client_side_mode,
+            rust_incremental: file_rust_incremental,
         } = file_conf;
         conf_caches.merge(cache);
 
@@ -1415,6 +1440,7 @@ impl Config {
             basedirs: env_basedirs,
             dist_cache_dir: env_dist_cache_dir,
             client_side_mode: env_client_side_mode,
+            rust_incremental: env_rust_incremental,
         } = env_conf;
         conf_caches.merge(cache);
 
@@ -1458,6 +1484,7 @@ impl Config {
             skip_cache_check: false,
             basedirs,
             client_side_mode,
+            rust_incremental: env_rust_incremental.unwrap_or(file_rust_incremental),
         })
     }
 }
@@ -1781,6 +1808,7 @@ fn config_overrides() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1809,6 +1837,7 @@ fn config_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     assert_eq!(
@@ -1866,6 +1895,7 @@ fn config_overrides() {
             skip_cache_check: false,
             basedirs: vec![],
             client_side_mode: false,
+            rust_incremental: Default::default(),
         }
     );
 }
@@ -1879,6 +1909,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["C:/env/basedir".to_string()].into(),
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1887,6 +1918,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1898,6 +1930,7 @@ fn config_basedirs_overrides() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1906,6 +1939,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1917,6 +1951,7 @@ fn config_basedirs_overrides() {
         basedirs: vec![].into(),
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1925,6 +1960,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:/file/basedir".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1936,6 +1972,7 @@ fn config_basedirs_overrides() {
         basedirs: vec![].into(),
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1944,6 +1981,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1959,6 +1997,7 @@ fn config_basedirs_overrides() {
         basedirs: vec!["/env/basedir".to_string()].into(),
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1967,6 +2006,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1978,6 +2018,7 @@ fn config_basedirs_overrides() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -1986,6 +2027,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -1997,6 +2039,7 @@ fn config_basedirs_overrides() {
         basedirs: vec![].into(),
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2005,6 +2048,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/file/basedir".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2016,6 +2060,7 @@ fn config_basedirs_overrides() {
         basedirs: vec![].into(),
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2024,6 +2069,7 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -2033,6 +2079,7 @@ fn config_basedirs_overrides() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -2041,10 +2088,40 @@ fn config_basedirs_overrides() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
     assert!(config.basedirs.is_empty());
+}
+
+#[test]
+#[serial]
+fn test_rust_incremental_config() {
+    const VAR: &str = "SCCACHE_RUST_INCREMENTAL";
+    let mode = |value| temp_env::with_var(VAR, value, || config_from_env().unwrap());
+    let file = || toml::from_str::<FileConfig>(r#"rust_incremental = "cache-no-bypass""#).unwrap();
+
+    assert_eq!(FileConfig::default().rust_incremental, RustIncremental::Off);
+    assert_eq!(
+        Config::from_env_and_file_configs(mode(None), file())
+            .unwrap()
+            .rust_incremental,
+        RustIncremental::CacheNoBypass
+    );
+    for (value, expected) in [
+        ("off", RustIncremental::Off),
+        ("cache", RustIncremental::Cache),
+        ("cache-no-bypass", RustIncremental::CacheNoBypass),
+    ] {
+        assert_eq!(
+            Config::from_env_and_file_configs(mode(Some(value)), file())
+                .unwrap()
+                .rust_incremental,
+            expected
+        );
+    }
+    temp_env::with_var(VAR, Some("invalid"), || assert!(config_from_env().is_err()));
 }
 
 #[test]
@@ -2234,6 +2311,7 @@ fn test_env_basedirs_with_spaces() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2264,6 +2342,7 @@ fn test_env_basedirs_with_spaces() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
     Config::from_env_and_file_configs(env_conf, file_conf)
         .expect_err("Should fail due to non-absolute path");
@@ -2963,6 +3042,7 @@ key_prefix = "cosprefix"
             server_startup_timeout_ms: Some(10000),
             basedirs: vec![],
             client_side_mode: false,
+            rust_incremental: Default::default(),
         }
     );
 }
@@ -3057,6 +3137,7 @@ size = "7g"
             server_startup_timeout_ms: None,
             basedirs: vec![],
             client_side_mode: false,
+            rust_incremental: Default::default(),
         }
     );
 }
@@ -3102,6 +3183,7 @@ fn test_integration_config_normalizes_and_strips() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3110,6 +3192,7 @@ fn test_integration_config_normalizes_and_strips() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3138,6 +3221,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3146,6 +3230,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home//user///project/".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3170,6 +3255,7 @@ fn test_integration_windows_path_normalization() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3178,6 +3264,7 @@ fn test_integration_windows_path_normalization() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\Test\\Project".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3203,6 +3290,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3211,6 +3299,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/project".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3236,6 +3325,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3244,6 +3334,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         server_startup_timeout_ms: None,
         basedirs: vec![],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3268,6 +3359,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3276,6 +3368,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user".to_string(), "/home/user/project".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3305,6 +3398,7 @@ fn test_integration_paths_with_dots_normalized() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3313,6 +3407,7 @@ fn test_integration_paths_with_dots_normalized() {
         server_startup_timeout_ms: None,
         basedirs: vec!["/home/user/./project/../project".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
@@ -3338,6 +3433,7 @@ fn test_integration_windows_mixed_slashes() {
         basedirs: None,
         dist_cache_dir: None,
         client_side_mode: None,
+        rust_incremental: Default::default(),
     };
 
     let file_conf = FileConfig {
@@ -3346,6 +3442,7 @@ fn test_integration_windows_mixed_slashes() {
         server_startup_timeout_ms: None,
         basedirs: vec!["C:\\Users\\test\\project".to_string()],
         client_side_mode: false,
+        rust_incremental: Default::default(),
     };
 
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();

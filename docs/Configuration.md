@@ -6,6 +6,9 @@
 # If specified, wait this long for the server to start up.
 server_startup_timeout_ms = 10000
 
+# Cache incremental Rust compiles: "off", "cache", or "cache-no-bypass".
+rust_incremental = "off"
+
 # Base directories to strip from source paths during cache key
 # computation.
 #
@@ -193,7 +196,7 @@ Note that some env variables may need sccache server restart to take effect.
 ### misc
 
 * `SCCACHE_ALLOW_CORE_DUMPS` to enable core dumps by the server
-* `SCCACHE_ALLOW_INCREMENTAL` set to `1` to allow Rust builds with `CARGO_INCREMENTAL=1`; incremental crates go uncached. See [Rust caveats](Rust.md)
+* `SCCACHE_RUST_INCREMENTAL` overrides the server's `rust_incremental` setting. Values are `off` (default), `cache`, and `cache-no-bypass`. Restart the server to change modes. See [incremental compilation](Rust.md#incremental-compilation).
 * `SCCACHE_CONF` configuration file path
 * `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths, or a value that is not valid UTF-8, will cause an error and prevent the server from start. The variable is also read from the environment of each compile, where it takes precedence over both for that compile: an empty value turns base directories off, and a relative path or a value that is not valid UTF-8 is ignored with a warning.
 * `SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS` comma-separated names of variables that a Rust crate reads with `env!` or `option_env!` whose values are hashed without stripping `SCCACHE_BASEDIRS`, e.g. `CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH`. Read from the environment of each compile; empty or not valid UTF-8 means none. Names are case-insensitive on Windows. See [Rust caveats](Rust.md)

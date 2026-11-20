@@ -658,77 +658,533 @@ fn test_rust_cargo_basedirs_remap_paths(compile_basedirs: bool) -> Result<()> {
     Ok(())
 }
 
-/// Test that without `SCCACHE_ALLOW_INCREMENTAL`, enabling cargo's incremental
-/// compilation still makes sccache refuse to run.
-#[test]
-#[serial]
-fn test_rust_cargo_incremental_refused_by_default() -> Result<()> {
-    let test_info = SccacheTest::new(None)?;
-    // Clean before setting the env var below: the refusal fires on any rustc
-    // invocation, including the `rustc -vV` probe `cargo clean` makes.
-    cargo_clean(&test_info)?;
+fn incremental_checkouts(
+    mode: &str,
+    client_side: bool,
+) -> Result<(SccacheTest<'static>, [PathBuf; 4])> {
+    let test_info = SccacheTest::new(Some(&[
+        ("SCCACHE_BASEDIRS_REMAP_PATHS", "1".into()),
+        (
+            "SCCACHE_CLIENT_SIDE",
+            if client_side { "1" } else { "0" }.into(),
+        ),
+    ]))?;
+    let tempdir = real_tempdir(&test_info)?;
+    let checkouts = ["a", "b", "c", "d"].map(|name| tempdir.join(name));
+    let basedirs = std::env::join_paths(&checkouts)?.into_string().unwrap();
+    restart_sccache(
+        &test_info,
+        Some(vec![
+            ("SCCACHE_BASEDIRS".into(), basedirs),
+            ("SCCACHE_RUST_INCREMENTAL".into(), mode.into()),
+        ]),
+    )?;
 
-    Command::new(CARGO.as_os_str())
-        .args(["build", "--color=never"])
-        .envs(test_info.env.iter().cloned())
-        .env("CARGO_INCREMENTAL", "1")
-        // Explicitly off, so the default is still tested on a machine that opted
-        // in globally (`.env_remove` cannot undo cargo's `[env]` table).
-        .env("SCCACHE_ALLOW_INCREMENTAL", "0")
-        .current_dir(CRATE_DIR.as_os_str())
-        .assert()
-        .try_stderr(predicates::str::contains("incremental compilation is prohibited").from_utf8())?
-        .try_failure()?;
+    for checkout in &checkouts {
+        fs::create_dir_all(checkout.join("src"))?;
+        fs::create_dir_all(checkout.join("la/src"))?;
+        fs::copy(CRATE_DIR.join("Cargo.lock"), checkout.join("Cargo.lock"))?;
+        let mut manifest = fs::read_to_string(CRATE_DIR.join("Cargo.toml"))?;
+        manifest.push_str("\n[dependencies.la]\npath = \"la\"\n");
+        fs::write(checkout.join("Cargo.toml"), manifest)?;
+        fs::write(
+            checkout.join("la/Cargo.toml"),
+            "[package]\nname = \"la\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )?;
+        fs::write(
+            checkout.join("src/bin.rs"),
+            "extern crate mylib;\nfn main() { println!(\"{}\", mylib::answer()); }\n",
+        )?;
+        edit_la(checkout, 10)?;
+        edit_mylib(checkout, 0)?;
+    }
+    Ok((test_info, checkouts))
+}
 
+fn edit_la(checkout: &Path, value: u32) -> Result<()> {
+    fs::write(
+        checkout.join("la/src/lib.rs"),
+        format!("pub fn answer() -> u32 {{ {value} }}\n"),
+    )?;
     Ok(())
 }
 
-/// Test that with `SCCACHE_ALLOW_INCREMENTAL` an incremental build succeeds and
-/// splits per invocation: the workspace crates cargo hands `-C incremental=`
-/// bypass the cache, while its registry dependencies keep hitting it.
+fn edit_mylib(checkout: &Path, delta: u32) -> Result<()> {
+    fs::write(
+        checkout.join("src/lib.rs"),
+        format!(
+            "extern crate la;\nfn incremental_warning() {{}}\n\
+             pub fn answer() -> u32 {{ la::answer() + {delta} }}\n"
+        ),
+    )?;
+    Ok(())
+}
+
+fn incremental_cargo(test: &SccacheTest, checkout: &Path, cmd: &str) -> Command {
+    let mut cargo = Command::new(CARGO.as_os_str());
+    cargo
+        .args([cmd, "--offline", "--color=never", "--target-dir"])
+        .arg(checkout.join("target"))
+        .envs(test.env.iter().cloned())
+        .env_remove("CARGO_INCREMENTAL")
+        // The running daemon is authoritative, including for client-side compiles.
+        .env("SCCACHE_RUST_INCREMENTAL", "off")
+        .current_dir(checkout);
+    cargo
+}
+
+fn run_incremental_bin(checkout: &Path, value: u32) -> Result<()> {
+    Command::new(
+        checkout
+            .join("target/debug")
+            .join(format!("mybin{}", std::env::consts::EXE_SUFFIX)),
+    )
+    .assert()
+    .try_success()?
+    .try_stdout(format!("{value}\n"))?;
+    Ok(())
+}
+
+fn incremental_crate_dirs(checkout: &Path, name: &str) -> Result<Vec<PathBuf>> {
+    let root = checkout.join("target/debug/incremental");
+    let mut dirs = Vec::new();
+    if root.exists() {
+        for entry in fs::read_dir(root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir()
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("{name}-"))
+            {
+                dirs.push(entry.path());
+            }
+        }
+    }
+    Ok(dirs)
+}
+
+fn assert_no_working_sessions(checkout: &Path, crates: &[&str]) -> Result<()> {
+    for name in crates {
+        for folder in incremental_crate_dirs(checkout, name)? {
+            for entry in fs::read_dir(&folder)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                assert!(
+                    !(entry.file_type()?.is_dir()
+                        && name.starts_with("s-")
+                        && name.ends_with("-working")),
+                    "unexpected preflight session at {:?}",
+                    entry.path()
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn incremental_sessions(checkout: &Path, name: &str) -> Result<Vec<PathBuf>> {
+    assert_no_working_sessions(checkout, &[name])?;
+    let dirs = incremental_crate_dirs(checkout, name)?;
+    assert_eq!(dirs.len(), 1, "crate {name} in {checkout:?}");
+    let mut sessions = Vec::new();
+    for entry in fs::read_dir(&dirs[0])? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.file_name().to_string_lossy().starts_with("s-") {
+            sessions.push(entry.path());
+        }
+    }
+    sessions.sort();
+    assert!(!sessions.is_empty(), "crate {name} in {checkout:?}");
+    Ok(sessions)
+}
+
+#[cfg(unix)]
+fn incremental_rmeta(checkout: &Path) -> Result<PathBuf> {
+    for entry in walkdir::WalkDir::new(checkout.join("target")) {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy();
+        if entry.file_type().is_file() && name.starts_with("libmylib-") && name.ends_with(".rmeta")
+        {
+            return Ok(entry.into_path());
+        }
+    }
+    bail!("missing mylib .rmeta in {checkout:?}")
+}
+
+fn zero_incremental_stats() -> Result<()> {
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("--zero-stats")
+        .assert()
+        .try_success()?;
+    Ok(())
+}
+
+fn incremental_stats(test: &SccacheTest, hits: u64, misses: u64) -> Result<serde_json::Value> {
+    let output = test.show_stats()?;
+    let info: serde_json::Value = serde_json::from_slice(&output.get_output().stdout)?;
+    let stats = &info["stats"];
+    assert_eq!(
+        stats["cache_hits"]["counts"]["Rust"].as_u64().unwrap_or(0),
+        hits,
+        "{stats}"
+    );
+    assert_eq!(
+        stats["cache_misses"]["counts"]["Rust"]
+            .as_u64()
+            .unwrap_or(0),
+        misses,
+        "{stats}"
+    );
+    Ok(stats.clone())
+}
+
 #[test]
 #[serial]
-fn test_rust_cargo_incremental_allowed_deps_cached() -> Result<()> {
-    let test_info = SccacheTest::new(None)?;
+fn test_rust_cargo_incremental_off() -> Result<()> {
+    let (test, [a, b, ..]) = incremental_checkouts("off", false)?;
+    incremental_cargo(&test, &a, "build")
+        .env("CARGO_INCREMENTAL", "1")
+        .assert()
+        .try_success()?;
+    zero_incremental_stats()?;
+    incremental_cargo(&test, &b, "build")
+        .env("CARGO_INCREMENTAL", "1")
+        .assert()
+        .try_success()?;
+    let stats = incremental_stats(&test, 1, 0)?;
+    assert_eq!(stats["not_cached"]["incremental"], 2);
+    assert_eq!(stats["rust_incremental_not_stored"], 0);
+    assert_no_working_sessions(&b, &["itoa"])?;
+    run_incremental_bin(&b, 10)
+}
 
-    // Two incremental builds, each from a clean target.
-    for _ in 0..2 {
-        cargo_clean(&test_info)?;
-        Command::new(CARGO.as_os_str())
-            .args(["build", "--color=never"])
-            .envs(test_info.env.iter().cloned())
-            .env("CARGO_INCREMENTAL", "1")
-            .env("SCCACHE_ALLOW_INCREMENTAL", "1")
-            .current_dir(CRATE_DIR.as_os_str())
+#[test_case(false ; "daemon")]
+#[test_case(true ; "client side")]
+#[serial]
+fn test_rust_cargo_incremental_new_checkout_hits_and_replays_warnings(
+    client_side: bool,
+) -> Result<()> {
+    let (test, [a, b, ..]) = incremental_checkouts("cache", client_side)?;
+    for checkout in [&a, &b] {
+        incremental_cargo(&test, checkout, "build")
             .assert()
-            .try_success()?;
+            .try_success()?
+            .try_stderr(
+                predicates::str::contains("function `incremental_warning` is never used")
+                    .from_utf8(),
+            )?;
+        run_incremental_bin(checkout, 10)?;
     }
+    let stats = incremental_stats(&test, 3, 3)?;
+    assert_eq!(stats["cache_writes"], 3);
+    assert_eq!(stats["rust_incremental_not_stored"], 0);
+    assert!(stats["not_cached"]["incremental"].is_null());
+    for name in ["la", "mylib"] {
+        assert!(incremental_crate_dirs(&b, name)?.is_empty());
+    }
+    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])
+}
 
-    // The workspace lib really went through rustc's incremental machinery.
-    let incremental_dir = test_info.tempdir.path().join("cargo/debug/incremental");
-    let has_mylib_session = std::fs::read_dir(&incremental_dir)?
-        .filter_map(|e| e.ok())
-        .any(|e| e.file_name().to_string_lossy().starts_with("mylib"));
-    assert!(
-        has_mylib_session,
-        "expected an incremental session dir for `mylib` in {incremental_dir:?}"
-    );
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_edits_store_only_when_cold() -> Result<()> {
+    let (test, [a, b, c, d]) = incremental_checkouts("cache-no-bypass", false)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 3, 3)?;
+    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+    assert!(incremental_crate_dirs(&b, "mylib")?.is_empty());
 
-    test_info
-        .show_stats()?
-        // itoa: one miss (first build), one hit (second build).
-        .try_stdout(predicates::str::contains(r#""cache_hits":{"counts":{"Rust":1}"#).from_utf8())?
-        .try_stdout(
-            predicates::str::contains(
-                r#""cache_misses":{"counts":{"Rust":1},"adv_counts":{"rust":1}}"#,
-            )
-            .from_utf8(),
-        )?
-        // The workspace lib bypassed the cache in both builds. `mybin` is rejected
-        // on `--crate-type bin` first, which cargo passes ahead of the flag.
-        .try_stdout(predicates::str::contains(r#""incremental":2"#).from_utf8())?
+    zero_incremental_stats()?;
+    edit_mylib(&b, 1)?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    run_incremental_bin(&b, 11)?;
+    let first = incremental_sessions(&b, "mylib")?;
+    assert_eq!(first.len(), 1);
+    assert_eq!(incremental_stats(&test, 0, 1)?["cache_writes"], 1);
+
+    zero_incremental_stats()?;
+    edit_mylib(&b, 2)?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    run_incremental_bin(&b, 12)?;
+    let second = incremental_sessions(&b, "mylib")?;
+    assert_eq!(first[0].parent(), second[0].parent());
+    assert!(second.iter().any(|path| !first.contains(path)));
+    let stats = incremental_stats(&test, 0, 1)?;
+    assert_eq!(stats["rust_incremental_not_stored"], 1);
+    assert_eq!(stats["cache_writes"], 0);
+    test.show_text_stats(false)?.try_stdout(
+        predicates::str::contains("Incremental: not stored, session reused").from_utf8(),
+    )?;
+
+    zero_incremental_stats()?;
+    edit_mylib(&c, 2)?;
+    incremental_cargo(&test, &c, "build")
+        .assert()
+        .try_success()?;
+    assert_eq!(incremental_stats(&test, 2, 1)?["cache_writes"], 1);
+    assert_no_working_sessions(&c, &["itoa", "la"])?;
+
+    zero_incremental_stats()?;
+    edit_mylib(&d, 2)?;
+    incremental_cargo(&test, &d, "build")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 3, 0)?;
+    run_incremental_bin(&d, 12)?;
+    assert_no_working_sessions(&d, &["itoa", "la", "mylib"])
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_hit_preserves_session_metadata_inode() -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (test, [a, b, c, ..]) = incremental_checkouts("cache-no-bypass", false)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 3, 3)?;
+    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+
+    edit_mylib(&a, 1)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    run_incremental_bin(&a, 11)?;
+    let output = incremental_rmeta(&a)?;
+    let output_meta = fs::metadata(&output)?;
+    let metadata = incremental_sessions(&a, "mylib")?
+        .into_iter()
+        .map(|session| session.join("metadata.rmeta"))
+        .find(|file| fs::metadata(file).is_ok_and(|meta| meta.ino() == output_meta.ino()))
+        .context("rustc did not hard-link its output into the incremental session")?;
+    let session_bytes = fs::read(&metadata)?;
+    let original_links = fs::metadata(&metadata)?.nlink();
+    assert!(original_links > 1);
+
+    zero_incremental_stats()?;
+    edit_mylib(&a, 0)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 1, 0)?;
+    run_incremental_bin(&a, 10)?;
+    assert_no_working_sessions(&a, &["mylib"])?;
+    assert_eq!(fs::metadata(&metadata)?.ino(), output_meta.ino());
+    assert_ne!(fs::metadata(&output)?.ino(), output_meta.ino());
+    assert_eq!(fs::metadata(&metadata)?.nlink(), original_links - 1);
+    assert_eq!(fs::read(&metadata)?, session_bytes);
+    assert_ne!(fs::read(&output)?, session_bytes);
+
+    edit_mylib(&a, 1)?;
+    incremental_cargo(&test, &a, "build")
+        .env("SCCACHE_RECACHE", "1")
+        .assert()
+        .try_success()?;
+    run_incremental_bin(&a, 11)?;
+
+    edit_mylib(&c, 1)?;
+    incremental_cargo(&test, &c, "build")
+        .env("SCCACHE_NO_CACHE", "1")
+        .assert()
+        .try_success()?;
+    assert_eq!(fs::read(&output)?, fs::read(incremental_rmeta(&c)?)?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_edit_against_cache_served_dependency() -> Result<()> {
+    let (test, [a, b, c, ..]) = incremental_checkouts("cache-no-bypass", false)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 3, 3)?;
+    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+
+    edit_mylib(&b, 1)?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    run_incremental_bin(&b, 11)?;
+    let before = incremental_sessions(&b, "mylib")?;
+
+    edit_la(&a, 20)?;
+    incremental_cargo(&test, &a, "clean")
+        .args(["-p", "la"])
+        .assert()
+        .try_success()?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
         .try_success()?;
 
+    zero_incremental_stats()?;
+    edit_la(&b, 20)?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    assert_eq!(
+        incremental_stats(&test, 1, 1)?["rust_incremental_not_stored"],
+        1
+    );
+    run_incremental_bin(&b, 21)?;
+    assert_no_working_sessions(&b, &["la"])?;
+    assert!(incremental_crate_dirs(&b, "la")?.is_empty());
+    assert_ne!(incremental_sessions(&b, "mylib")?, before);
+
+    edit_la(&c, 20)?;
+    edit_mylib(&c, 1)?;
+    incremental_cargo(&test, &c, "build")
+        .env("SCCACHE_NO_CACHE", "1")
+        .assert()
+        .try_success()?;
+    assert_eq!(
+        fs::read(incremental_rmeta(&b)?)?,
+        fs::read(incremental_rmeta(&c)?)?
+    );
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_stale_sessions_survive_hits() -> Result<()> {
+    let (test, [a, b, ..]) = incremental_checkouts("cache-no-bypass", false)?;
+    edit_la(&a, 20)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    run_incremental_bin(&b, 10)?;
+    assert_no_working_sessions(&b, &["itoa"])?;
+    let old_la = incremental_sessions(&b, "la")?;
+    let old_mylib = incremental_sessions(&b, "mylib")?;
+
+    zero_incremental_stats()?;
+    edit_la(&b, 20)?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 2, 0)?;
+    run_incremental_bin(&b, 20)?;
+    assert_eq!(incremental_sessions(&b, "la")?, old_la);
+    assert_eq!(incremental_sessions(&b, "mylib")?, old_mylib);
+
+    zero_incremental_stats()?;
+    edit_la(&b, 30)?;
+    incremental_cargo(&test, &b, "build")
+        .assert()
+        .try_success()?;
+    assert_eq!(
+        incremental_stats(&test, 0, 2)?["rust_incremental_not_stored"],
+        2
+    );
+    assert_ne!(incremental_sessions(&b, "la")?, old_la);
+    run_incremental_bin(&b, 30)
+}
+
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_modes_do_not_mix() -> Result<()> {
+    let (test, [a, b, c, ..]) = incremental_checkouts("cache", false)?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+
+    zero_incremental_stats()?;
+    incremental_cargo(&test, &b, "build")
+        .args(["--config", "profile.dev.incremental=false"])
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 1, 2)?;
+    assert_no_working_sessions(&b, &["itoa"])?;
+
+    // Cargo also forwards this variable to non-incremental dependencies.
+    zero_incremental_stats()?;
+    incremental_cargo(&test, &c, "build")
+        .env("CARGO_INCREMENTAL", "0")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 0, 3)?;
+
+    zero_incremental_stats()?;
+    incremental_cargo(&test, &a, "clean")
+        .assert()
+        .try_success()?;
+    incremental_cargo(&test, &a, "build")
+        .assert()
+        .try_success()?;
+    incremental_stats(&test, 3, 0)?;
+    assert_no_working_sessions(&a, &["itoa", "la", "mylib"])?;
+    run_incremental_bin(&a, 10)
+}
+
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_check_hits_then_bypasses_known_session() -> Result<()> {
+    let (test, [a, b, ..]) = incremental_checkouts("cache", false)?;
+    incremental_cargo(&test, &a, "check")
+        .assert()
+        .try_success()?;
+    incremental_cargo(&test, &b, "check")
+        .assert()
+        .try_success()?;
+    assert_eq!(incremental_stats(&test, 3, 3)?["cache_writes"], 3);
+    assert_no_working_sessions(&b, &["itoa", "la", "mylib"])?;
+    assert!(incremental_crate_dirs(&b, "mylib")?.is_empty());
+
+    zero_incremental_stats()?;
+    edit_mylib(&b, 1)?;
+    incremental_cargo(&test, &b, "check")
+        .assert()
+        .try_success()?;
+    assert_eq!(incremental_stats(&test, 0, 1)?["cache_writes"], 1);
+    let old = incremental_sessions(&b, "mylib")?;
+
+    zero_incremental_stats()?;
+    edit_mylib(&b, 2)?;
+    incremental_cargo(&test, &b, "check")
+        .assert()
+        .try_success()?;
+    let stats = incremental_stats(&test, 0, 0)?;
+    assert_eq!(stats["not_cached"]["incremental session"], 1);
+    assert_eq!(stats["cache_writes"], 0);
+    assert_ne!(incremental_sessions(&b, "mylib")?, old);
+    test.show_text_stats(false)?
+        .try_stdout(predicates::str::contains("incremental session").from_utf8())?;
+
+    incremental_cargo(&test, &b, "clean")
+        .args(["-p", "test-crate"])
+        .assert()
+        .try_success()?;
+    let root = b.join("target/debug/incremental");
+    assert!(!fs::read_dir(root)?.any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("mylib-")
+    }));
     Ok(())
 }
 

@@ -15,12 +15,13 @@
 use crate::cache::{FileObjectSource, Storage};
 use crate::compiler::args::*;
 use crate::compiler::{
-    CCompileCommand, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
-    Compiler, CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy, HashResult, Language,
-    SingleCompileCommand, c::ArtifactDescriptor,
+    CacheStoreCheck, CacheStoreVeto, Cacheable, ColorMode, Compilation, CompileCommand,
+    CompileCommandImpl, Compiler, CompilerArguments, CompilerHasher, CompilerKind, CompilerProxy,
+    HashResult, Language, SingleCompileCommand, c::ArtifactDescriptor,
 };
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
+use crate::config::RustIncremental;
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -63,6 +64,9 @@ use std::sync::{Arc, LazyLock};
 use std::time;
 
 use crate::errors::*;
+
+mod incremental;
+use incremental::IncrementalSession;
 
 pub(crate) const NO_CRATE_TYPE_PASSED: &str = "No crate-type passed";
 
@@ -384,6 +388,7 @@ pub struct ParsedArguments {
     has_json: bool,
     /// A `--target` parameter that specifies a path to a JSON file.
     target_json: Option<PathBuf>,
+    incremental_dir: Option<PathBuf>,
 }
 
 /// A struct on which to hang a `Compilation` impl.
@@ -406,6 +411,7 @@ pub struct RustCompilation {
     /// Whether `arguments` start with `basedirs_remap_arguments`.
     #[cfg(feature = "dist-client")]
     remaps_basedirs: bool,
+    incremental: Option<IncrementalSession>,
     /// The compiler inputs.
     inputs: Vec<PathBuf>,
     /// The compiler outputs.
@@ -423,7 +429,7 @@ pub struct RustCompilation {
 }
 
 // The selection of crate types for this compilation
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CrateTypes {
     rlib: bool,
     staticlib: bool,
@@ -969,22 +975,42 @@ where
         &self,
         arguments: &[OsString],
         cwd: &Path,
-        _env_vars: &[(OsString, OsString)],
+        env_vars: &[(OsString, OsString)],
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
-        match parse_arguments(arguments, cwd) {
-            CompilerArguments::Ok(args) => CompilerArguments::Ok(Box::new(RustHasher {
-                executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
-                host: self.host.clone(),
-                version: self.version.clone(),
-                sysroot: self.sysroot.clone(),
-                #[cfg(feature = "dist-client")]
-                target_libdir: self.target_libdir.clone(),
-                compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
-                dist_archive: self.dist_archive.clone(),
-                #[cfg(feature = "dist-client")]
-                rlib_dep_reader: self.rlib_dep_reader.clone(),
-                parsed_args: args,
-            })),
+        self.parse_arguments_with_rust_incremental(arguments, cwd, env_vars, RustIncremental::Off)
+    }
+
+    fn parse_arguments_with_rust_incremental(
+        &self,
+        arguments: &[OsString],
+        cwd: &Path,
+        _env_vars: &[(OsString, OsString)],
+        mode: RustIncremental,
+    ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
+        match parse_arguments(arguments, cwd, mode) {
+            CompilerArguments::Ok(args) => {
+                let hasher = RustHasher {
+                    executable: self.executable.clone(), // if rustup exists, this must already contain the true resolved compiler path
+                    host: self.host.clone(),
+                    version: self.version.clone(),
+                    sysroot: self.sysroot.clone(),
+                    #[cfg(feature = "dist-client")]
+                    target_libdir: self.target_libdir.clone(),
+                    compiler_shlibs_digests: self.compiler_shlibs_digests.clone(),
+                    dist_archive: self.dist_archive.clone(),
+                    #[cfg(feature = "dist-client")]
+                    rlib_dep_reader: self.rlib_dep_reader.clone(),
+                    parsed_args: args,
+                };
+                if mode == RustIncremental::Cache
+                    && hasher
+                        .incremental_session()
+                        .is_some_and(|session| session.has_session())
+                {
+                    cannot_cache!("incremental session");
+                }
+                CompilerArguments::Ok(Box::new(hasher))
+            }
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
             CompilerArguments::CannotCache(why, extra_info) => {
                 CompilerArguments::CannotCache(why, extra_info)
@@ -1625,14 +1651,15 @@ fn arguments_for_spawn(
     Ok((vec![arg], Some(file)))
 }
 
-/// Keeps the response file of [`arguments_for_spawn`] until the compile has run.
-struct WithResponseFile<C> {
-    inner: C,
+struct RustCompileCommand {
+    inner: SingleCompileCommand,
+    // Rustc reads this after the command is spawned.
     _response_file: Option<tempfile::NamedTempFile>,
+    incremental: Option<IncrementalSession>,
 }
 
 #[async_trait]
-impl<C: CompileCommandImpl> CompileCommandImpl for WithResponseFile<C> {
+impl<T: CommandCreatorSync> CompileCommand<T> for RustCompileCommand {
     fn get_executable(&self) -> PathBuf {
         self.inner.get_executable()
     }
@@ -1646,19 +1673,28 @@ impl<C: CompileCommandImpl> CompileCommandImpl for WithResponseFile<C> {
         self.inner.get_cwd()
     }
 
-    async fn execute<T>(
+    async fn execute(
         &self,
         service: &crate::server::SccacheService<T>,
         creator: &T,
-    ) -> Result<process::Output>
-    where
-        T: CommandCreatorSync,
-    {
+    ) -> Result<process::Output> {
         self.inner.execute(service, creator).await
+    }
+
+    fn prepare_cache_store(&self) -> Option<CacheStoreCheck> {
+        let session = self.incremental.clone()?;
+        let before = session.snapshot();
+        Some(Box::new(move || {
+            (!session.store_after_compile(before)).then_some(CacheStoreVeto::RustIncrementalSession)
+        }))
     }
 }
 
-fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<ParsedArguments> {
+fn parse_arguments(
+    arguments: &[OsString],
+    cwd: &Path,
+    mode: RustIncremental,
+) -> CompilerArguments<ParsedArguments> {
     let mut args = vec![];
 
     let mut emit: Option<HashSet<String>> = None;
@@ -1679,6 +1715,11 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     let mut profile = None;
     let mut gcno = false;
     let mut target_json = None;
+    let mut incremental_dir = None;
+    let mut split_debuginfo_unpacked = false;
+    let mut debuginfo = false;
+    let mut save_temps = false;
+    let mut grouped_codegen = false;
 
     // Custom iterator to expand `@` arguments which stand for reading a file
     // and interpreting it as a list of more arguments.
@@ -1734,23 +1775,26 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
             Some(CrateName(value)) => crate_name = Some(value.clone()),
             Some(OutDir(value)) => output_dir = Some(value.clone()),
             Some(Extern(ArgExtern { path, .. })) => externs.push(path.clone()),
-            Some(CodeGen(ArgCodegen { opt, value })) => {
-                match (opt.as_ref(), value) {
-                    ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
-                    ("extra-filename", None) => cannot_cache!("extra-filename"),
-                    ("profile-use", Some(v)) => profile = Some(v.clone()),
-                    // Incremental compilation makes a mess of sccache's entire world
-                    // view. It produces additional compiler outputs that we don't cache,
-                    // and just letting rustc do its work in incremental mode is likely
-                    // to be faster than trying to fetch a result from cache anyway, so
-                    // don't bother caching compiles where it's enabled currently.
-                    // Longer-term we would like to figure out better integration between
-                    // sccache and rustc in the incremental scenario:
-                    // https://github.com/mozilla/sccache/issues/236
-                    ("incremental", _) => cannot_cache!("incremental"),
-                    (_, _) => (),
+            Some(CodeGen(ArgCodegen { opt, value })) => match (opt.as_ref(), value) {
+                ("extra-filename", Some(value)) => extra_filename = Some(value.to_owned()),
+                ("extra-filename", None) => cannot_cache!("extra-filename"),
+                ("profile-use", Some(v)) => profile = Some(v.clone()),
+                ("incremental", Some(dir)) if mode != RustIncremental::Off => {
+                    incremental_dir = Some(cwd.join(dir));
                 }
-            }
+                ("incremental", _) => cannot_cache!("incremental"),
+                ("split-debuginfo" | "split_debuginfo", value) => {
+                    split_debuginfo_unpacked = value.as_deref() == Some("unpacked");
+                }
+                ("debuginfo", value) => {
+                    debuginfo = !matches!(value.as_deref(), Some("0" | "none"));
+                }
+                ("save-temps" | "save_temps", value) => {
+                    save_temps =
+                        !matches!(value.as_deref(), Some("0" | "n" | "no" | "off" | "false"));
+                }
+                (_, _) => (),
+            },
             Some(Unstable(ArgUnstable { opt, value })) => match value.as_deref() {
                 Some("y") | Some("yes") | Some("on") | None if opt == "profile" => {
                     gcno = true;
@@ -1794,7 +1838,21 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
                         }
                         input = Some(val.clone());
                     }
-                    Argument::UnknownFlag(_) => {}
+                    Argument::UnknownFlag(ref flag) => {
+                        if let Some(short) = flag.to_str().and_then(|s| s.strip_prefix('-')) {
+                            let suffix = short.trim_start_matches(['g', 'O', 'v', 'V', 'h']);
+                            debuginfo |= short[..short.len() - suffix.len()].contains('g');
+                            // Our parser does not split clusters such as -gC.
+                            if suffix != short
+                                && let Some(codegen) = suffix.strip_prefix('C')
+                            {
+                                if codegen == "incremental" || codegen.starts_with("incremental=") {
+                                    cannot_cache!("incremental");
+                                }
+                                grouped_codegen = true;
+                            }
+                        }
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -1843,6 +1901,21 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
     // linker output and dep-info.
     if emit.iter().any(|e| !ALLOWED_EMIT.contains(e.as_str())) {
         cannot_cache!("unsupported --emit");
+    }
+
+    if incremental_dir.is_some() {
+        if !crate_name.chars().all(|c| c == '_' || c.is_alphanumeric()) || crate_name.is_empty() {
+            cannot_cache!("incremental crate name");
+        }
+        if grouped_codegen {
+            cannot_cache!("incremental with grouped codegen flags");
+        }
+        if split_debuginfo_unpacked && debuginfo {
+            cannot_cache!("incremental with unpacked split debuginfo");
+        }
+        if save_temps {
+            cannot_cache!("incremental with save-temps");
+        }
     }
 
     // Figure out the dep-info filename, if emitting dep-info.
@@ -1913,7 +1986,25 @@ fn parse_arguments(arguments: &[OsString], cwd: &Path) -> CompilerArguments<Pars
         color_mode,
         has_json,
         target_json,
+        incremental_dir,
     })
+}
+
+impl RustHasher {
+    fn incremental_session(&self) -> Option<IncrementalSession> {
+        Some(IncrementalSession::new(
+            &self.parsed_args,
+            self.parsed_args.incremental_dir.clone()?,
+            &self.version,
+            &self.compiler_shlibs_digests,
+        ))
+    }
+}
+
+fn cargo_incremental_env(var: &OsStr) -> bool {
+    var == "CARGO_INCREMENTAL"
+        || var == "CARGO_BUILD_INCREMENTAL"
+        || (var.starts_with("CARGO_PROFILE_") && var.as_encoded_bytes().ends_with(b"_INCREMENTAL"))
 }
 
 fn rust_dist_toolchain_weak_key(base: &Digest, sysroot: &Path) -> String {
@@ -2092,6 +2183,8 @@ where
             .parsed_args
             .arguments
             .iter()
+            // Preflight must never create a rustc incremental session.
+            .filter(|arg| !matches!(arg.get_data(), Some(CodeGen(ArgCodegen { opt, .. })) if opt == "incremental"))
             .map(|arg| {
                 (
                     arg.to_os_string(),
@@ -2299,6 +2392,10 @@ where
                 })
         };
         args.hash(&mut HashToDigest { digest: &mut m });
+        let incremental = self.incremental_session();
+        if incremental.is_some() {
+            m.delimiter(b"-C incremental");
+        }
         // 4. The digest of all source files (this includes src file from cmdline).
         // 5. The digest of all files listed on the commandline (self.externs).
         // 6. The digest of all static libraries listed on the commandline (self.staticlibs).
@@ -2350,6 +2447,7 @@ where
                 || var.starts_with("CARGO_REGISTRIES_")
                 || var == "CARGO_BUILD_JOBS"
                 || var == "CARGO_ENCODED_RUSTFLAGS"
+                || (incremental.is_some() && cargo_incremental_env(var))
             {
                 continue;
             }
@@ -2506,6 +2604,7 @@ where
                 arguments,
                 #[cfg(feature = "dist-client")]
                 remaps_basedirs,
+                incremental,
                 inputs,
                 outputs,
                 crate_link_paths: self.parsed_args.crate_link_paths.clone(),
@@ -2604,7 +2703,7 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             }
 
             // The mappings name local paths, which the build server does not have.
-            if self.remaps_basedirs {
+            if self.remaps_basedirs || self.incremental.is_some() {
                 return None;
             }
             let mut dist_arguments = vec![];
@@ -2696,11 +2795,12 @@ impl<T: CommandCreatorSync> Compilation<T> for RustCompilation {
             })
         })();
 
-        let command = WithResponseFile {
+        let command = RustCompileCommand {
             inner: command,
             _response_file: response_file,
+            incremental: self.incremental.clone(),
         };
-        Ok((CCompileCommand::new(command), dist_command, Cacheable::Yes))
+        Ok((Box::new(command), dist_command, Cacheable::Yes))
     }
 
     #[cfg(feature = "dist-client")]
@@ -3534,7 +3634,7 @@ mod test {
 
     fn _parse_arguments(arguments: &[String]) -> CompilerArguments<ParsedArguments> {
         let arguments = arguments.iter().map(OsString::from).collect::<Vec<_>>();
-        parse_arguments(&arguments, ".".as_ref())
+        parse_arguments(&arguments, ".".as_ref(), RustIncremental::Off)
     }
 
     macro_rules! parses {
@@ -3755,33 +3855,173 @@ LLVM version: 15.0.2
         );
     }
 
+    const RUST_LIB_ARGS: &[&str] = &[
+        "foo.rs",
+        "--crate-name=foo",
+        "--crate-type=lib",
+        "--emit=link",
+        "--out-dir=out",
+    ];
+
+    fn parse_rust_lib(
+        extra: &[&str],
+        cwd: &Path,
+        mode: RustIncremental,
+    ) -> CompilerArguments<ParsedArguments> {
+        let args = RUST_LIB_ARGS
+            .iter()
+            .chain(extra)
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+        parse_arguments(&args, cwd, mode)
+    }
+
+    #[test_case(&["-C", "incremental=x"] ; "short separate")]
+    #[test_case(&["-Cincremental=x"] ; "short joined")]
+    #[test_case(&["--codegen", "incremental=x"] ; "long separate")]
+    #[test_case(&["--codegen=incremental=x"] ; "long joined")]
+    fn test_parse_arguments_incremental(extra: &[&str]) {
+        let cwd = Path::new("project");
+        assert_eq!(
+            parse_rust_lib(extra, cwd, RustIncremental::Off),
+            CompilerArguments::CannotCache("incremental", None)
+        );
+        for mode in [RustIncremental::Cache, RustIncremental::CacheNoBypass] {
+            let CompilerArguments::Ok(args) = parse_rust_lib(extra, cwd, mode) else {
+                panic!("expected incremental arguments to parse in {mode:?}");
+            };
+            assert_eq!(args.incremental_dir, Some(cwd.join("x")));
+        }
+    }
+
+    #[test_case(&["-Csplit-debuginfo=unpacked", "-Cdebuginfo=2"], "incremental with unpacked split debuginfo" ; "unpacked debuginfo")]
+    #[test_case(&["-Csplit_debuginfo=unpacked", "-g"], "incremental with unpacked split debuginfo" ; "unpacked with short debuginfo flag")]
+    #[test_case(&["-Csave-temps"], "incremental with save-temps" ; "save temps")]
+    fn test_incremental_refuses_extra_outputs(extra: &[&str], reason: &'static str) {
+        let mut args = vec!["-Cincremental=x"];
+        args.extend_from_slice(extra);
+        assert_eq!(
+            parse_rust_lib(&args, Path::new("."), RustIncremental::Cache),
+            CompilerArguments::CannotCache(reason, None)
+        );
+    }
+
     #[test]
-    fn test_parse_arguments_incremental() {
-        parses!(
-            "--emit",
-            "link",
-            "foo.rs",
-            "--out-dir",
-            "out",
-            "--crate-name",
-            "foo",
-            "--crate-type",
-            "lib"
+    fn test_incremental_allows_disabled_extra_outputs() {
+        let args = [
+            "-Cincremental=x",
+            "-Csplit-debuginfo=unpacked",
+            "-g",
+            "-Cdebuginfo=0",
+            "-Csave-temps=no",
+        ];
+        assert!(matches!(
+            parse_rust_lib(&args, Path::new("."), RustIncremental::Cache),
+            CompilerArguments::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn test_incremental_refuses_grouped_codegen() {
+        for mode in [RustIncremental::Off, RustIncremental::Cache] {
+            assert_eq!(
+                parse_rust_lib(&["-gCincremental=x"], Path::new("."), mode),
+                CompilerArguments::CannotCache("incremental", None)
+            );
+        }
+    }
+
+    fn incremental_session(
+        dir: &Path,
+        extra: &[&str],
+        version: &str,
+        digests: &[String],
+    ) -> IncrementalSession {
+        let CompilerArguments::Ok(args) = parse_rust_lib(extra, dir, RustIncremental::Cache) else {
+            panic!("expected Rust library arguments to parse");
+        };
+        IncrementalSession::new(&args, dir.to_owned(), version, digests)
+    }
+
+    #[test]
+    fn test_incremental_marker_identity() {
+        let dir = Path::new("incremental");
+        let metadata = ["-Cmetadata=a", "--codegen=metadata=b"];
+        let marker = |args: &[&str], version: &str, digests: &[String]| {
+            incremental_session(dir, args, version, digests).marker_path()
+        };
+        let lib = marker(&metadata, "version", &["digest".into()]);
+        assert_eq!(
+            lib,
+            marker(
+                &["-Cmetadata=b", "-Cmetadata=a"],
+                "version",
+                &["digest".into()]
+            )
         );
-        let r = fails!(
-            "--emit",
-            "link",
-            "foo.rs",
-            "--out-dir",
-            "out",
-            "--crate-name",
-            "foo",
-            "--crate-type",
-            "lib",
-            "-C",
-            "incremental=/foo"
-        );
-        assert_eq!(r, CompilerArguments::CannotCache("incremental", None));
+        let name = lib.file_name().unwrap().to_str().unwrap();
+        let hash = name.strip_prefix("foo-sccache-").unwrap();
+        assert_eq!(hash.len(), 16);
+        assert!(hash.bytes().all(|b| b.is_ascii_hexdigit()));
+
+        for extra in [
+            "--crate-name=bar",
+            "--crate-type=staticlib",
+            "--test",
+            "-Cmetadata=c",
+        ] {
+            let mut args = metadata.to_vec();
+            args.push(extra);
+            assert_ne!(lib, marker(&args, "version", &["digest".into()]));
+        }
+        assert_ne!(lib, marker(&metadata, "other version", &["digest".into()]));
+        assert_ne!(lib, marker(&metadata, "version", &["other digest".into()]));
+    }
+
+    #[test]
+    fn test_incremental_session_observation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let session = incremental_session(root, &[], "version", &[]);
+        let folder = root.join("foo-library");
+        fs::create_dir_all(folder.join("s-abandoned-working")).unwrap();
+        fs::create_dir_all(root.join("foo-harness/s-other-unit")).unwrap();
+        fs::create_dir_all(root.join("other-library/s-other-crate")).unwrap();
+        fs::write(root.join("foo-marker-file"), b"").unwrap();
+        fs::write(folder.join("s-file"), b"").unwrap();
+
+        assert!(!session.has_session());
+        let before = session.snapshot();
+        fs::create_dir(folder.join("s-first")).unwrap();
+        assert!(session.store_after_compile(before));
+        let marker = session.marker_path();
+        assert_eq!(fs::read_to_string(&marker).unwrap(), "foo-library");
+        assert!(session.has_session());
+
+        fs::remove_file(&marker).unwrap();
+        let before = session.snapshot();
+        fs::remove_dir(folder.join("s-first")).unwrap();
+        fs::create_dir(folder.join("s-second")).unwrap();
+        assert!(!session.store_after_compile(before));
+        assert!(session.has_session());
+        assert!(!session.store_after_compile(session.snapshot()));
+        fs::remove_dir(folder.join("s-second")).unwrap();
+        assert!(!session.has_session());
+
+        fs::write(marker, "foo-library/../foo-harness").unwrap();
+        assert!(!session.has_session());
+    }
+
+    #[test]
+    fn test_incremental_session_observation_rejects_ambiguous_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("incremental");
+        let session = incremental_session(&root, &[], "version", &[]);
+        let before = session.snapshot();
+        fs::create_dir_all(root.join("foo-library/s-first")).unwrap();
+        fs::create_dir_all(root.join("foo-harness/s-second")).unwrap();
+        assert!(!session.store_after_compile(before));
+        assert!(!session.marker_path().exists());
     }
 
     #[test]
@@ -4438,6 +4678,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         next_command_calls(creator, move |args| {
             // A long command line comes as a response file, see `arguments_for_spawn`.
             let args: Vec<OsString> = ExpandResponseFile::new(Path::new(""), args).collect();
+            assert!(args.iter().all(|arg| !arg.starts_with("incremental=")));
             let mut dep_info_path = None;
             let mut it = args.iter();
             while let Some(a) = it.next() {
@@ -4461,14 +4702,11 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
 
     fn mock_file_names(creator: &Arc<Mutex<MockCommandCreator>>, filenames: &[&str]) {
         // Mock the `rustc --print=file-names` process output.
-        next_command(
-            creator,
-            Ok(MockChild::new(
-                exit_status(0),
-                filenames.iter().join("\n"),
-                "",
-            )),
-        );
+        let filenames = filenames.join("\n");
+        next_command_calls(creator, move |args| {
+            assert!(args.iter().all(|arg| !arg.starts_with("incremental=")));
+            Ok(MockChild::new(exit_status(0), filenames.as_str(), ""))
+        });
     }
 
     #[test_case(true ; "with preprocessor cache")]
@@ -4541,6 +4779,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 profile: None,
                 gcno: None,
                 target_json: None,
+                incremental_dir: None,
             },
         });
         let creator = new_creator();
@@ -4647,6 +4886,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     profile: None,
                     gcno: None,
                     target_json: None,
+                    incremental_dir: None,
                 },
             })
         };
@@ -4738,6 +4978,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 profile: None,
                 gcno: None,
                 target_json: None,
+                incremental_dir: None,
             },
         });
         let creator = new_creator();
@@ -4844,7 +5085,7 @@ foo.rs:
             .iter()
             .map(|a| a.as_ref().to_owned())
             .collect::<Vec<OsString>>();
-        let parsed_args = match parse_arguments(&oargs, cwd) {
+        let parsed_args = match parse_arguments(&oargs, cwd, RustIncremental::CacheNoBypass) {
             CompilerArguments::Ok(parsed_args) => parsed_args,
             o => panic!("Got unexpected parse result: {:?}", o),
         };
@@ -4895,6 +5136,113 @@ foo.rs:
             )
             .wait()
             .unwrap()
+    }
+
+    #[test]
+    fn test_incremental_cache_key() {
+        let f = TestFixture::new();
+        let key = |extra: &[&str], env: &[(OsString, OsString)]| {
+            let args = [RUST_LIB_ARGS, extra].concat();
+            hash_key_with(&f, &args, env, &[], nothing, MockStorage::new(None, false))
+        };
+        let inc = key(&["-Cincremental=a"], &[]);
+        assert_eq!(inc, key(&["--codegen=incremental=b"], &[]));
+        let noninc = key(&[], &[]);
+        assert_ne!(inc, noninc);
+        assert_ne!(
+            key(&["-Cincremental=a", "-Ccodegen-units=1"], &[]),
+            key(&["-Cincremental=a", "-Ccodegen-units=256"], &[])
+        );
+        for var in [
+            "CARGO_INCREMENTAL",
+            "CARGO_BUILD_INCREMENTAL",
+            "CARGO_PROFILE_DEV_INCREMENTAL",
+        ] {
+            let env = [(var.into(), "1".into())];
+            assert_eq!(inc, key(&["-Cincremental=a"], &env));
+            assert_ne!(noninc, key(&[], &env));
+        }
+        let args = [RUST_LIB_ARGS, &["-Cincremental=a"]].concat();
+        let env_dep_key = |value: &str| {
+            hash_key_with(
+                &f,
+                &args,
+                &[("CARGO_INCREMENTAL".into(), value.into())],
+                &[("CARGO_INCREMENTAL", value.into())],
+                nothing,
+                MockStorage::new(None, false),
+            )
+        };
+        assert_ne!(env_dep_key("0"), env_dep_key("1"));
+    }
+
+    #[test]
+    fn test_incremental_preflights_share_dep_info_key() {
+        let f = TestFixture::new();
+        let cwd = f.tempdir.path();
+        f.touch("foo.rs").unwrap();
+        let runtime = single_threaded_runtime();
+        let creator = new_creator();
+        let hash = |extra: &[&str]| {
+            let CompilerArguments::Ok(parsed_args) =
+                parse_rust_lib(extra, cwd, RustIncremental::CacheNoBypass)
+            else {
+                panic!("incremental arguments did not parse");
+            };
+            RustHasher {
+                executable: "rustc".into(),
+                host: "x86-64-unknown-unknown-unknown".into(),
+                version: TEST_RUSTC_VERSION.into(),
+                sysroot: cwd.join("sysroot"),
+                #[cfg(feature = "dist-client")]
+                target_libdir: cwd.join("sysroot/lib/rustlib/fake-target/lib"),
+                compiler_shlibs_digests: vec![],
+                dist_archive: None,
+                #[cfg(feature = "dist-client")]
+                rlib_dep_reader: None,
+                parsed_args,
+            }
+            .generate_hash_key(
+                &creator,
+                cwd.to_owned(),
+                vec![],
+                false,
+                runtime.handle(),
+                false,
+                Arc::new(MockStorage::new(None, false)),
+                &[],
+                CacheControl::Default,
+            )
+            .wait()
+            .unwrap()
+        };
+
+        mock_dep_info(&creator, &["foo.rs"]);
+        mock_file_names(&creator, &["libfoo.rlib"]);
+        hash(&["-Cincremental=a"]);
+        assert!(creator.lock().unwrap().children.is_empty());
+
+        // The second hasher must reuse the preflights despite the different path.
+        let result = hash(&["--codegen=incremental=b"]);
+        let (local, dist, _) = result
+            .compilation
+            .generate_compile_commands(&mut dist::PathTransformer::new(), false)
+            .unwrap();
+        assert!(local.get_arguments().contains(&"incremental=b".into()));
+        #[cfg(feature = "dist-client")]
+        {
+            assert!(dist.is_none());
+            assert!(
+                hash(&[])
+                    .compilation
+                    .generate_compile_commands(&mut dist::PathTransformer::new(), false)
+                    .unwrap()
+                    .1
+                    .is_some()
+            );
+        }
+        #[cfg(not(feature = "dist-client"))]
+        let _ = dist;
     }
 
     #[allow(clippy::unnecessary_unwrap)]
@@ -5806,7 +6154,7 @@ foo.rs:
             .unwrap();
         let arg = format!("@{}", td.path().join("args").display());
         let args: Vec<OsString> = vec![OsString::from(arg)];
-        let result = parse_arguments(&args, td.path());
+        let result = parse_arguments(&args, td.path(), RustIncremental::Off);
         let parsed = match result {
             CompilerArguments::Ok(args) => args,
             o => panic!("Got unexpected parse result: {:?}", o),
@@ -5823,7 +6171,7 @@ foo.rs:
         // to missing --out-dir / --emit etc.
         let cwd = Path::new("/nonexistent");
         let args: Vec<OsString> = vec![OsString::from("@missing_file")];
-        let result = parse_arguments(&args, cwd);
+        let result = parse_arguments(&args, cwd, RustIncremental::Off);
         assert!(matches!(result, CompilerArguments::CannotCache(..)));
     }
 
