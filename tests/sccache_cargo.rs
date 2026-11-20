@@ -2264,7 +2264,7 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
         &probe_source,
         "extern crate proc_macro; #[proc_macro] pub fn probe(x: proc_macro::TokenStream) -> proc_macro::TokenStream { x }",
     )?;
-    let mut rustc_probe = Command::new(rustc);
+    let mut rustc_probe = Command::new(&rustc);
     rustc_probe
         .arg(&probe_source)
         .args(["--crate-type=proc-macro", "--out-dir"])
@@ -2463,6 +2463,93 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
         incremental_stats(&test, 0, 0)?;
         assert_eq!(pm_misses()?.len(), expected);
     }
+    assert_failed_linked_proc_macro_runs_once(&test, &rustc, driver, fuse_ld.as_deref())?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_failed_linked_proc_macro_runs_once(
+    test: &SccacheTest,
+    rustc: &std::ffi::OsStr,
+    driver: &str,
+    fuse_ld: Option<&str>,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let sysroot = Command::new(rustc).args(["--print", "sysroot"]).output()?;
+    assert!(sysroot.status.success());
+    let sysroot = String::from_utf8(sysroot.stdout)?;
+    let rustc = Path::new(sysroot.trim()).join("bin/rustc");
+    let root = test.tempdir.path();
+    let wrapper = root.join("rustc");
+    let runs = root.join("rustc-runs");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+codegen=0
+print=0
+capture=plain
+for arg do
+    case "$arg" in
+        --emit=dep-info,link|dep-info,link) codegen=1 ;;
+        --print|--print=*) print=1 ;;
+        link-arg=*--dependency-file=*|-Clink-arg=*--dependency-file=*) capture=captured ;;
+    esac
+done
+if [ "$codegen" = 1 ] && [ "$print" = 0 ]; then
+    printf '%s\n' "$capture" >> "$LINK_TEST_RUNS"
+    printf '%s compile\n' "$capture" >&2
+fi
+exec "$LINK_TEST_RUSTC" "$@"
+"#,
+    )?;
+    fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+    fs::create_dir(root.join("out"))?;
+    fs::write(
+        root.join("broken.rs"),
+        r#"extern crate proc_macro;
+#[proc_macro]
+pub fn broken(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    let _: u8 = "deliberate type error";
+    input
+}
+"#,
+    )?;
+    let args = [
+        "--crate-type=proc-macro",
+        "--crate-name=broken",
+        "--out-dir=out",
+        "--emit=dep-info,link",
+        "broken.rs",
+    ];
+    let linker = format!("-Clinker={driver}");
+    let expected = Command::new(&rustc)
+        .args(args)
+        .arg(&linker)
+        .args(fuse_ld)
+        .current_dir(root)
+        .output()?;
+    let code = expected.status.code().context("rustc exited by signal")?;
+    assert_ne!(code, 0);
+
+    zero_incremental_stats()?;
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg(&wrapper)
+        .args(args)
+        .arg(&linker)
+        .args(fuse_ld)
+        .env("LINK_TEST_RUSTC", rustc)
+        .env("LINK_TEST_RUNS", &runs)
+        .env_remove("LD_LIBRARY_PATH")
+        .current_dir(root)
+        .assert()
+        .try_code(code)?
+        .try_stderr(predicate::str::contains("error[E0308]"))?
+        .try_stderr(predicate::str::contains("captured compile"))?;
+    assert_eq!(fs::read_to_string(runs)?, "captured\n");
+    let stats = incremental_stats(test, 0, 0)?;
+    assert_eq!(stats["compile_fails"], 1);
+    assert_eq!(stats["cache_writes"], 0);
     Ok(())
 }
 
