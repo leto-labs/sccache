@@ -101,6 +101,33 @@ are read at server startup. Oversize compiles count under
 (`rust_linked_entry_too_large` in JSON). Linked entries share the disk cache's
 normal size limit and reflink accounting.
 
+### Comparing restored and rebuilt test harnesses
+
+Start the server under test with the `tests` or `all` stage, then warm its
+cache with `cargo test --workspace --no-run` in one checkout. Set
+`SCCACHE_BASEDIRS` to that checkout's root and use the same toolchain, profile,
+and Rust flags in the second checkout.
+
+```sh
+SCCACHE_BASEDIRS_REMAP_PATHS=1 leto/linked-soak.sh /work/checkout-b --run
+```
+
+The script needs Python 3.9 or later and `objcopy`. Use an empty Cargo target
+directory in the second checkout. A custom Cargo build directory must be
+inside that target directory. The script uses the
+configured sccache server and `RUSTC_WRAPPER` (default `sccache`) and defaults
+`SCCACHE_BASEDIRS` to the checkout root. It builds the workspace test harnesses
+with the cache, optionally runs them with `--run`, then builds the same units
+from scratch at the same target path with `SCCACHE_NO_CACHE=1`. The rebuilt
+outputs are left in the target directory.
+
+The report compares raw bytes and, for mismatches, compares copies with
+debug sections and the GNU build ID removed by `objcopy`. Set
+`SCCACHE_BASEDIRS_REMAP_PATHS=1` for both checkouts to expect byte equality.
+Without remapping, debug paths can differ. The script exits nonzero if a
+harness is missing, normalized bytes differ, raw bytes differ with remapping
+enabled, or a restored test fails.
+
 ## Incremental compilation
 
 Cargo enables incremental compilation for workspace members and path
