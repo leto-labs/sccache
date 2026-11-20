@@ -416,6 +416,7 @@ where
         storage: Arc<dyn Storage>,
         basedirs: &[Vec<u8>],
         cache_control: CacheControl,
+        _explain_miss: bool,
     ) -> Result<HashResult<T>> {
         let start_of_compilation = std::time::SystemTime::now();
 
@@ -565,6 +566,7 @@ where
                         );
                         return Ok(HashResult {
                             key,
+                            manifest: None,
                             compilation: Box::new(CCompilation {
                                 parsed_args: self.parsed_args.clone(),
                                 is_locally_preprocessed: false,
@@ -738,6 +740,7 @@ where
         );
         Ok(HashResult {
             key,
+            manifest: None,
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,

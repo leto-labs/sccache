@@ -1568,3 +1568,127 @@ fn write_compile_basedirs_config(checkout: &Path) -> Result<()> {
     )?;
     Ok(())
 }
+
+#[test_case(false ; "server side")]
+#[test_case(true ; "client side requested")]
+#[serial]
+fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()> {
+    use serde_json::{Value, json};
+
+    let mut test = SccacheTest::new(Some(&[
+        (
+            "SCCACHE_CLIENT_SIDE",
+            if client_side { "1" } else { "0" }.into(),
+        ),
+        ("SCCACHE_BASEDIRS_REMAP_PATHS", "1".into()),
+    ]))?;
+    let root = real_tempdir(&test)?;
+    let [a, b] = ["a", "b"].map(|name| root.join(name));
+    let log = root.join("misses.jsonl");
+    let start = |test| {
+        restart_sccache(
+            test,
+            Some(vec![(
+                "SCCACHE_MISS_EXPLAIN".into(),
+                log.to_str().unwrap().into(),
+            )]),
+        )
+    };
+    let package = |name: &str| {
+        format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n")
+    };
+    for (checkout, value) in [(&a, 42), (&b, 43)] {
+        for crate_dir in ["leaf", "middle", "."] {
+            fs::create_dir_all(checkout.join(crate_dir).join("src"))?;
+        }
+        write_compile_basedirs_config(checkout)?;
+        fs::write(
+            checkout.join("Cargo.toml"),
+            package("explain_top") + "\n[dependencies]\nexplain_middle = { path = \"middle\" }\n",
+        )?;
+        fs::write(
+            checkout.join("src/lib.rs"),
+            "pub const ANSWER: (&str, u32) = explain_middle::ANSWER;\n",
+        )?;
+        fs::write(
+            checkout.join("middle/Cargo.toml"),
+            package("explain_middle")
+                + "\n[dependencies]\nleaf = { package = \"explain_leaf\", path = \"../leaf\" }\n",
+        )?;
+        fs::write(
+            checkout.join("middle/src/lib.rs"),
+            "pub const ANSWER: (&str, u32) = leaf::ANSWER;\n",
+        )?;
+        fs::write(checkout.join("leaf/Cargo.toml"), package("explain_leaf"))?;
+        fs::write(
+            checkout.join("leaf/src/lib.rs"),
+            format!("pub const ANSWER: (&str, u32) = (env!(\"TEST_ENV_VAR\"), {value});\n"),
+        )?;
+    }
+
+    start(&test)?;
+    cargo_build(&test, &a)?;
+    // Restart to verify the baselines survive a server restart.
+    start(&test)?;
+    test.env.push(("TEST_ENV_VAR", "checkout-b".into()));
+    cargo_build(&test, &b)?;
+
+    let stats: Value = serde_json::from_slice(&test.show_stats()?.get_output().stdout)?;
+    assert_eq!(
+        stats["stats"]["miss_explain"],
+        json!({
+            "new": 0, "own-input": 1, "dependency": 2, "unchanged": 0,
+        })
+    );
+    test.show_text_stats(false)?
+        .try_stdout(predicate::str::contains(
+            "Rust misses explained (own-input)",
+        ))?;
+
+    let contents = fs::read_to_string(log)?;
+    let entries = contents
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<serde_json::Result<Vec<_>>>()?;
+    assert_eq!(entries.len(), 6, "{contents}");
+    for (old, new) in entries[..3].iter().zip(&entries[3..]) {
+        assert_eq!(old["classification"], "new");
+        assert_eq!(old["crate_name"], new["crate_name"]);
+        assert_eq!(old["identity"], new["identity"]);
+        assert_eq!(old["key"], new["closest_key"]);
+        assert_eq!(old["basedir"], a.to_str().unwrap());
+        assert_eq!(new["basedir"], b.to_str().unwrap());
+        let differences = new["differences"].as_array().unwrap();
+        let names: Vec<_> = differences
+            .iter()
+            .map(|d| d["name"].as_str().unwrap())
+            .collect();
+        match new["crate_name"].as_str().unwrap() {
+            "explain_leaf" => {
+                assert_eq!(new["classification"], "own-input");
+                assert_eq!(names, ["env:TEST_ENV_VAR", "source:leaf/src/lib.rs"]);
+            }
+            "explain_middle" => {
+                assert_eq!(new["classification"], "dependency");
+                assert_eq!(names, ["extern:leaf"]);
+                assert!(
+                    entries[3]["artifacts"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&differences[0]["artifact"])
+                );
+            }
+            "explain_top" => {
+                assert_eq!(new["classification"], "dependency");
+                assert_eq!(names, ["extern:explain_middle"]);
+            }
+            name => panic!("unexpected crate {name}"),
+        }
+        for difference in differences {
+            assert!(difference["previous"].is_string());
+            assert!(difference["current"].is_string());
+            assert_ne!(difference["previous"], difference["current"]);
+        }
+    }
+    Ok(())
+}

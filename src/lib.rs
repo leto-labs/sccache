@@ -42,6 +42,7 @@ pub mod config;
 pub mod dist;
 mod jobserver;
 pub mod lru_disk_cache;
+mod miss_explain;
 mod mock_command;
 mod net;
 mod protocol;

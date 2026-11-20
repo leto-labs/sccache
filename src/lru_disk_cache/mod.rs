@@ -75,6 +75,11 @@ impl<K> Meter<K, u64> for FileSize {
 fn get_all_files<P: AsRef<Path>>(path: P) -> Box<dyn Iterator<Item = (PathBuf, u64)>> {
     let mut files: Vec<_> = WalkDir::new(path.as_ref())
         .into_iter()
+        .filter_entry(|entry| {
+            entry.depth() != 1
+                || !entry.file_type().is_dir()
+                || entry.file_name() != crate::miss_explain::DIRECTORY
+        })
         .filter_map(|e| {
             e.ok().and_then(|f| {
                 // Only look at files
@@ -822,6 +827,22 @@ mod tests {
         c.insert_bytes("b", &[0u8; 30]).unwrap();
         assert!(f.tmp().join(CACHEDIR_TAG_FILE_NAME).exists());
         assert!(!c.contains_key("a"));
+    }
+
+    #[test]
+    fn test_miss_explain_history_is_outside_entry_eviction() {
+        let f = TestFixture::new();
+        let explain = f.tmp().join(crate::miss_explain::DIRECTORY);
+        fs::create_dir_all(&explain).unwrap();
+        let history = explain.join("manifest.json");
+        fs::write(&history, [0; 70]).unwrap();
+
+        let mut cache = LruDiskCache::new(f.tmp(), 50).unwrap();
+        assert_eq!(cache.size(), 0);
+        cache.insert_bytes("a", &[0u8; 30]).unwrap();
+        cache.insert_bytes("b", &[0u8; 30]).unwrap();
+        assert!(history.exists());
+        assert!(!cache.contains_key("a"));
     }
 
     #[test]

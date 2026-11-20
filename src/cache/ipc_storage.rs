@@ -39,18 +39,11 @@ pub struct IpcStorage {
 }
 
 impl IpcStorage {
-    /// Connect to the daemon and perform the `StorageHandshake` RPC.
-    /// Returns an `IpcStorage` that can be used as an `Arc<dyn Storage>`.
-    pub fn connect(mut conn: ServerConnection) -> Result<Self> {
-        let resp = conn.request(Request::StorageHandshake)?;
-        let handshake = match resp {
-            Response::StorageHandshake(info) => info,
-            other => bail!("IpcStorage: unexpected handshake response: {other:?}"),
-        };
-        Ok(Self {
+    pub fn new(conn: ServerConnection, handshake: StorageHandshakeInfo) -> Self {
+        Self {
             conn: Arc::new(Mutex::new(conn)),
             handshake,
-        })
+        }
     }
 
     /// Return a clone of the underlying connection handle so callers can send

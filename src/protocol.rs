@@ -128,6 +128,8 @@ pub struct StorageHandshakeInfo {
     pub max_size: Option<u64>,
     #[serde(skip)]
     pub rust_incremental: RustIncremental,
+    #[serde(skip)]
+    pub miss_explain: bool,
 }
 
 // Older peers ignore trailing bytes. Keep extensions at the end of the
@@ -135,7 +137,7 @@ pub struct StorageHandshakeInfo {
 pub(crate) fn encode_request(request: &Request) -> bincode::Result<Vec<u8>> {
     let mut frame = bincode::serialize(request)?;
     if let Request::RecordStats(stats) = request {
-        bincode::serialize_into(&mut frame, &stats.rust_incremental_not_stored)?;
+        encode_stats_extension(&mut frame, stats)?;
     }
     Ok(frame)
 }
@@ -145,7 +147,7 @@ pub(crate) fn decode_request(frame: &[u8]) -> bincode::Result<Request> {
     if let Request::RecordStats(stats) = &mut request
         && !extension.is_empty()
     {
-        stats.rust_incremental_not_stored = bincode::deserialize(extension)?;
+        decode_stats_extension(extension, stats)?;
     }
     Ok(request)
 }
@@ -155,10 +157,13 @@ pub(crate) fn encode_response(response: &Response) -> bincode::Result<Vec<u8>> {
     bincode::serialize_into(&mut frame, response)?;
     match response {
         Response::Stats(info) | Response::ShuttingDown(info) => {
-            bincode::serialize_into(&mut frame, &info.stats.rust_incremental_not_stored)?;
+            encode_stats_extension(&mut frame, &info.stats)?;
         }
         Response::StorageHandshake(info) => {
             bincode::serialize_into(&mut frame, &info.rust_incremental)?;
+            if info.miss_explain {
+                bincode::serialize_into(&mut frame, &info.miss_explain)?;
+            }
         }
         _ => {}
     }
@@ -170,15 +175,36 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
     if !extension.is_empty() {
         match &mut response {
             Response::Stats(info) | Response::ShuttingDown(info) => {
-                info.stats.rust_incremental_not_stored = bincode::deserialize(extension)?;
+                decode_stats_extension(extension, &mut info.stats)?;
             }
             Response::StorageHandshake(info) => {
-                info.rust_incremental = bincode::deserialize(extension)?;
+                let (mode, remaining) = decode_frame(extension)?;
+                info.rust_incremental = mode;
+                if !remaining.is_empty() {
+                    info.miss_explain = bincode::deserialize(remaining)?;
+                }
             }
             _ => {}
         }
     }
     Ok(response)
+}
+
+fn encode_stats_extension(frame: &mut Vec<u8>, stats: &ServerStats) -> bincode::Result<()> {
+    bincode::serialize_into(&mut *frame, &stats.rust_incremental_not_stored)?;
+    if stats.miss_explain != Default::default() {
+        bincode::serialize_into(frame, &stats.miss_explain)?;
+    }
+    Ok(())
+}
+
+fn decode_stats_extension(extension: &[u8], stats: &mut ServerStats) -> bincode::Result<()> {
+    let (incremental, remaining) = decode_frame(extension)?;
+    stats.rust_incremental_not_stored = incremental;
+    if !remaining.is_empty() {
+        stats.miss_explain = bincode::deserialize(remaining)?;
+    }
+    Ok(())
 }
 
 fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> bincode::Result<(T, &[u8])> {
@@ -190,6 +216,7 @@ fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> bincode::Result<(T, &[u8])
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::MissExplainStats;
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -241,25 +268,40 @@ mod tests {
             assert_eq!(info.stats.cache_writes, 11);
             assert_eq!(info.stats.not_cached["incremental session"], 17);
             assert_eq!(info.stats.rust_incremental_not_stored, 0);
+            assert_eq!(info.stats.miss_explain, MissExplainStats::default());
             assert_eq!(info.cache_location, "cache");
             assert_eq!(info.basedirs, ["/work"]);
 
+            let mut incremental_frame = old_frame.clone();
+            bincode::serialize_into(&mut incremental_frame, &23_u64).unwrap();
+            let (Response::Stats(previous) | Response::ShuttingDown(previous)) =
+                decode_response(&incremental_frame).unwrap()
+            else {
+                panic!("expected stats response");
+            };
+            assert_eq!(previous.stats.rust_incremental_not_stored, 23);
+            assert_eq!(previous.stats.miss_explain, MissExplainStats::default());
+
             info.stats.rust_incremental_not_stored = 23;
+            info.stats.miss_explain.own_input = 41;
             let json = serde_json::to_value(&info).unwrap();
             assert_eq!(json["stats"]["rust_incremental_not_stored"], 23);
+            assert_eq!(json["stats"]["miss_explain"]["own-input"], 41);
             let from_json: ServerInfo = serde_json::from_value(json).unwrap();
             assert_eq!(from_json.stats.rust_incremental_not_stored, 23);
+            assert_eq!(from_json.stats.miss_explain.own_input, 41);
 
             let new_frame = encode_response(&response).unwrap();
-            assert!(new_frame.starts_with(&old_frame));
-            for (response, expected) in [
-                (bincode::deserialize(&new_frame).unwrap(), 0),
-                (decode_response(&new_frame).unwrap(), 23),
+            assert!(new_frame.starts_with(&incremental_frame));
+            for (response, incremental, own_input) in [
+                (bincode::deserialize(&new_frame).unwrap(), 0, 0),
+                (decode_response(&new_frame).unwrap(), 23, 41),
             ] {
                 let (Response::Stats(info) | Response::ShuttingDown(info)) = response else {
                     panic!("expected stats response");
                 };
-                assert_eq!(info.stats.rust_incremental_not_stored, expected);
+                assert_eq!(info.stats.rust_incremental_not_stored, incremental);
+                assert_eq!(info.stats.miss_explain.own_input, own_input);
                 assert_eq!(info.cache_location, "cache");
             }
         }
@@ -275,16 +317,26 @@ mod tests {
         assert_eq!(stats.cache_writes, 11);
         assert_eq!(stats.rust_incremental_not_stored, 0);
         stats.rust_incremental_not_stored = 23;
+        let incremental_frame = encode_request(&Request::RecordStats(stats.clone())).unwrap();
+        let Request::RecordStats(previous) = decode_request(&incremental_frame).unwrap() else {
+            panic!("expected stats request");
+        };
+        assert_eq!(previous.rust_incremental_not_stored, 23);
+        assert_eq!(previous.miss_explain, MissExplainStats::default());
+
+        stats.miss_explain.dependency = 31;
         let new_frame = encode_request(&Request::RecordStats(stats)).unwrap();
-        assert!(new_frame.starts_with(&old_frame));
-        for (request, expected) in [
-            (bincode::deserialize(&new_frame).unwrap(), 0),
-            (decode_request(&new_frame).unwrap(), 23),
+        assert!(incremental_frame.starts_with(&old_frame));
+        assert!(new_frame.starts_with(&incremental_frame));
+        for (request, incremental, dependency) in [
+            (bincode::deserialize(&new_frame).unwrap(), 0, 0),
+            (decode_request(&new_frame).unwrap(), 23, 31),
         ] {
             let Request::RecordStats(stats) = request else {
                 panic!("expected stats request");
             };
-            assert_eq!(stats.rust_incremental_not_stored, expected);
+            assert_eq!(stats.rust_incremental_not_stored, incremental);
+            assert_eq!(stats.miss_explain.dependency, dependency);
             assert_eq!(stats.cache_writes, 11);
         }
     }
@@ -308,23 +360,36 @@ mod tests {
         assert_eq!(info.rust_incremental, RustIncremental::Off);
         assert_eq!(info.cache_mode, CacheMode::ReadOnly);
         assert_eq!(info.max_size, Some(200));
+        assert!(!info.miss_explain);
         info.rust_incremental = RustIncremental::CacheNoBypass;
+        let previous_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
+        let Response::StorageHandshake(previous) = decode_response(&previous_frame).unwrap() else {
+            panic!("expected storage handshake");
+        };
+        assert_eq!(previous.rust_incremental, RustIncremental::CacheNoBypass);
+        assert!(!previous.miss_explain);
+
+        info.miss_explain = true;
         let new_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
-        assert!(new_frame.starts_with(&old_frame));
-        for (response, expected) in [
+        assert!(previous_frame.starts_with(&old_frame));
+        assert!(new_frame.starts_with(&previous_frame));
+        for (response, expected, miss_explain) in [
             (
                 bincode::deserialize(&new_frame).unwrap(),
                 RustIncremental::Off,
+                false,
             ),
             (
                 decode_response(&new_frame).unwrap(),
                 RustIncremental::CacheNoBypass,
+                true,
             ),
         ] {
             let Response::StorageHandshake(info) = response else {
                 panic!("expected storage handshake");
             };
             assert_eq!(info.rust_incremental, expected);
+            assert_eq!(info.miss_explain, miss_explain);
             assert_eq!(info.cache_mode, CacheMode::ReadOnly);
         }
     }

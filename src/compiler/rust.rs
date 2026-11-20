@@ -26,6 +26,7 @@ use crate::config::RustIncremental;
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
 use crate::lru_disk_cache::{LruCache, Meter};
+use crate::miss_explain::{self, Manifest};
 use crate::mock_command::{CommandCreatorSync, RunCommand};
 use crate::util::{
     Digest, fmt_duration_as_secs, hash_all, hash_all_archives, hash_all_externs, run_input_output,
@@ -2214,6 +2215,139 @@ fn basedirs_remap_paths(env_vars: &[(OsString, OsString)]) -> bool {
 
 const BASEDIRS_REMAP_PREFIX: &str = "/sccache/basedir";
 
+fn matches_basedir(dir: &Path, basedirs: &[Vec<u8>]) -> bool {
+    let mut bytes = dir.as_os_str().as_encoded_bytes().to_vec();
+    bytes.push(b'/');
+    #[cfg(target_os = "windows")]
+    let bytes = crate::util::normalize_win_path(&bytes);
+    basedirs.contains(&bytes)
+}
+
+fn explain_path(path: &Path, basedirs: &[Vec<u8>]) -> String {
+    let stripped = strip_basedirs_os(path.as_os_str(), basedirs);
+    let path = stripped.to_string_lossy();
+    let path = path.strip_prefix('\0').unwrap_or(&path);
+    #[cfg(windows)]
+    return path.replace('\\', "/");
+    #[cfg(not(windows))]
+    path.to_owned()
+}
+
+impl ParsedArguments {
+    fn unit_hash(&self, domain: &[u8]) -> String {
+        let mut metadata: Vec<_> = self
+            .arguments
+            .iter()
+            .filter_map(|arg| match arg.get_data() {
+                Some(CodeGen(ArgCodegen { opt, value })) if opt == "metadata" => value.as_deref(),
+                _ => None,
+            })
+            .collect();
+        metadata.sort_unstable();
+        let is_test = self
+            .arguments
+            .iter()
+            .any(|arg| matches!(arg, Argument::UnknownFlag(flag) if flag == "--test"));
+        let crate_types: Vec<_> = [
+            self.crate_types.rlib.then_some("rlib"),
+            self.crate_types.staticlib.then_some("staticlib"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let mut digest = Digest::new();
+        digest.delimiter(domain);
+        (
+            self.crate_name.as_str(),
+            metadata,
+            crate_types.as_slice(),
+            is_test,
+        )
+            .hash(&mut HashToDigest {
+                digest: &mut digest,
+            });
+        digest.finish()
+    }
+
+    fn explain_manifest(&self, cwd: &Path, basedirs: &[Vec<u8>]) -> Manifest {
+        let output_dir = cwd.join(&self.output_dir);
+        let basedir = cwd
+            .ancestors()
+            .chain(output_dir.ancestors())
+            .find(|dir| matches_basedir(dir, basedirs));
+        Manifest {
+            identity: self.unit_hash(b"rust-miss-explain"),
+            crate_name: self.crate_name.clone(),
+            cwd: cwd.to_string_lossy().into_owned(),
+            basedir: basedir.map(|dir| dir.to_string_lossy().into_owned()),
+            artifacts: Vec::new(),
+            components: Vec::new(),
+        }
+    }
+}
+
+fn hash_env_input(digest: &mut Digest, var: &OsStr, val: &OsStr, manifest: Option<&mut Manifest>) {
+    var.hash(&mut HashToDigest { digest });
+    digest.update(b"=");
+    val.hash(&mut HashToDigest { digest });
+    if let Some(manifest) = manifest {
+        manifest.add(
+            format!("env:{}", var.to_string_lossy()),
+            miss_explain::digest(val),
+        );
+    }
+}
+
+/// The files and env-deps parsed from dep-info are hashed as inputs. The dep-info
+/// text itself is an output and can contain checkout-specific paths.
+#[allow(clippy::too_many_arguments)]
+fn record_rust_files(
+    manifest: &mut Manifest,
+    arguments: &[Argument<ArgData>],
+    sources: &[PathBuf],
+    source_hashes: &[String],
+    extern_hashes: &[String],
+    staticlibs: &[PathBuf],
+    staticlib_hashes: &[String],
+    target_json_hash: &[String],
+    basedirs: &[Vec<u8>],
+) {
+    for (path, hash) in sources.iter().zip(source_hashes) {
+        manifest.add(
+            format!("source:{}", explain_path(path, basedirs)),
+            hash.clone(),
+        );
+    }
+    let mut externs: Vec<_> = arguments
+        .iter()
+        .filter_map(|arg| match arg.get_data() {
+            Some(Extern(extern_arg)) => Some(extern_arg),
+            _ => None,
+        })
+        .collect();
+    // The same path ordering used for the cache key, including ties.
+    externs.sort_by(|left, right| left.path.cmp(&right.path));
+    for (extern_arg, hash) in externs.into_iter().zip(extern_hashes) {
+        manifest.components.push(miss_explain::Component {
+            name: format!("extern:{}", extern_arg.name),
+            digest: hash.clone(),
+            artifact: extern_arg
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned()),
+        });
+    }
+    for (path, hash) in staticlibs.iter().zip(staticlib_hashes) {
+        manifest.add(
+            format!("staticlib:{}", explain_path(path, basedirs)),
+            hash.clone(),
+        );
+    }
+    for hash in target_json_hash {
+        manifest.add("target-json", hash.clone());
+    }
+}
+
 /// rustc applies the last matching `--remap-path-prefix`, so outer basedirs come first, and
 /// the user's own mappings, which are passed after these, take precedence.
 fn basedirs_remap_arguments(
@@ -2231,13 +2365,7 @@ fn basedirs_remap_arguments(
         debug!("Not remapping basedirs: `..` in {cwd:?} or {output_dir:?}");
         return vec![];
     }
-    let is_basedir = |dir: &&Path| {
-        let mut bytes = dir.as_os_str().as_encoded_bytes().to_vec();
-        bytes.push(b'/');
-        #[cfg(target_os = "windows")]
-        let bytes = crate::util::normalize_win_path(&bytes);
-        basedirs.contains(&bytes)
-    };
+    let is_basedir = |dir: &&Path| matches_basedir(dir, basedirs);
     let remap = |from: &Path, to: &Path| {
         let mut value = from.as_os_str().to_owned();
         value.push("=");
@@ -2314,6 +2442,7 @@ where
         _storage: Arc<dyn Storage>,
         basedirs: &[Vec<u8>],
         _cache_control: CacheControl,
+        explain_miss: bool,
     ) -> Result<HashResult<T>> {
         trace!("[{}]: generate_hash_key", self.parsed_args.crate_name);
         // TODO: this doesn't produce correct arguments if they should be concatenated - should use iter_os_strings
@@ -2480,6 +2609,7 @@ where
                 }
             };
         let (extern_hashes, staticlib_hashes, target_json_hash) = inputs;
+        let mut manifest = explain_miss.then(|| self.parsed_args.explain_manifest(&cwd, basedirs));
 
         // If you change any of the inputs to the hash, you should change `CACHE_VERSION`.
         let mut m = Digest::new();
@@ -2489,6 +2619,13 @@ where
         // 2. compiler_shlibs_digests
         for d in &self.compiler_shlibs_digests {
             m.update(d.as_bytes());
+        }
+        if let Some(manifest) = &mut manifest {
+            manifest.add("cache-version", miss_explain::digest(CACHE_VERSION));
+            manifest.add(
+                "compiler",
+                miss_explain::digest(&self.compiler_shlibs_digests),
+            );
         }
         let weak_toolchain_key = rust_dist_toolchain_weak_key(&m, &self.sysroot);
         let remap_arguments = self.remap_arguments(&cwd, &env_vars, basedirs);
@@ -2536,9 +2673,28 @@ where
                 })
         };
         args.hash(&mut HashToDigest { digest: &mut m });
+        if let Some(manifest) = &mut manifest {
+            manifest.add("arguments", miss_explain::digest(&args));
+        }
         let incremental = self.incremental_session();
         if incremental.is_some() {
             m.delimiter(b"-C incremental");
+            if let Some(manifest) = &mut manifest {
+                manifest.add("incremental", miss_explain::digest("-C incremental"));
+            }
+        }
+        if let Some(manifest) = &mut manifest {
+            record_rust_files(
+                manifest,
+                &self.parsed_args.arguments,
+                &source_files,
+                &source_hashes,
+                &extern_hashes,
+                &abs_staticlibs,
+                &staticlib_hashes,
+                &target_json_hash,
+                basedirs,
+            );
         }
         // 4. The digest of all source files (this includes src file from cmdline).
         // 5. The digest of all files listed on the commandline (self.externs).
@@ -2560,13 +2716,12 @@ where
         env_deps.sort();
         let verbatim = basedirs_verbatim_env_deps(&env_vars, basedirs);
         for (var, val) in env_deps.iter() {
-            var.hash(&mut HashToDigest { digest: &mut m });
-            m.update(b"=");
-            if verbatim(var) {
-                val.hash(&mut HashToDigest { digest: &mut m });
+            let val = if verbatim(var) {
+                Cow::Borrowed(val.as_os_str())
             } else {
-                strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
-            }
+                strip_basedirs_os(val, basedirs)
+            };
+            hash_env_input(&mut m, var, &val, manifest.as_mut());
         }
         let mut env_vars: Vec<_> = env_vars
             .iter()
@@ -2596,15 +2751,19 @@ where
                 continue;
             }
 
-            var.hash(&mut HashToDigest { digest: &mut m });
-            m.update(b"=");
-            strip_basedirs_os(val, basedirs).hash(&mut HashToDigest { digest: &mut m });
+            let val = strip_basedirs_os(val, basedirs);
+            hash_env_input(&mut m, var, &val, manifest.as_mut());
         }
         // 9. The cwd of the compile. This will wind up in the rlib.
-        Path::new(&strip_basedirs_os(cwd.as_os_str(), basedirs))
-            .hash(&mut HashToDigest { digest: &mut m });
+        let normalized_cwd = strip_basedirs_os(cwd.as_os_str(), basedirs);
+        let normalized_cwd = Path::new(&normalized_cwd);
+        normalized_cwd.hash(&mut HashToDigest { digest: &mut m });
         // 10. The version of the compiler.
         self.version.hash(&mut HashToDigest { digest: &mut m });
+        if let Some(manifest) = &mut manifest {
+            manifest.add("cwd", miss_explain::digest(normalized_cwd));
+            manifest.add("compiler-version", miss_explain::digest(&self.version));
+        }
 
         // metadata / dep-info don't ever generate binaries, but
         // rustc still makes them appear in the --print
@@ -2682,6 +2841,11 @@ where
                 .with_context(|| format!("Failed to write dep-info to {}", path.display()))?;
         }
 
+        if let Some(manifest) = &mut manifest {
+            manifest.artifacts = outputs.clone();
+            manifest.artifacts.sort_unstable();
+        }
+
         // Convert output files into a map of basename -> full
         // path, and remove some unneeded / non-existing ones,
         // see https://github.com/rust-lang/rust/pull/68799.
@@ -2730,6 +2894,7 @@ where
 
         Ok(HashResult {
             key: m.finish(),
+            manifest,
             compilation: Box::new(RustCompilation {
                 executable: self.executable.clone(),
                 host: self.host.clone(),
@@ -4923,6 +5088,14 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                         ArgData::PassThrough("abc".into()),
                         ArgDisposition::Separated,
                     ),
+                    Argument::WithValue(
+                        "--extern",
+                        ArgData::Extern(ArgExtern {
+                            name: "renamed_bar".into(),
+                            path: "bar.rlib".into(),
+                        }),
+                        ArgDisposition::Separated,
+                    ),
                 ],
                 output_dir: "foo/".into(),
                 externs: vec!["bar.rlib".into()],
@@ -4944,39 +5117,88 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             },
         });
         let creator = new_creator();
-        mock_dep_info(&creator, &["foo.rs", "bar.rs"]);
+        let env_path = f.tempdir.path().join("generated");
+        mock_dep_info_with_env(
+            &creator,
+            &["foo.rs", "bar.rs"],
+            &[
+                ("NORMALIZED", env_path.clone().into_os_string()),
+                ("VERBATIM", env_path.clone().into_os_string()),
+            ],
+        );
         mock_file_names(&creator, &["foo.rlib", "foo.a"]);
         let runtime = single_threaded_runtime();
         let pool = runtime.handle().clone();
-        let res = hasher
-            .generate_hash_key(
-                &creator,
-                f.tempdir.path().to_owned(),
-                [
-                    (OsString::from("CARGO_PKG_NAME"), OsString::from("foo")),
-                    (OsString::from("FOO"), OsString::from("bar")),
-                    (OsString::from("CARGO_BLAH"), OsString::from("abc")),
-                    (
-                        OsString::from("CARGO_REGISTRIES_A_TOKEN"),
-                        OsString::from("ignored"),
-                    ),
-                    (
-                        OsString::from("CARGO_BUILD_JOBS"),
-                        OsString::from("ignored"),
-                    ),
-                ]
-                .to_vec(),
-                false,
-                &pool,
-                false,
-                Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
-                &[],
-                CacheControl::Default,
-            )
-            .wait()
-            .unwrap();
+        let basedirs = crate::config::basedirs_from_env(f.tempdir.path().as_os_str()).unwrap();
+        let mut run = |explain_miss| {
+            hasher
+                .generate_hash_key(
+                    &creator,
+                    f.tempdir.path().to_owned(),
+                    [
+                        (OsString::from("CARGO_PKG_NAME"), OsString::from("foo")),
+                        (
+                            OsString::from("SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS"),
+                            OsString::from("VERBATIM"),
+                        ),
+                        (OsString::from("CARGO_BLAH"), OsString::from("abc")),
+                        (
+                            OsString::from("CARGO_REGISTRIES_A_TOKEN"),
+                            OsString::from("ignored"),
+                        ),
+                        (
+                            OsString::from("CARGO_BUILD_JOBS"),
+                            OsString::from("ignored"),
+                        ),
+                    ]
+                    .to_vec(),
+                    false,
+                    &pool,
+                    false,
+                    Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
+                    &basedirs,
+                    CacheControl::Default,
+                    explain_miss,
+                )
+                .wait()
+                .unwrap()
+        };
+        let res = run(false);
+        let explained = run(true);
+        assert_eq!(res.key, explained.key);
+        assert!(res.manifest.is_none());
+        let manifest = explained.manifest.unwrap();
+        assert_eq!(manifest.crate_name, "foo");
+        assert_eq!(manifest.basedir.as_deref(), f.tempdir.path().to_str());
+        let names: Vec<_> = manifest
+            .components
+            .iter()
+            .map(|component| component.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "cache-version",
+                "compiler",
+                "arguments",
+                "source:bar.rs",
+                "source:foo.rs",
+                "extern:renamed_bar",
+                "staticlib:libbaz.a",
+                "env:NORMALIZED",
+                "env:VERBATIM",
+                "env:CARGO_BLAH",
+                "env:CARGO_PKG_NAME",
+                "cwd",
+                "compiler-version",
+            ]
+        );
+        assert_eq!(manifest.components[5].artifact.as_deref(), Some("bar.rlib"));
         let m = Digest::new();
         let empty_digest = m.finish();
+        assert_eq!(manifest.components[3].digest, empty_digest);
+        assert_eq!(manifest.components[5].digest, empty_digest);
+        assert_eq!(manifest.components[6].digest, libbaz_a_digest);
 
         let mut m = Digest::new();
         // Version.
@@ -4995,19 +5217,59 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         // file, baz.o, consisting of 1024 bytes of zeroes.
         m.update(libbaz_a_digest.as_bytes());
         // Env vars
+        OsStr::new("NORMALIZED").hash(&mut HashToDigest { digest: &mut m });
+        m.update(b"=");
+        OsStr::new("\0generated").hash(&mut HashToDigest { digest: &mut m });
+        OsStr::new("VERBATIM").hash(&mut HashToDigest { digest: &mut m });
+        m.update(b"=");
+        env_path
+            .as_os_str()
+            .hash(&mut HashToDigest { digest: &mut m });
         OsStr::new("CARGO_BLAH").hash(&mut HashToDigest { digest: &mut m });
         m.update(b"=");
         OsStr::new("abc").hash(&mut HashToDigest { digest: &mut m });
         OsStr::new("CARGO_PKG_NAME").hash(&mut HashToDigest { digest: &mut m });
         m.update(b"=");
         OsStr::new("foo").hash(&mut HashToDigest { digest: &mut m });
-        f.tempdir.path().hash(&mut HashToDigest { digest: &mut m });
+        Path::new("\0").hash(&mut HashToDigest { digest: &mut m });
         TEST_RUSTC_VERSION.hash(&mut HashToDigest { digest: &mut m });
         let digest = m.finish();
         assert_eq!(res.key, digest);
         let mut out = res.compilation.outputs().map(|k| k.key).collect::<Vec<_>>();
         out.sort();
         assert_eq!(out, vec!["foo.a", "foo.rlib", "foo.rmeta"]);
+    }
+
+    #[test]
+    fn test_miss_explain_unit_identity() {
+        let identity = |cwd: &str, extra: &[&str]| {
+            let CompilerArguments::Ok(args) =
+                parse_rust_lib(extra, Path::new(cwd), RustIncremental::Off)
+            else {
+                panic!("expected cacheable args");
+            };
+            args.unit_hash(b"rust-miss-explain")
+        };
+        let reference = identity("checkout-a", &["-Cmetadata=b", "-Cmetadata=a"]);
+        assert_eq!(
+            reference,
+            identity(
+                "checkout-b",
+                &["-Cmetadata=a", "-Cmetadata=b", "-Copt-level=2"]
+            )
+        );
+        for changes in [
+            "-Cmetadata=c",
+            "--test",
+            "--crate-type=staticlib",
+            "--crate-name=another",
+        ] {
+            assert_ne!(
+                reference,
+                identity("checkout-b", &["-Cmetadata=a", "-Cmetadata=b", changes]),
+                "{changes}",
+            );
+        }
     }
 
     #[test]
@@ -5067,6 +5329,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                     Arc::new(MockStorage::new(None, false)),
                     &[],
                     CacheControl::Default,
+                    false,
                 )
                 .wait()
                 .unwrap()
@@ -5160,6 +5423,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 Arc::new(MockStorage::new(None, false)),
                 &[],
                 CacheControl::Default,
+                false,
             )
             .wait()
             .unwrap();
@@ -5297,6 +5561,7 @@ foo.rs:
                 Arc::new(storage),
                 &basedirs,
                 CacheControl::Default,
+                false,
             )
             .wait()
             .unwrap()
@@ -5377,6 +5642,7 @@ foo.rs:
                 Arc::new(MockStorage::new(None, false)),
                 &[],
                 CacheControl::Default,
+                false,
             )
             .wait()
             .unwrap()

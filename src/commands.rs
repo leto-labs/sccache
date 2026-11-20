@@ -729,7 +729,7 @@ where
 pub fn do_compile_client_side<C>(
     jobserver: &Client,
     runtime: &mut Runtime,
-    conn: ServerConnection,
+    mut conn: ServerConnection,
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
@@ -742,8 +742,25 @@ where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
 {
     trace!("do_compile_client_side");
+    let Response::StorageHandshake(handshake) = conn.request(Request::StorageHandshake)? else {
+        bail!("unexpected storage handshake response");
+    };
+    if handshake.miss_explain {
+        return do_compile(
+            C::new(jobserver),
+            runtime,
+            conn,
+            exe,
+            cmdline,
+            cwd,
+            path,
+            env_vars,
+            stdout,
+            stderr,
+        );
+    }
     let exe_path = which_in(exe, path, cwd)?;
-    let storage = IpcStorage::connect(conn)?;
+    let storage = IpcStorage::new(conn, handshake);
     let cache_mode = runtime.block_on(storage.check())?;
     let conn_arc = storage.conn();
     let rust_incremental = storage.rust_incremental();

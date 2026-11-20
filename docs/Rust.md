@@ -68,3 +68,42 @@ In `--show-stats`, incremental lookups count under Rust hits and misses.
 started with a finalized session or whose session directory could not be read.
 Under `Non-cacheable reasons`, `incremental session` counts bypasses of known
 local sessions.
+
+## Explain cross-worktree cache misses
+
+Set `SCCACHE_MISS_EXPLAIN` to an absolute log path when starting the server.
+For a fresh baseline, use a dedicated server and disk cache. Build a known-good checkout
+first, then build the checkout you want to compare using the same Cargo
+command and profile. Each build should set `SCCACHE_BASEDIRS` to its own root.
+
+```sh
+export SCCACHE_SERVER_PORT=4241
+export SCCACHE_DIR="$HOME/.cache/sccache-explain"
+export SCCACHE_MISS_EXPLAIN="$HOME/sccache-misses.jsonl"
+sccache --start-server
+(cd /work/checkout-a && SCCACHE_BASEDIRS="$PWD" RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 cargo build)
+(cd /work/checkout-b && SCCACHE_BASEDIRS="$PWD" RUSTC_WRAPPER=sccache CARGO_INCREMENTAL=0 cargo build)
+python3 leto/explain-misses.py "$SCCACHE_MISS_EXPLAIN"
+sccache --show-stats
+sccache --stop-server
+```
+
+The server appends a JSON line for each Rust cache lookup that returns a
+miss. `new` means there is no history for the crate's compilation identity.
+`own-input` lists inputs such as a source file, an environment variable, or
+the argument digest. `dependency` names the changed externs. `unchanged`
+means the same key was previously stored and is now missing. For a changed
+key, the server compares against the stored manifest with the fewest
+differences. Source and library paths use the same basedir stripping as the
+key. Arguments and environment values appear only as digests. The reader
+follows changed extern artifact names to earlier misses in the same
+checkout and reports unresolved externs when a producer is absent from the
+log. Pass `--json` to include the root crates in JSON output.
+
+The server stores up to four distinct keys per crate identity under
+`$SCCACHE_DIR/explain` as it writes cache entries. This history survives a
+server restart, and existing cache hits do not populate it. Keep the log
+outside the disk cache folder. The log appends across builds and restarts.
+This mode routes client-side builds through the server for diagnostics.
+Warm incremental compiles that bypass the cache produce no miss record.
+Unset `SCCACHE_MISS_EXPLAIN` and restart the server to turn the mode off.
