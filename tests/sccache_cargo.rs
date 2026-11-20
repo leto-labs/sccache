@@ -434,8 +434,7 @@ fn build_checkout(test_info: &SccacheTest, name: &str) -> Result<PathBuf> {
 fn cargo_build(test_info: &SccacheTest, checkout: &Path) -> Result<PathBuf> {
     let target_dir = checkout.join("target");
     Command::new(CARGO.as_os_str())
-        // `--target-dir` rather than `CARGO_TARGET_DIR`,
-        // since cargo forwards `CARGO_*` to rustc and sccache hashes them.
+        // Keep the environment fixed across checkouts, including in `all` mode.
         .args(["build", "--color=never", "--target-dir"])
         .arg(&target_dir)
         .envs(test_info.env.iter().cloned())
@@ -605,6 +604,61 @@ fn test_rust_cargo_basedirs_other_checkout() -> Result<()> {
         "dep-info does not name checkout b:\n{dep_info}"
     );
 
+    Ok(())
+}
+
+#[test_case("semantic", false; "semantic server")]
+#[test_case("semantic", true; "semantic client")]
+#[test_case("all", false; "all server")]
+#[test_case("all", true; "all client")]
+#[serial]
+fn test_rust_cargo_hash_cargo_env_other_checkout(mode: &str, client_side: bool) -> Result<()> {
+    let test = SccacheTest::new(Some(&[(
+        "SCCACHE_CLIENT_SIDE",
+        if client_side { "1" } else { "0" }.into(),
+    )]))?;
+    let root = real_tempdir(&test)?;
+    let [a, b] = ["a", "b"].map(|name| root.join(name));
+    for checkout in [&a, &b] {
+        write_out_dir_crate(checkout)?;
+        write_compile_basedirs_config(checkout)?;
+        let manifest = checkout.join("Cargo.toml");
+        let package = fs::read_to_string(&manifest)?;
+        fs::write(manifest, package + "\n[workspace]\nmembers = [\"dep\"]\n")?;
+    }
+    restart_sccache(
+        &test,
+        Some(vec![("SCCACHE_RUST_HASH_CARGO_ENV".into(), mode.into())]),
+    )?;
+
+    let build = |checkout: &Path, extra_env: &[(&str, &str)]| -> Result<()> {
+        Command::new(CARGO.as_os_str())
+            .args(["build", "--workspace", "--lib"])
+            .envs(test.env.iter().cloned())
+            .env("CARGO_TARGET_DIR", checkout.join("target"))
+            .env_remove("CARGO_TERM_COLOR")
+            .env_remove("CARGO_NET_OFFLINE")
+            .envs(extra_env.iter().copied())
+            .current_dir(checkout)
+            .assert()
+            .try_success()?;
+        Ok(())
+    };
+    build(&a, &[])?;
+    incremental_stats(&test, 0, 2)?;
+    zero_incremental_stats()?;
+    build(
+        &b,
+        &[
+            ("CARGO_TERM_COLOR", "always"),
+            ("CARGO_NET_OFFLINE", "true"),
+        ],
+    )?;
+    if mode == "semantic" {
+        incremental_stats(&test, 2, 0)?;
+    } else {
+        incremental_stats(&test, 0, 2)?;
+    }
     Ok(())
 }
 
@@ -2023,13 +2077,13 @@ fn test_rust_cargo_incremental_modes_do_not_mix() -> Result<()> {
     incremental_stats(&test, 1, 2)?;
     assert_cache_only_sessions(&b, &["itoa"])?;
 
-    // Cargo also forwards this variable to non-incremental dependencies.
+    // The same non-incremental invocation can come from either Cargo setting.
     zero_incremental_stats()?;
     incremental_cargo(&test, &c, "build")
         .env("CARGO_INCREMENTAL", "0")
         .assert()
         .try_success()?;
-    incremental_stats(&test, 0, 3)?;
+    incremental_stats(&test, 3, 0)?;
 
     zero_incremental_stats()?;
     incremental_cargo(&test, &a, "clean")
@@ -2148,8 +2202,7 @@ fn test_rust_cargo_proc_macro_in_another_target_dir() -> Result<()> {
         "pub fn answer() -> u32 { pm::answer!() }\n",
     )?;
 
-    // The target directory goes on the command line, because sccache hashes every `CARGO_*`
-    // variable and an exported CARGO_TARGET_DIR would itself make the keys differ.
+    // Keep the environment fixed across target directories, including in `all` mode.
     let env = test_info
         .env
         .iter()

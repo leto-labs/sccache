@@ -30,7 +30,7 @@ use crate::compiler::ptxas::Ptxas;
 use crate::compiler::rust::linked;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
-use crate::config::{RustCacheLinked, RustIncrementalSettings};
+use crate::config::{RustCacheLinked, RustHashCargoEnv, RustIncrementalSettings};
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
 #[cfg(feature = "dist-client")]
@@ -523,6 +523,7 @@ where
         env_vars: &[(OsString, OsString)],
         _settings: RustIncrementalSettings,
         _rust_cache_linked: RustCacheLinked,
+        _rust_hash_cargo_env: RustHashCargoEnv,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
         self.parse_arguments(arguments, cwd, env_vars)
     }

@@ -24,7 +24,8 @@ use crate::compiler::{
 #[cfg(feature = "dist-client")]
 use crate::compiler::{DistPackagers, NoopOutputsRewriter};
 use crate::config::{
-    RustCacheLinked, RustIncremental, RustIncrementalFirstBuild, RustIncrementalSettings,
+    RustCacheLinked, RustHashCargoEnv, RustIncremental, RustIncrementalFirstBuild,
+    RustIncrementalSettings,
 };
 #[cfg(feature = "dist-client")]
 use crate::dist::pkg;
@@ -342,6 +343,7 @@ pub struct RustHasher {
     parsed_args: ParsedArguments,
     incremental_settings: RustIncrementalSettings,
     rust_cache_linked: RustCacheLinked,
+    rust_hash_cargo_env: RustHashCargoEnv,
 }
 
 /// a lookup proxy for determining the actual compiler used per file or directory
@@ -998,6 +1000,7 @@ where
             env_vars,
             RustIncrementalSettings::default(),
             RustCacheLinked::Off,
+            RustHashCargoEnv::default(),
         )
     }
 
@@ -1008,6 +1011,7 @@ where
         _env_vars: &[(OsString, OsString)],
         settings: RustIncrementalSettings,
         rust_cache_linked: RustCacheLinked,
+        rust_hash_cargo_env: RustHashCargoEnv,
     ) -> CompilerArguments<Box<dyn CompilerHasher<T> + 'static>> {
         match parse_arguments(arguments, cwd, settings.mode, rust_cache_linked) {
             CompilerArguments::Ok(args) => {
@@ -1025,6 +1029,7 @@ where
                     parsed_args: args,
                     incremental_settings: settings,
                     rust_cache_linked,
+                    rust_hash_cargo_env,
                 }))
             }
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
@@ -2320,6 +2325,44 @@ fn cargo_incremental_env(var: &OsStr) -> bool {
         || (var.starts_with("CARGO_PROFILE_") && var.as_encoded_bytes().ends_with(b"_INCREMENTAL"))
 }
 
+fn cargo_internal_env(var: &OsStr) -> bool {
+    let name = var.as_encoded_bytes();
+    matches!(
+        name,
+        b"CARGO_TARGET_DIR"
+            | b"CARGO_BUILD_TARGET_DIR"
+            | b"CARGO_BUILD_BUILD_DIR"
+            | b"CARGO_BUILD_JOBS"
+            | b"CARGO_MAKEFLAGS"
+            | b"CARGO_HOME"
+            | b"CARGO_ENCODED_RUSTFLAGS"
+            | b"CARGO_BUILD_RUSTFLAGS"
+            | b"CARGO_INCREMENTAL"
+            | b"CARGO_BUILD_INCREMENTAL"
+    ) || [
+        "CARGO_LOG",
+        "CARGO_CACHE_",
+        "CARGO_NET_",
+        "CARGO_HTTP_",
+        "CARGO_TERM_",
+        "CARGO_REGISTRIES_",
+        "CARGO_REGISTRY_",
+        "CARGO_ALIAS_",
+        "CARGO_CARGO_NEW_",
+        "CARGO_FUTURE_INCOMPAT_",
+        "CARGO_RESOLVER_",
+        "CARGO_PROFILE_",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix.as_bytes()))
+        || name.strip_prefix(b"CARGO_TARGET_").is_some_and(|target| {
+            target
+                .strip_suffix(b"_RUSTFLAGS")
+                .or_else(|| target.strip_suffix(b"_LINKER"))
+                .is_some_and(|triple| !triple.is_empty())
+        })
+}
+
 fn rust_dist_toolchain_weak_key(base: &Digest, sysroot: &Path) -> String {
     let mut weak = base.clone();
     // Distributed Rust toolchain archives preserve the sysroot's absolute layout.
@@ -2938,11 +2981,8 @@ where
         {
             m.update(h.as_bytes());
         }
-        // 8. Environment variables: Hash all environment variables listed in the rustc dep-info
-        //    output. Additionally also has all environment variables starting with `CARGO_`,
-        //    since those are not listed in dep-info but affect cacheability.
-        //    A crate that bakes a listed env-dep such as `env!("CARGO_MANIFEST_DIR")` into its
-        //    outputs must not hit across checkouts. Stripped values start with a NUL, unlike these.
+        // 8. Environment variables: dep-info captures values read by the crate, even
+        //    for Cargo settings excluded from the blanket CARGO_* hash below.
         env_deps.sort();
         let verbatim = basedirs_verbatim_env_deps(&env_vars, basedirs);
         for (var, val) in env_deps.iter() {
@@ -2966,17 +3006,15 @@ where
                 continue;
             }
 
-            // CARGO_MAKEFLAGS will have jobserver info which is extremely non-cacheable.
-            // CARGO_REGISTRIES_*_TOKEN contains non-cacheable secrets.
-            // Registry override config doesn't need to be hashed, because deps' package IDs
-            // already uniquely identify the relevant registries.
-            // CARGO_BUILD_JOBS only affects Cargo's parallelism, not rustc output.
-            // CARGO_ENCODED_RUSTFLAGS is already cached in argument list
+            // Encoded rustflags are already represented in the arguments. Jobserver
+            // data, registry credentials and Cargo parallelism are also volatile.
             if var == "CARGO_MAKEFLAGS"
                 || var.starts_with("CARGO_REGISTRIES_")
                 || var == "CARGO_BUILD_JOBS"
                 || var == "CARGO_ENCODED_RUSTFLAGS"
                 || (incremental.is_some() && cargo_incremental_env(var))
+                || (self.rust_hash_cargo_env == RustHashCargoEnv::Semantic
+                    && cargo_internal_env(var))
             {
                 continue;
             }
@@ -4719,6 +4757,7 @@ LLVM version: 15.0.2
                     &[],
                     settings,
                     stage,
+                    RustHashCargoEnv::default(),
                 );
             let CompilerArguments::Ok(hasher) = parsed else {
                 panic!("expected incremental arguments to parse");
@@ -5723,6 +5762,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             dist_archive: None,
             incremental_settings: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::Off,
+            rust_hash_cargo_env: RustHashCargoEnv::default(),
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
@@ -5893,6 +5933,95 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
         assert_eq!(out, vec!["foo.a", "foo.rlib", "foo.rmeta"]);
     }
 
+    fn cargo_env_key(
+        fixture: &TestFixture,
+        mode: RustHashCargoEnv,
+        var: &str,
+        value: &str,
+        read_by_crate: bool,
+    ) -> String {
+        let dep = (var, OsString::from(value));
+        let env_deps = if read_by_crate {
+            std::slice::from_ref(&dep)
+        } else {
+            &[]
+        };
+        hash_result_with_options(
+            fixture,
+            fixture.tempdir.path(),
+            &[
+                "foo.rs",
+                "--crate-name=foo",
+                "--crate-type=rlib",
+                "--out-dir=out",
+                "--emit=link",
+            ],
+            &[(var.into(), value.into())],
+            env_deps,
+            (|_| Ok(()), MockStorage::new(None, false)),
+            (RustCacheLinked::Off, mode),
+        )
+        .key
+    }
+
+    #[test]
+    fn test_hash_cargo_env_skips_internal_variables() {
+        let fixture = TestFixture::new();
+        for var in [
+            "CARGO_TARGET_DIR",
+            "CARGO_NET_OFFLINE",
+            "CARGO_TERM_COLOR",
+            "CARGO_PROFILE_RELEASE_NATIVE_STRIP",
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS",
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER",
+            "CARGO_INCREMENTAL",
+            "CARGO_BUILD_INCREMENTAL",
+        ] {
+            let key = |mode, value| cargo_env_key(&fixture, mode, var, value, false);
+            assert_eq!(
+                key(RustHashCargoEnv::Semantic, "a"),
+                key(RustHashCargoEnv::Semantic, "b"),
+                "{var}"
+            );
+            assert_ne!(
+                key(RustHashCargoEnv::All, "a"),
+                key(RustHashCargoEnv::All, "b"),
+                "{var}"
+            );
+        }
+
+        let key =
+            |mode, value| cargo_env_key(&fixture, mode, "CARGO_ENCODED_RUSTFLAGS", value, false);
+        for mode in [RustHashCargoEnv::Semantic, RustHashCargoEnv::All] {
+            assert_eq!(key(mode, "a"), key(mode, "b"), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn test_hash_cargo_env_preserves_dep_info_env_deps() {
+        let fixture = TestFixture::new();
+        for mode in [RustHashCargoEnv::Semantic, RustHashCargoEnv::All] {
+            let key = |value| cargo_env_key(&fixture, mode, "CARGO_TARGET_DIR", value, true);
+            assert_ne!(key("a"), key("b"), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn test_hash_cargo_env_keeps_other_variables() {
+        let fixture = TestFixture::new();
+        for var in [
+            "CARGO_PKG_VERSION",
+            "CARGO_PRIMARY_PACKAGE",
+            "CARGO_TARGET_TMPDIR",
+            "CARGO_TARGET_UNKNOWN",
+            "CARGO_FOO",
+        ] {
+            let key =
+                |value| cargo_env_key(&fixture, RustHashCargoEnv::Semantic, var, value, false);
+            assert_ne!(key("a"), key("b"), "{var}");
+        }
+    }
+
     #[test]
     fn test_miss_explain_unit_identity() {
         let identity = |cwd: &str, extra: &[&str]| {
@@ -5944,6 +6073,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 dist_archive: None,
                 incremental_settings: RustIncrementalSettings::default(),
                 rust_cache_linked: RustCacheLinked::Off,
+                rust_hash_cargo_env: RustHashCargoEnv::default(),
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
                 parsed_args: ParsedArguments {
@@ -6041,6 +6171,7 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
             dist_archive: Some("/toolchains/rust.tar.gz".into()),
             incremental_settings: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::Off,
+            rust_hash_cargo_env: RustHashCargoEnv::default(),
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args: ParsedArguments {
@@ -6167,31 +6298,32 @@ foo.rs:
         A: AsRef<OsStr>,
         F: Fn(&Path) -> Result<()>,
     {
-        hash_result_for_stage(
+        hash_result_with_options(
             f,
             cwd,
             args,
             env_vars,
             env_deps,
             (pre_func, storage),
-            RustCacheLinked::Off,
+            (RustCacheLinked::Off, RustHashCargoEnv::default()),
         )
     }
 
-    fn hash_result_for_stage<A, F>(
+    fn hash_result_with_options<A, F>(
         f: &TestFixture,
         cwd: &Path,
         args: &[A],
         env_vars: &[(OsString, OsString)],
         env_deps: &[(&str, OsString)],
         setup: (F, MockStorage),
-        stage: RustCacheLinked,
+        options: (RustCacheLinked, RustHashCargoEnv),
     ) -> HashResult<Arc<Mutex<MockCommandCreator>>>
     where
         A: AsRef<OsStr>,
         F: Fn(&Path) -> Result<()>,
     {
         let (pre_func, storage) = setup;
+        let (stage, rust_hash_cargo_env) = options;
         let oargs = args
             .iter()
             .map(|a| a.as_ref().to_owned())
@@ -6224,6 +6356,7 @@ foo.rs:
             dist_archive: None,
             incremental_settings: RustIncrementalSettings::default(),
             rust_cache_linked: stage,
+            rust_hash_cargo_env,
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args,
@@ -6375,7 +6508,7 @@ foo.rs:
                 .map(|key| ((*key).into(), cwd.into()))
                 .collect();
             let deps: Vec<_> = env_dep.into_iter().map(|key| (key, cwd.into())).collect();
-            hash_result_for_stage(
+            hash_result_with_options(
                 fixture,
                 cwd,
                 &[
@@ -6392,7 +6525,7 @@ foo.rs:
                     nothing,
                     MockStorage::new(None, false).with_basedirs(vec![basedir(cwd)]),
                 ),
-                stage,
+                (stage, RustHashCargoEnv::default()),
             )
             .key
         };
@@ -6457,20 +6590,30 @@ foo.rs:
         );
     }
 
-    #[test]
-    fn test_incremental_cache_key() {
+    #[test_case(RustHashCargoEnv::Semantic; "semantic")]
+    #[test_case(RustHashCargoEnv::All; "all")]
+    fn test_incremental_cache_key(mode: RustHashCargoEnv) {
         let f = TestFixture::new();
-        let key = |extra: &[&str], env: &[(OsString, OsString)]| {
+        let key = |extra: &[&str], env: &[(OsString, OsString)], env_deps: &[(&str, OsString)]| {
             let args = [RUST_LIB_ARGS, extra].concat();
-            hash_key_with(&f, &args, env, &[], nothing, MockStorage::new(None, false))
+            hash_result_with_options(
+                &f,
+                f.tempdir.path(),
+                &args,
+                env,
+                env_deps,
+                (nothing, MockStorage::new(None, false)),
+                (RustCacheLinked::Off, mode),
+            )
+            .key
         };
-        let inc = key(&["-Cincremental=a"], &[]);
-        assert_eq!(inc, key(&["--codegen=incremental=b"], &[]));
-        let noninc = key(&[], &[]);
+        let inc = key(&["-Cincremental=a"], &[], &[]);
+        assert_eq!(inc, key(&["--codegen=incremental=b"], &[], &[]));
+        let noninc = key(&[], &[], &[]);
         assert_ne!(inc, noninc);
         assert_ne!(
-            key(&["-Cincremental=a", "-Ccodegen-units=1"], &[]),
-            key(&["-Cincremental=a", "-Ccodegen-units=256"], &[])
+            key(&["-Cincremental=a", "-Ccodegen-units=1"], &[], &[]),
+            key(&["-Cincremental=a", "-Ccodegen-units=256"], &[], &[])
         );
         for var in [
             "CARGO_INCREMENTAL",
@@ -6478,21 +6621,21 @@ foo.rs:
             "CARGO_PROFILE_DEV_INCREMENTAL",
         ] {
             let env = [(var.into(), "1".into())];
-            assert_eq!(inc, key(&["-Cincremental=a"], &env));
-            assert_ne!(noninc, key(&[], &env));
+            assert_eq!(inc, key(&["-Cincremental=a"], &env, &[]));
+            assert_eq!(
+                noninc == key(&[], &env, &[]),
+                mode == RustHashCargoEnv::Semantic,
+                "{var}"
+            );
         }
-        let args = [RUST_LIB_ARGS, &["-Cincremental=a"]].concat();
         let env_dep_key = |value: &str| {
-            hash_key_with(
-                &f,
-                &args,
+            key(
+                &["-Cincremental=a"],
                 &[("CARGO_INCREMENTAL".into(), value.into())],
                 &[("CARGO_INCREMENTAL", value.into())],
-                nothing,
-                MockStorage::new(None, false),
             )
         };
-        assert_ne!(env_dep_key("0"), env_dep_key("1"));
+        assert_ne!(env_dep_key("first"), env_dep_key("second"));
     }
 
     #[test]
@@ -6519,6 +6662,7 @@ foo.rs:
                 dist_archive: None,
                 incremental_settings: RustIncrementalSettings::default(),
                 rust_cache_linked: RustCacheLinked::Off,
+                rust_hash_cargo_env: RustHashCargoEnv::default(),
                 #[cfg(feature = "dist-client")]
                 rlib_dep_reader: None,
                 parsed_args,

@@ -23,8 +23,8 @@ use crate::compiler::{
 #[cfg(feature = "dist-client")]
 use crate::config;
 use crate::config::{
-    Config, RustCacheLinked, RustIncrementalSettings, default_incremental_prune_days,
-    default_rust_cache_linked_max_entry_bytes,
+    Config, RustCacheLinked, RustHashCargoEnv, RustIncrementalSettings,
+    default_incremental_prune_days, default_rust_cache_linked_max_entry_bytes,
 };
 use crate::dist;
 use crate::jobserver::Client;
@@ -774,6 +774,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
                 .with_rust_options(
                     config.rust_incremental,
                     config.rust_cache_linked,
+                    config.rust_hash_cargo_env,
                     config.incremental_prune_days(),
                     config.rust_cache_linked_max_entry_bytes(),
                 );
@@ -1003,6 +1004,7 @@ where
 
     rust_incremental: RustIncrementalSettings,
     rust_cache_linked: RustCacheLinked,
+    rust_hash_cargo_env: RustHashCargoEnv,
     pub(crate) rust_cache_linked_max_entry_bytes: u64,
     pub(crate) miss_explain: Option<Arc<MissExplain>>,
     pub(crate) incremental_prune_days: u64,
@@ -1131,6 +1133,7 @@ where
                         cache_mode: me.effective_cache_mode,
                         rust_incremental: me.rust_incremental,
                         rust_cache_linked: me.rust_cache_linked,
+                        rust_hash_cargo_env: me.rust_hash_cargo_env,
                         rust_cache_linked_max_entry_bytes: me.rust_cache_linked_max_entry_bytes,
                         miss_explain: me.miss_explain.is_some(),
                         incremental_prune_days: me.incremental_prune_days,
@@ -1238,6 +1241,7 @@ where
             effective_cache_mode,
             rust_incremental: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::default(),
+            rust_hash_cargo_env: RustHashCargoEnv::default(),
             rust_cache_linked_max_entry_bytes: default_rust_cache_linked_max_entry_bytes(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
@@ -1255,11 +1259,13 @@ where
         mut self,
         settings: RustIncrementalSettings,
         rust_cache_linked: RustCacheLinked,
+        rust_hash_cargo_env: RustHashCargoEnv,
         prune_days: u64,
         linked_max_entry_bytes: u64,
     ) -> Self {
         self.rust_incremental = settings;
         self.rust_cache_linked = rust_cache_linked;
+        self.rust_hash_cargo_env = rust_hash_cargo_env;
         self.rust_cache_linked_max_entry_bytes = linked_max_entry_bytes;
         self.incremental_prune_days = prune_days;
         self
@@ -1282,6 +1288,7 @@ where
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::default(),
+            rust_hash_cargo_env: RustHashCargoEnv::default(),
             rust_cache_linked_max_entry_bytes: default_rust_cache_linked_max_entry_bytes(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
@@ -1326,6 +1333,7 @@ where
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::default(),
+            rust_hash_cargo_env: RustHashCargoEnv::default(),
             rust_cache_linked_max_entry_bytes: default_rust_cache_linked_max_entry_bytes(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
@@ -1713,6 +1721,7 @@ where
                     &env_vars,
                     self.rust_incremental,
                     self.rust_cache_linked,
+                    self.rust_hash_cargo_env,
                 ) {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {:?}", cmd);

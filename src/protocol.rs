@@ -1,7 +1,7 @@
 use crate::cache::{CacheMode, GetPathResult};
 use crate::compiler::ColorMode;
 use crate::config::{
-    PreprocessorCacheModeConfig, RustCacheLinked, RustIncrementalFirstBuild,
+    PreprocessorCacheModeConfig, RustCacheLinked, RustHashCargoEnv, RustIncrementalFirstBuild,
     RustIncrementalSettings, default_incremental_prune_days,
     default_rust_cache_linked_max_entry_bytes,
 };
@@ -142,6 +142,12 @@ pub struct StorageHandshakeInfo {
     pub rust_cache_linked: RustCacheLinked,
     #[serde(skip, default = "default_rust_cache_linked_max_entry_bytes")]
     pub rust_cache_linked_max_entry_bytes: u64,
+    #[serde(skip, default = "legacy_rust_hash_cargo_env")]
+    pub rust_hash_cargo_env: RustHashCargoEnv,
+}
+
+fn legacy_rust_hash_cargo_env() -> RustHashCargoEnv {
+    RustHashCargoEnv::All
 }
 
 // Older peers ignore trailing bytes. Keep extensions at the end of the
@@ -179,10 +185,14 @@ pub(crate) fn encode_response(response: &Response) -> bincode::Result<Vec<u8>> {
             bincode::serialize_into(&mut frame, &info.write_raw_objects)?;
             let custom_limit = info.rust_cache_linked_max_entry_bytes
                 != default_rust_cache_linked_max_entry_bytes();
-            if info.rust_cache_linked != RustCacheLinked::Off || custom_limit {
+            let semantic_env = info.rust_hash_cargo_env != legacy_rust_hash_cargo_env();
+            if info.rust_cache_linked != RustCacheLinked::Off || custom_limit || semantic_env {
                 bincode::serialize_into(&mut frame, &info.rust_cache_linked)?;
-                if custom_limit {
+                if custom_limit || semantic_env {
                     bincode::serialize_into(&mut frame, &info.rust_cache_linked_max_entry_bytes)?;
+                }
+                if semantic_env {
+                    bincode::serialize_into(&mut frame, &info.rust_hash_cargo_env)?;
                 }
             }
         }
@@ -221,8 +231,12 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                                     let (linked, remaining) = decode_frame(remaining)?;
                                     info.rust_cache_linked = linked;
                                     if !remaining.is_empty() {
-                                        info.rust_cache_linked_max_entry_bytes =
-                                            bincode::deserialize(remaining)?;
+                                        let (limit, remaining) = decode_frame(remaining)?;
+                                        info.rust_cache_linked_max_entry_bytes = limit;
+                                        if !remaining.is_empty() {
+                                            info.rust_hash_cargo_env =
+                                                bincode::deserialize(remaining)?;
+                                        }
                                     }
                                 }
                             }
@@ -434,6 +448,7 @@ mod tests {
         assert!(!info.write_raw_objects);
         assert_eq!(info.rust_cache_linked, RustCacheLinked::Off);
         assert_eq!(info.rust_cache_linked_max_entry_bytes, 256 * 1024 * 1024);
+        assert_eq!(info.rust_hash_cargo_env, RustHashCargoEnv::All);
 
         let mode = CacheNoBypass;
         let mut mode_only = old_frame.clone();
@@ -462,13 +477,22 @@ mod tests {
         info.rust_cache_linked = RustCacheLinked::Check;
         let incremental_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
         info.rust_cache_linked_max_entry_bytes = 1024;
-        let limited_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
+        let limited_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
+        info.rust_hash_cargo_env = RustHashCargoEnv::Semantic;
+        let semantic_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
         assert!(limited_frame.starts_with(&incremental_frame));
+        assert!(semantic_frame.starts_with(&limited_frame));
+        let Response::StorageHandshake(semantic) = decode_response(&semantic_frame).unwrap() else {
+            panic!("expected storage handshake");
+        };
+        assert_eq!(semantic.rust_hash_cargo_env, RustHashCargoEnv::Semantic);
+        assert_eq!(semantic.rust_cache_linked_max_entry_bytes, 1024);
         let Response::StorageHandshake(limited) = decode_response(&limited_frame).unwrap() else {
             panic!("expected storage handshake");
         };
         assert_eq!(limited.rust_cache_linked, RustCacheLinked::Check);
         assert_eq!(limited.rust_cache_linked_max_entry_bytes, 1024);
+        assert_eq!(limited.rust_hash_cargo_env, RustHashCargoEnv::All);
         assert!(incremental_frame.starts_with(&raw_frame));
 
         let (legacy_mode, remaining) =

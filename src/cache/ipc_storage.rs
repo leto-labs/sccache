@@ -16,7 +16,9 @@ use crate::cache::cache_io::{Cache, CacheRead, CacheWrite};
 use crate::cache::storage::Storage;
 use crate::client::ServerConnection;
 use crate::compiler::PreprocessorCacheEntry;
-use crate::config::{PreprocessorCacheModeConfig, RustCacheLinked, RustIncrementalSettings};
+use crate::config::{
+    PreprocessorCacheModeConfig, RustCacheLinked, RustHashCargoEnv, RustIncrementalSettings,
+};
 use crate::errors::*;
 use crate::protocol::{Request, Response, StorageHandshakeInfo};
 use async_trait::async_trait;
@@ -63,6 +65,10 @@ impl IpcStorage {
 
     pub(crate) fn rust_cache_linked(&self) -> RustCacheLinked {
         self.handshake.rust_cache_linked
+    }
+
+    pub(crate) fn rust_hash_cargo_env(&self) -> RustHashCargoEnv {
+        self.handshake.rust_hash_cargo_env
     }
 
     pub(crate) fn incremental_prune_days(&self) -> u64 {
@@ -259,6 +265,7 @@ mod tests {
                 max_size: None,
                 rust_incremental: Default::default(),
                 rust_cache_linked: Default::default(),
+                rust_hash_cargo_env: RustHashCargoEnv::All,
                 rust_cache_linked_max_entry_bytes:
                     crate::config::default_rust_cache_linked_max_entry_bytes(),
                 miss_explain: false,
