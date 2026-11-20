@@ -15,6 +15,28 @@ If you are using Rust 1.18 or later, you can ask cargo to wrap all compilation w
 
 To compute the cache key of a crate, sccache runs `rustc --emit=dep-info` to list its source files, and `rustc --print file-names` to list its outputs. The server remembers what both found, and reuses it for a later compile of the crate with the same compiler, arguments, working directory, environment, externs, static libraries and target spec, as long as every listed source file still has the same contents. This lasts for the life of the server; nothing is written to the cache. As with the preprocessor cache, a file that was not listed does not invalidate it: for instance, adding `foo/mod.rs` next to an existing `foo.rs` keeps reusing the cached result instead of failing with an ambiguous module error.
 
+## Cargo environment variables
+
+The fork defaults to `rust_hash_cargo_env = "semantic"`. It excludes known
+Cargo settings from the blanket `CARGO_*` hash, including target directories,
+network and terminal settings, and profile and rustflags settings that reach
+rustc through its arguments. Package metadata, Cargo variables used by
+compilers, and unknown `CARGO_*` variables still participate in the key. Values
+that rustc lists in dep-info, including reads through `env!` and `option_env!`,
+are always hashed under the existing path normalization rules.
+
+Set `rust_hash_cargo_env = "all"` at the top level of the server config to
+use upstream's blanket hash. Both modes exclude jobserver data,
+`CARGO_REGISTRIES_*`, `CARGO_TARGET_DIR`, and `CARGO_ENCODED_RUSTFLAGS`.
+The `all` mode excludes every `CARGO_BUILD_*` variable. The `semantic` mode
+excludes the same known Cargo settings as Leto 0.19.0-12 and still hashes
+unknown `CARGO_BUILD_*` variables for key compatibility. Incremental
+compiles in either mode exclude Cargo's incremental settings. The linked
+output key also includes its linker environment inputs.
+
+`SCCACHE_RUST_HASH_CARGO_ENV=all` or `semantic` overrides the config file.
+Restart the server to change the mode.
+
 ## Caching test, binary and proc-macro targets
 
 Set `rust_cache_linked = "check"` at the top level of the server config or
@@ -214,10 +236,9 @@ the same key whether its cold compile runs plain or incremental. Both produce
 the requested outputs, and cache hits reuse whichever output was stored.
 Dependents hash the exact metadata they compile against, and rustc validates
 upstream crates by SVH when reusing a dependent's incremental session.
-Cargo forwards variables such as `CARGO_INCREMENTAL` and
-`CARGO_PROFILE_DEV_INCREMENTAL` to registry dependency compiles, where their
-values participate in non-incremental cache keys. Use consistent Cargo
-profile settings to share those entries across builds.
+With `rust_hash_cargo_env = "all"`, Cargo variables such as
+`CARGO_INCREMENTAL` and `CARGO_PROFILE_DEV_INCREMENTAL` participate in
+non-incremental cache keys.
 
 Incremental builds run locally. Invocations with `-C save-temps` enabled or
 with unpacked split debuginfo and debuginfo enabled run uncached. This includes

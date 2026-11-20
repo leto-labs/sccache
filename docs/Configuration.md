@@ -15,6 +15,9 @@ rust_incremental = "off"
 # Codegen on first-build misses in either incremental cache mode.
 rust_incremental_first_build = "plain"
 
+# Cargo environment hashing for Rust: "semantic" or "all".
+rust_hash_cargo_env = "semantic"
+
 # Cumulative Rust target caching stages: "off", "check", "proc-macro", "tests", "all".
 rust_cache_linked = "off"
 
@@ -227,6 +230,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_ALLOW_INCREMENTAL=cache` in a compile's environment enables incremental caching when the server mode is `off`.
 * `SCCACHE_RUST_INCREMENTAL` overrides the server's `rust_incremental` setting. Values are `off` (default), `cache`, and `cache-no-bypass`. Restart the server to change modes. See [incremental compilation](Rust.md#incremental-compilation).
 * `SCCACHE_RUST_INCREMENTAL_FIRST_BUILD` overrides the server's `rust_incremental_first_build` setting. Values are `plain` (default) and `incremental`. Restart the server to change the setting. See [incremental compilation](Rust.md#incremental-compilation).
+* `SCCACHE_RUST_HASH_CARGO_ENV` overrides the server's `rust_hash_cargo_env` setting. Values are `semantic` (default) and `all`. Restart the server to change the setting. See [Cargo environment variables](Rust.md#cargo-environment-variables).
 * `SCCACHE_RUST_CACHE_LINKED` overrides the server's `rust_cache_linked` setting. Values are `off` (default), `check`, `proc-macro`, `tests`, and `all`. Restart the server to change the setting. See [Rust caching](Rust.md#caching-test-binary-and-proc-macro-targets).
 * `SCCACHE_RUST_CACHE_LINKED_MAX_ENTRY` overrides the server's `rust_cache_linked_max_entry_bytes` setting in bytes. The default is 256 MiB. Restart the server to change the setting.
 * `SCCACHE_INCREMENTAL_PRUNE_DAYS` overrides `incremental_prune_days`. The default is 7 days. Set `0` to disable. The server reads this setting at startup. The local incremental fast path reads the client's setting. See [incremental compilation](Rust.md#incremental-compilation).

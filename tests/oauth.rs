@@ -66,6 +66,7 @@ fn config_with_dist_auth(
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     }

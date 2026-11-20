@@ -822,6 +822,14 @@ impl RustCacheLinked {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RustHashCargoEnv {
+    All,
+    #[default]
+    Semantic,
+}
+
 pub(crate) const fn default_rust_cache_linked_max_entry_bytes() -> u64 {
     256 * 1024 * 1024
 }
@@ -929,6 +937,7 @@ pub struct FileConfig {
     pub rust_incremental: RustIncremental,
     pub rust_incremental_first_build: RustIncrementalFirstBuild,
     pub rust_cache_linked: RustCacheLinked,
+    pub rust_hash_cargo_env: RustHashCargoEnv,
     pub rust_cache_linked_max_entry_bytes: Option<u64>,
     pub incremental_prune_days: Option<u64>,
 }
@@ -977,6 +986,7 @@ pub struct EnvConfig {
     rust_incremental: Option<RustIncremental>,
     rust_incremental_first_build: Option<RustIncrementalFirstBuild>,
     rust_cache_linked: Option<RustCacheLinked>,
+    rust_hash_cargo_env: Option<RustHashCargoEnv>,
     rust_cache_linked_max_entry_bytes: Option<u64>,
     incremental_prune_days: Option<u64>,
 }
@@ -1460,6 +1470,16 @@ fn config_from_env() -> Result<EnvConfig> {
         Err(err) => return Err(err).context("Invalid SCCACHE_RUST_CACHE_LINKED"),
     };
 
+    let rust_hash_cargo_env = match env::var("SCCACHE_RUST_HASH_CARGO_ENV") {
+        Ok(value) => Some(match value.as_str() {
+            "all" => RustHashCargoEnv::All,
+            "semantic" => RustHashCargoEnv::Semantic,
+            _ => bail!("SCCACHE_RUST_HASH_CARGO_ENV must be all or semantic"),
+        }),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => return Err(err).context("Invalid SCCACHE_RUST_HASH_CARGO_ENV"),
+    };
+
     let incremental_prune_days = match env::var("SCCACHE_INCREMENTAL_PRUNE_DAYS") {
         Ok(value) => Some(
             value
@@ -1481,6 +1501,7 @@ fn config_from_env() -> Result<EnvConfig> {
         rust_incremental,
         rust_incremental_first_build,
         rust_cache_linked,
+        rust_hash_cargo_env,
         rust_cache_linked_max_entry_bytes: number_from_env_var(
             "SCCACHE_RUST_CACHE_LINKED_MAX_ENTRY",
         )
@@ -1592,6 +1613,7 @@ pub struct Config {
     pub client_side_mode: bool,
     pub rust_incremental: RustIncrementalSettings,
     pub rust_cache_linked: RustCacheLinked,
+    pub rust_hash_cargo_env: RustHashCargoEnv,
     pub rust_cache_linked_max_entry_bytes: Option<u64>,
     pub incremental_prune_days: Option<u64>,
 }
@@ -1635,6 +1657,7 @@ impl Config {
             rust_incremental: file_rust_incremental,
             rust_incremental_first_build: file_first_build,
             rust_cache_linked: file_rust_cache_linked,
+            rust_hash_cargo_env: file_rust_hash_cargo_env,
             rust_cache_linked_max_entry_bytes: file_rust_cache_linked_max_entry_bytes,
             incremental_prune_days: file_incremental_prune_days,
         } = file_conf;
@@ -1654,6 +1677,7 @@ impl Config {
             rust_incremental: env_rust_incremental,
             rust_incremental_first_build: env_first_build,
             rust_cache_linked: env_rust_cache_linked,
+            rust_hash_cargo_env: env_rust_hash_cargo_env,
             rust_cache_linked_max_entry_bytes: env_rust_cache_linked_max_entry_bytes,
             incremental_prune_days: env_incremental_prune_days,
         } = env_conf;
@@ -1734,6 +1758,7 @@ impl Config {
                 first_build: env_first_build.unwrap_or(file_first_build),
             },
             rust_cache_linked: env_rust_cache_linked.unwrap_or(file_rust_cache_linked),
+            rust_hash_cargo_env: env_rust_hash_cargo_env.unwrap_or(file_rust_hash_cargo_env),
             rust_cache_linked_max_entry_bytes: env_rust_cache_linked_max_entry_bytes
                 .or(file_rust_cache_linked_max_entry_bytes),
             incremental_prune_days: env_incremental_prune_days.or(file_incremental_prune_days),
@@ -2186,6 +2211,37 @@ fn test_rust_cache_linked_config() {
 }
 
 #[test]
+fn test_rust_hash_cargo_env_config() {
+    let env_var = "SCCACHE_RUST_HASH_CARGO_ENV";
+    let mode = |env, file| {
+        temp_env::with_var(env_var, env, || {
+            Config::from_env_and_file_configs(
+                config_from_env().unwrap(),
+                toml::from_str(file).unwrap(),
+            )
+            .unwrap()
+            .rust_hash_cargo_env
+        })
+    };
+
+    assert_eq!(mode(None, ""), RustHashCargoEnv::Semantic);
+    assert_eq!(
+        mode(None, "rust_hash_cargo_env = 'all'"),
+        RustHashCargoEnv::All
+    );
+    assert_eq!(
+        mode(Some("semantic"), "rust_hash_cargo_env = 'all'"),
+        RustHashCargoEnv::Semantic
+    );
+    assert_eq!(
+        mode(Some("all"), "rust_hash_cargo_env = 'semantic'"),
+        RustHashCargoEnv::All
+    );
+    assert!(temp_env::with_var(env_var, Some("invalid"), config_from_env).is_err());
+    assert!(toml::from_str::<FileConfig>("rust_hash_cargo_env = 'invalid'").is_err());
+}
+
+#[test]
 fn test_rust_cache_linked_max_entry_config() {
     let env_var = "SCCACHE_RUST_CACHE_LINKED_MAX_ENTRY";
     let limit = |env, file| {
@@ -2245,6 +2301,7 @@ fn config_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2282,6 +2339,7 @@ fn config_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2347,6 +2405,7 @@ fn config_overrides() {
             client_side_mode: false,
             rust_incremental: Default::default(),
             rust_cache_linked: Default::default(),
+            rust_hash_cargo_env: Default::default(),
             rust_cache_linked_max_entry_bytes: None,
             incremental_prune_days: None,
         }
@@ -2368,6 +2427,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2383,6 +2443,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2402,6 +2463,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2417,6 +2479,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2436,6 +2499,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2451,6 +2515,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2470,6 +2535,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2485,6 +2551,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2508,6 +2575,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2523,6 +2591,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2542,6 +2611,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2557,6 +2627,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2576,6 +2647,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2591,6 +2663,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2610,6 +2683,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2625,6 +2699,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2642,6 +2717,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -2657,6 +2733,7 @@ fn config_basedirs_overrides() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -3000,6 +3077,7 @@ fn test_env_basedirs_with_spaces() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -3037,6 +3115,7 @@ fn test_env_basedirs_with_spaces() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -3745,6 +3824,7 @@ key_prefix = "cosprefix"
             rust_incremental: Default::default(),
             rust_incremental_first_build: Default::default(),
             rust_cache_linked: Default::default(),
+            rust_hash_cargo_env: Default::default(),
             rust_cache_linked_max_entry_bytes: None,
             incremental_prune_days: None,
         }
@@ -3846,6 +3926,7 @@ size = "7g"
             rust_incremental: Default::default(),
             rust_incremental_first_build: Default::default(),
             rust_cache_linked: Default::default(),
+            rust_hash_cargo_env: Default::default(),
             rust_cache_linked_max_entry_bytes: None,
             incremental_prune_days: None,
         }
@@ -3899,6 +3980,7 @@ fn test_integration_config_normalizes_and_strips() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -3914,6 +3996,7 @@ fn test_integration_config_normalizes_and_strips() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -3950,6 +4033,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -3965,6 +4049,7 @@ fn test_integration_normalized_path_with_double_slashes() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -3997,6 +4082,7 @@ fn test_integration_windows_path_normalization() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4012,6 +4098,7 @@ fn test_integration_windows_path_normalization() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4045,6 +4132,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4060,6 +4148,7 @@ fn test_integration_cow_borrowed_when_no_match() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4093,6 +4182,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4108,6 +4198,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4140,6 +4231,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4155,6 +4247,7 @@ fn test_integration_multiple_basedirs_longest_match() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4192,6 +4285,7 @@ fn test_integration_paths_with_dots_normalized() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4207,6 +4301,7 @@ fn test_integration_paths_with_dots_normalized() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4240,6 +4335,7 @@ fn test_integration_windows_mixed_slashes() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };
@@ -4255,6 +4351,7 @@ fn test_integration_windows_mixed_slashes() {
         rust_incremental: Default::default(),
         rust_incremental_first_build: Default::default(),
         rust_cache_linked: Default::default(),
+        rust_hash_cargo_env: Default::default(),
         rust_cache_linked_max_entry_bytes: None,
         incremental_prune_days: None,
     };

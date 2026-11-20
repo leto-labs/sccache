@@ -840,6 +840,7 @@ where
     let conn_arc = storage.conn();
     let rust_incremental = storage.rust_incremental();
     let rust_cache_linked = storage.rust_cache_linked();
+    let rust_hash_cargo_env = storage.rust_hash_cargo_env();
     let incremental_prune_days = storage.incremental_prune_days();
     let linked_max_entry_bytes = storage.rust_cache_linked_max_entry_bytes();
     let (tx, _rx) = futures::channel::mpsc::channel(1);
@@ -856,6 +857,7 @@ where
     .with_rust_options(
         rust_incremental,
         rust_cache_linked,
+        rust_hash_cargo_env,
         incremental_prune_days,
         linked_max_entry_bytes,
     );
