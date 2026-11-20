@@ -1,6 +1,6 @@
 use crate::cache::{CacheMode, GetPathResult};
 use crate::compiler::ColorMode;
-use crate::config::PreprocessorCacheModeConfig;
+use crate::config::{PreprocessorCacheModeConfig, RustIncremental};
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
@@ -126,4 +126,5 @@ pub struct StorageHandshakeInfo {
     pub preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
     pub cache_mode: CacheMode,
     pub max_size: Option<u64>,
+    pub rust_incremental: RustIncremental,
 }

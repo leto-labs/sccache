@@ -16,12 +16,13 @@ use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
-    CacheControl, CompileResult, Compiler, CompilerArguments, CompilerHasher, CompilerKind,
-    CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED, get_compiler_info,
+    CacheControl, CacheStoreVeto, CompileResult, Compiler, CompilerArguments, CompilerHasher,
+    CompilerKind, CompilerProxy, DistType, Language, MissType, NO_CRATE_TYPE_PASSED,
+    get_compiler_info,
 };
 #[cfg(feature = "dist-client")]
 use crate::config;
-use crate::config::Config;
+use crate::config::{Config, RustIncremental};
 use crate::dist;
 use crate::jobserver::Client;
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
@@ -571,6 +572,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     dist_client,
                     storage,
                     cache_mode,
+                    config.rust_incremental,
                 );
                 Ok((
                     srv.local_addr().unwrap(),
@@ -591,6 +593,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     dist_client,
                     storage,
                     cache_mode,
+                    config.rust_incremental,
                 );
                 Ok((
                     srv.local_addr().unwrap(),
@@ -614,6 +617,7 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     dist_client,
                     storage,
                     cache_mode,
+                    config.rust_incremental,
                 );
                 Ok((
                     srv.local_addr()
@@ -681,6 +685,7 @@ impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
             dist_client,
             storage,
             cache_mode,
+            RustIncremental::Off,
         ))
     }
 }
@@ -693,6 +698,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         dist_client: DistClientContainer,
         storage: Arc<dyn Storage>,
         cache_mode: CacheMode,
+        rust_incremental: RustIncremental,
     ) -> Self {
         // Prepare the service which we'll use to service all incoming TCP
         // connections.
@@ -700,7 +706,8 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
         let service =
-            SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info);
+            SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info)
+                .with_rust_incremental(rust_incremental);
 
         SccacheServer {
             runtime,
@@ -884,6 +891,8 @@ where
     /// Access mode selected when this service was constructed.
     effective_cache_mode: CacheMode,
 
+    rust_incremental: RustIncremental,
+
     /// A cache of known compiler info.
     compilers: Arc<RwLock<CompilerMap<C>>>,
 
@@ -1006,6 +1015,7 @@ where
                         basedirs: me.storage.basedirs().to_vec(),
                         preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
                         cache_mode: me.effective_cache_mode,
+                        rust_incremental: me.rust_incremental,
                         max_size: me.storage.max_size().await.unwrap_or(None),
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
@@ -1105,6 +1115,7 @@ where
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode,
+            rust_incremental: RustIncremental::Off,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1113,6 +1124,11 @@ where
             info,
             notification_tx: None,
         }
+    }
+
+    pub(crate) fn with_rust_incremental(mut self, mode: RustIncremental) -> Self {
+        self.rust_incremental = mode;
+        self
     }
 
     pub fn mock_with_storage(
@@ -1128,6 +1144,7 @@ where
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
+            rust_incremental: RustIncremental::Off,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1165,6 +1182,7 @@ where
             ))),
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
+            rust_incremental: RustIncremental::Off,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt: rt.clone(),
@@ -1505,7 +1523,12 @@ where
                 debug!("check_compiler: Supported compiler");
                 // Now check that we can handle this compiler with
                 // the provided commandline.
-                match c.parse_arguments(&cmd, &cwd, &env_vars) {
+                match c.parse_arguments_with_rust_incremental(
+                    &cmd,
+                    &cwd,
+                    &env_vars,
+                    self.rust_incremental,
+                ) {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {:?}", cmd);
 
@@ -1688,7 +1711,12 @@ where
                             stats.cache_misses.increment(&kind, &lang);
                             stats.compiler_write_duration += duration;
                             debug!("stats after compile result: {stats:?}");
-                            cache_write = Some(future);
+                            match future {
+                                Ok(future) => cache_write = Some(future),
+                                Err(CacheStoreVeto::RustIncrementalSession) => {
+                                    stats.rust_incremental_not_stored += 1;
+                                }
+                            }
                         }
                         CompileResult::NotCached(dt, duration) => {
                             debug!("[{}]: compile result: not cached", out_pretty);
@@ -1876,6 +1904,8 @@ pub struct ServerStats {
     pub cache_hits: PerLanguageCount,
     /// The count of cache misses for handled compile requests (per language).
     pub cache_misses: PerLanguageCount,
+    /// Incremental compiles that did not confirm a cold session.
+    pub rust_incremental_not_stored: u64,
     /// The count of cache misses because the cache took too long to respond.
     pub cache_timeouts: u64,
     /// The count of errors reading cache entries.
@@ -1919,6 +1949,7 @@ impl std::ops::AddAssign for ServerStats {
         self.cache_errors += rhs.cache_errors;
         self.cache_hits += rhs.cache_hits;
         self.cache_misses += rhs.cache_misses;
+        self.rust_incremental_not_stored += rhs.rust_incremental_not_stored;
         self.cache_timeouts += rhs.cache_timeouts;
         self.cache_read_errors += rhs.cache_read_errors;
         self.non_cacheable_compilations += rhs.non_cacheable_compilations;
@@ -1981,6 +2012,7 @@ impl Default for ServerStats {
             cache_errors: PerLanguageCount::new(),
             cache_hits: PerLanguageCount::new(),
             cache_misses: PerLanguageCount::new(),
+            rust_incremental_not_stored: 0,
             cache_timeouts: u64::default(),
             cache_read_errors: u64::default(),
             non_cacheable_compilations: u64::default(),
@@ -2089,6 +2121,13 @@ impl ServerStats {
         set_stat!(stats_vec, self.cache_timeouts, "Cache timeouts");
         set_stat!(stats_vec, self.cache_read_errors, "Cache read errors");
         set_stat!(stats_vec, self.forced_recaches, "Forced recaches");
+        if self.rust_incremental_not_stored > 0 {
+            set_stat!(
+                stats_vec,
+                self.rust_incremental_not_stored,
+                "Incremental: not stored, session reused"
+            );
+        }
         set_stat!(stats_vec, self.cache_write_errors, "Cache write errors");
         if advanced {
             set_compiler_stat!(stats_vec, self.cache_errors, "Cache errors");

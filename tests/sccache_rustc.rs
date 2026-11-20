@@ -226,3 +226,52 @@ fn run_sccache(root: &Path, path: &Path, port: u16, client_side: bool) -> std::p
         .get_output()
         .clone()
 }
+
+#[test]
+fn test_incremental_and_non_incremental_cache_keys() {
+    let workspace = tempdir().unwrap();
+    let root = workspace.path();
+    fs::write(root.join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let port = 4324;
+    drop(StopServer(port));
+    let _stop_server = StopServer(port);
+    let command = || {
+        let mut cmd = Command::cargo_bin("sccache").unwrap();
+        cmd.current_dir(root)
+            .env("SCCACHE_SERVER_PORT", port.to_string())
+            .env_remove("SCCACHE_SERVER_UDS")
+            .env("SCCACHE_DIR", root.join("cache"))
+            .env("SCCACHE_RUST_INCREMENTAL", "cache");
+        cmd
+    };
+    let compile = |extra: &[&str]| {
+        command()
+            .arg(var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .args([
+                "lib.rs",
+                "--crate-name=probe",
+                "--crate-type=lib",
+                "--emit=metadata,link",
+                "--out-dir=.",
+            ])
+            .args(extra)
+            .assert()
+            .success();
+        fs::read(root.join("libprobe.rmeta")).unwrap()
+    };
+
+    let ordinary = compile(&[]);
+    let incremental = compile(&["-Cincremental=one"]);
+    assert_ne!(ordinary, incremental);
+    assert_eq!(compile(&["--codegen=incremental=two"]), incremental);
+    assert!(!root.join("two").exists());
+    assert_eq!(compile(&[]), ordinary);
+
+    let stats = command()
+        .args(["--show-stats", "--stats-format=json"])
+        .assert()
+        .success();
+    let info: serde_json::Value = serde_json::from_slice(&stats.get_output().stdout).unwrap();
+    assert_eq!(info["stats"]["cache_hits"]["counts"]["Rust"], 2);
+    assert_eq!(info["stats"]["cache_misses"]["counts"]["Rust"], 2);
+}

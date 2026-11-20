@@ -74,7 +74,7 @@ impl SccacheTest<'_> {
         let mut env = vec![
             ("CARGO_TARGET_DIR", cargo_dir.as_os_str().to_owned()),
             ("RUSTC_WRAPPER", SCCACHE_BIN.as_os_str().to_owned()),
-            // Explicitly disable incremental compilation, which sccache doesn't cache by default.
+            // Keep the default test profile independent of incremental caching.
             ("CARGO_INCREMENTAL", OsString::from("0")),
             ("TEST_ENV_VAR", OsString::from("1")),
         ];

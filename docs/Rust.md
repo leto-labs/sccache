@@ -1,7 +1,7 @@
 sccache includes support for caching Rust compilation. This includes many caveats, and is primarily focused on caching rustc invocations as produced by cargo. A (possibly-incomplete) list follows:
 * `--emit` is required.
 * `--crate-name` is required.
-* Only `link`, `metadata` and `dep-info` are supported as `--emit` values, and `link` must be present.
+* Only `link`, `metadata` and `dep-info` are supported as `--emit` values. An explicit emit list must include `link` or `metadata`.
 * `--out-dir` is required.
 * `-o file` is not supported.
 * Compilation from stdin is not supported, a source file must be provided.
@@ -10,10 +10,43 @@ sccache includes support for caching Rust compilation. This includes many caveat
 * With `SCCACHE_BASEDIRS`, a hit can restore a crate compiled in another checkout, with that checkout's paths in its metadata and debug info. With `SCCACHE_BASEDIRS_REMAP_PATHS=1` in the environment of the compile, sccache passes rustc `--remap-path-prefix` so that these outputs are the same in every checkout. Paths under a basedir that holds the working directory become relative to the working directory, so diagnostics still lead to the files, but the compilation directory in the debug info is `.` and a debugger has to be started in the directory cargo ran rustc in. Other paths under a basedir that holds the output directory, such as the `OUT_DIR` of a crates.io dependency, are written under `/sccache/basedir`, which names no local file. A `--remap-path-prefix` of the build's own takes precedence where both match. Such compiles are not distributed.
 * Procedural macros that read files from the filesystem may not be cached properly.
 * A procedural macro is identified by its crate metadata, so a change to native code it links, with no change to its Rust source or dependencies, is not seen.
-* Crates compiled with `rustc`'s incremental compilation (by default, in the debug profile, cargo's workspace members and path dependencies, see [The Cargo Book](https://doc.rust-lang.org/cargo/reference/profiles.html#incremental)) are not cached by default. sccache exits with an error when `CARGO_INCREMENTAL=1` is set, unless `SCCACHE_ALLOW_INCREMENTAL=1` is set: then only the incremental crates go uncached.
-* With `SCCACHE_ALLOW_INCREMENTAL=cache` in the environment of the compile, incremental crates are cached too, which helps a shared cache when a crate hasn't been built locally yet (a fresh checkout or worktree, CI). A hit leaves the incremental directory as it was, so the next rebuild after an edit can be slower. `CARGO_INCREMENTAL=1` and the profile's default give different keys, and incremental compiles are not distributed. A bad rlib from an incremental bug in rustc is cached like any other output: rebuild with `SCCACHE_RECACHE=1`.
 * Crates that invoke the system linker cannot be cached. Examples are `bin`, `dylib`, `cdylib`, and `proc-macro` crates.
 
 If you are using Rust 1.18 or later, you can ask cargo to wrap all compilation with sccache by setting `RUSTC_WRAPPER=sccache` in your build environment.
 
 To compute the cache key of a crate, sccache runs `rustc --emit=dep-info` to list its source files, and `rustc --print file-names` to list its outputs. The server remembers what both found, and reuses it for a later compile of the crate with the same compiler, arguments, working directory, environment, externs, static libraries and target spec, as long as every listed source file still has the same contents. This lasts for the life of the server; nothing is written to the cache. As with the preprocessor cache, a file that was not listed does not invalidate it: for instance, adding `foo/mod.rs` next to an existing `foo.rs` keeps reusing the cached result instead of failing with an ambiguous module error.
+
+
+## Incremental compilation
+
+Cargo enables incremental compilation for workspace members and path
+dependencies in the dev profile. The server's `rust_incremental` setting
+controls how sccache handles invocations with `-C incremental=DIR`.
+`SCCACHE_RUST_INCREMENTAL` overrides the config file. Restart the server to
+change the mode. `SCCACHE_ALLOW_INCREMENTAL=cache` in the compile's
+environment selects `cache` when the configured mode is `off`.
+`CARGO_INCREMENTAL=1` can be used in any mode.
+`SCCACHE_ALLOW_INCREMENTAL=1` leaves the configured mode in effect.
+
+- `off` (default) runs incremental invocations uncached.
+- `cache` looks up eligible invocations and stores outputs from confirmed
+  cold local compiles. Once sccache knows that a unit has a finalized local
+  session, later invocations skip the cache and use that session directly.
+- `cache-no-bypass` always looks up eligible invocations and applies the same
+  cold-session rule to writes.
+
+sccache records observed sessions in small marker files in the incremental
+directory. `cargo clean -p` removes a package's markers along with its sessions.
+Cache hits restore the normal rustc outputs and leave the incremental sessions
+alone. Incremental and non-incremental builds use separate entries, regardless
+of the name of the incremental directory. Cargo forwards variables such as
+`CARGO_INCREMENTAL` to registry dependency compiles, where their values
+participate in non-incremental cache keys. Incremental builds run locally.
+Invocations with `-C save-temps` enabled or with unpacked split debuginfo
+and debuginfo enabled run uncached.
+
+In `--show-stats`, incremental lookups count under Rust hits and misses.
+`Incremental: not stored, session reused` counts successful misses that
+reused a session or whose session could not be confirmed cold. Under
+`Non-cacheable reasons`, `incremental session` counts bypasses of known local
+sessions.
