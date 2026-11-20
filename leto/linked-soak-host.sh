@@ -8,15 +8,18 @@
 # Usage: leto/linked-soak-host.sh REPO WORKDIR PORT SCCACHE_BIN [--run] [--reflink]
 #   --run      also run the restored test harnesses (needs the project's test env)
 #   --reflink  SCCACHE_DISK_REFLINK=true (btrfs hosts)
+#   --remap    SCCACHE_BASEDIRS_REMAP_PATHS=1: cached outputs carry no checkout
+#              paths, so restored and rebuilt binaries must be byte-identical
 # The shared server is never used: the run has its own port, config and cache.
 set -euo pipefail
 repo=$(readlink -f "${1:?repo}"); work=${2:?workdir}; port=${3:?port}; bin=$(readlink -f "${4:?sccache binary}")
 shift 4
-soak_args=() reflink=false
+soak_args=() reflink=false remap=
 for a in "$@"; do
   case "$a" in
     --run) soak_args+=(--run) ;;
     --reflink) reflink=true ;;
+    --remap) remap=1 ;;
     *) echo "unknown option $a" >&2; exit 2 ;;
   esac
 done
@@ -41,6 +44,7 @@ export SCCACHE_CONF="$work/sccache.conf" SCCACHE_SERVER_PORT="$port" SCCACHE_IDL
 export SCCACHE_RUST_INCREMENTAL=cache SCCACHE_DISK_REFLINK="$reflink"
 export SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS=CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH
 export SCCACHE_MISS_EXPLAIN="$work/misses.jsonl"
+[[ -z "$remap" ]] || export SCCACHE_BASEDIRS_REMAP_PATHS=1
 PATH="$(dirname "$bin"):$PATH"
 export PATH RUSTC_WRAPPER="$bin" LONGBOW_SCCACHE_BIN="$bin"
 
@@ -56,7 +60,8 @@ echo "soak: clone A filled the cache in $(( $(date +%s) - t0 )) s"
 "$bin" --show-stats --stats-format=json >"$work/stats-a.json"
 "$bin" --zero-stats >/dev/null
 
-SCCACHE_BASEDIRS="$work/b" "$here/linked-soak.sh" "$work/b" "${soak_args[@]}" 2>"$work/b-soak.err" | tee "$work/b-soak.txt"
+soak_rc=0
+SCCACHE_BASEDIRS="$work/b" "$here/linked-soak.sh" "$work/b" "${soak_args[@]}" 2>"$work/b-soak.err" | tee "$work/b-soak.txt" || soak_rc=$?
 "$bin" --show-stats --stats-format=json >"$work/stats-b.json"
 python3 -I - "$work" <<'PY'
 import json, sys
@@ -68,3 +73,5 @@ for name in ("a", "b"):
           f"misses {s['cache_misses'].get('counts')} not cacheable {s['requests_not_cacheable']} "
           f"too large {s.get('rust_linked_entry_too_large', 0)}")
 PY
+echo "soak: linked-soak.sh exit $soak_rc"
+exit "$soak_rc"
