@@ -36,18 +36,24 @@ environment selects `cache` when the configured mode is `off`.
   cold-session rule to writes.
 
 In either cache mode, sccache runs eligible units with a private session
-directory named `DIR/<crate_name>-sccache-<unit hash>`. The first compile into
-an unused directory is cold. Switching between `off` and a cache mode switches
-between Cargo's session location and the private directory. The two cache
-modes share that private directory. `cargo clean -p` removes a package's private
+directory named `DIR/<crate_name>-sccache-<unit hash>`. Switching from `off`
+to a cache mode starts each unit cold the first time it compiles in its private
+directory. Switching back selects Cargo's original session location. Both
+cache modes share the private directory. sccache refreshes its modification
+time after each local compile, including bypasses, so mtime-based cleanup can
+recognize active sessions. `cargo clean -p` removes a package's private
 directories along with its other sessions. Cache hits restore the normal rustc
 outputs without creating or modifying session directories.
 Incremental and non-incremental builds use separate entries, regardless
 of the name of the incremental directory. Cargo forwards variables such as
-`CARGO_INCREMENTAL` to registry dependency compiles, where their values
-participate in non-incremental cache keys. Incremental builds run locally.
-Invocations with `-C save-temps` enabled or with unpacked split debuginfo
-and debuginfo enabled run uncached.
+`CARGO_INCREMENTAL` and `CARGO_PROFILE_DEV_INCREMENTAL` to registry dependency
+compiles, where their values participate in non-incremental cache keys. Use
+consistent Cargo profile settings to share those entries across builds.
+
+Incremental builds run locally. Invocations with `-C save-temps` enabled or
+with unpacked split debuginfo and debuginfo enabled run uncached. This includes
+Cargo dev profiles on macOS that use unpacked split debuginfo. Combined short
+flag groups such as `-gCincremental=DIR` also run uncached.
 
 In `--show-stats`, incremental lookups count under Rust hits and misses.
 `Incremental: not stored, session reused` counts successful misses that

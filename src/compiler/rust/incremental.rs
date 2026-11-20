@@ -82,11 +82,17 @@ impl IncrementalSession {
                 }
                 Err(err) => return Err(err.into()),
             };
+            if entry.depth() == 0 {
+                if !entry.file_type().is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotADirectory,
+                        "invalid incremental directory",
+                    ));
+                }
+                continue;
+            }
             let name = entry.file_name().as_encoded_bytes();
-            if entry.depth() > 0
-                && entry.file_type().is_dir()
-                && name.starts_with(b"s-")
-                && !name.ends_with(b"-working")
+            if name.starts_with(b"s-") && !name.ends_with(b"-working") && !name.ends_with(b".lock")
             {
                 return Ok(true);
             }

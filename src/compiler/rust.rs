@@ -1680,7 +1680,12 @@ impl<T: CommandCreatorSync> CompileCommand<T> for RustCompileCommand {
         service: &crate::server::SccacheService<T>,
         creator: &T,
     ) -> Result<process::Output> {
-        self.inner.execute(service, creator).await
+        let result = self.inner.execute(service, creator).await;
+        if let Some(session) = &self.incremental {
+            // Cleanup tools use the mtime of the top-level incremental directory entry.
+            let _ = filetime::set_file_mtime(session.path(), FileTime::now());
+        }
+        result
     }
 
     fn cache_store_veto(&self) -> Option<CacheStoreVeto> {
@@ -4079,19 +4084,26 @@ LLVM version: 15.0.2
         let unit = incremental_session(root, &[], "version", &[]);
         let harness = incremental_session(root, &["--test"], "version", &[]);
         assert!(!unit.has_finalized_session().unwrap());
+        fs::write(unit.path(), b"obsolete file").unwrap();
+        assert!(unit.has_finalized_session().is_err());
+        fs::remove_file(unit.path()).unwrap();
 
+        fs::create_dir(unit.path()).unwrap();
+        assert!(!unit.has_finalized_session().unwrap());
         fs::create_dir_all(harness.path().join("foo-test-id/s-finalized")).unwrap();
         fs::create_dir_all(root.join("foo-original-id/s-finalized")).unwrap();
         let crate_dir = unit.path().join("foo-lib-id");
         fs::create_dir_all(crate_dir.join("s-abandoned-working")).unwrap();
-        fs::write(crate_dir.join("s-file"), b"").unwrap();
+        fs::write(crate_dir.join("s-abandoned.lock"), b"").unwrap();
         assert!(!unit.has_finalized_session().unwrap());
         assert!(harness.has_finalized_session().unwrap());
 
-        let other_id = unit.path().join("foo-other-id");
-        fs::create_dir_all(other_id.join("s-finalized")).unwrap();
+        fs::create_dir(crate_dir.join("s-first")).unwrap();
         assert!(unit.has_finalized_session().unwrap());
-        fs::remove_dir_all(other_id).unwrap();
+        fs::create_dir(crate_dir.join("s-second")).unwrap();
+        assert!(unit.has_finalized_session().unwrap());
+        fs::remove_dir(crate_dir.join("s-first")).unwrap();
+        fs::remove_dir(crate_dir.join("s-second")).unwrap();
         assert!(!unit.has_finalized_session().unwrap());
     }
 

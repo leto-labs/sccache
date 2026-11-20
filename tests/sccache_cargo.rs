@@ -671,14 +671,7 @@ fn incremental_checkouts(
     ]))?;
     let tempdir = real_tempdir(&test_info)?;
     let checkouts = ["a", "b", "c", "d"].map(|name| tempdir.join(name));
-    let basedirs = std::env::join_paths(&checkouts)?.into_string().unwrap();
-    restart_sccache(
-        &test_info,
-        Some(vec![
-            ("SCCACHE_BASEDIRS".into(), basedirs),
-            ("SCCACHE_RUST_INCREMENTAL".into(), mode.into()),
-        ]),
-    )?;
+    restart_incremental_server(&test_info, &checkouts, mode)?;
 
     for checkout in &checkouts {
         fs::create_dir_all(checkout.join("src"))?;
@@ -699,6 +692,17 @@ fn incremental_checkouts(
         edit_mylib(checkout, 0)?;
     }
     Ok((test_info, checkouts))
+}
+
+fn restart_incremental_server(test: &SccacheTest, checkouts: &[PathBuf], mode: &str) -> Result<()> {
+    let basedirs = std::env::join_paths(checkouts)?.into_string().unwrap();
+    restart_sccache(
+        test,
+        Some(vec![
+            ("SCCACHE_BASEDIRS".into(), basedirs),
+            ("SCCACHE_RUST_INCREMENTAL".into(), mode.into()),
+        ]),
+    )
 }
 
 fn edit_la(checkout: &Path, value: u32) -> Result<()> {
@@ -890,6 +894,63 @@ fn test_rust_cargo_incremental_off(allow: Option<&str>) -> Result<()> {
     }
     assert_cache_only_sessions(&b, &["itoa"])?;
     run_incremental_bin(&b, 10)
+}
+
+#[test]
+#[serial]
+fn test_rust_cargo_incremental_build_ignores_flat_session_then_bypasses() -> Result<()> {
+    let (test, checkouts) = incremental_checkouts("off", false)?;
+    let a = &checkouts[0];
+    incremental_cargo(&test, a, "build")
+        .assert()
+        .try_success()?;
+    assert!(private_incremental_dirs(a, "mylib")?.is_empty());
+    let flat = incremental_crate_dirs(a, "mylib")?;
+    assert_eq!(flat.len(), 1);
+    assert!(fs::read_dir(&flat[0])?.any(|entry| {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        entry.file_type().unwrap().is_dir() && name.starts_with("s-") && !name.ends_with("-working")
+    }));
+
+    restart_incremental_server(&test, &checkouts, "cache")?;
+    edit_mylib(a, 1)?;
+    incremental_cargo(&test, a, "build")
+        .assert()
+        .try_success()?;
+    let stats = incremental_stats(&test, 0, 1)?;
+    assert_eq!(stats["cache_writes"], 1);
+    assert_eq!(stats["rust_incremental_not_stored"], 0);
+    let before = incremental_sessions(a, "mylib")?;
+    let private = &private_incremental_dirs(a, "mylib")?[0];
+    let dirs_before_bypass = incremental_crate_dirs(a, "mylib")?;
+
+    let old_mtime = filetime::FileTime::from_unix_time(1_000_000_000, 0);
+    filetime::set_file_mtime(private, old_mtime)?;
+    zero_incremental_stats()?;
+    edit_mylib(a, 2)?;
+    incremental_cargo(&test, a, "build")
+        .assert()
+        .try_success()?;
+    let stats = incremental_stats(&test, 0, 0)?;
+    assert_eq!(stats["not_cached"]["incremental session"], 1);
+    assert_eq!(stats["cache_writes"], 0);
+    assert_ne!(incremental_sessions(a, "mylib")?, before);
+    let mut dirs_after_bypass = incremental_crate_dirs(a, "mylib")?;
+    dirs_after_bypass.sort();
+    let mut dirs_before_bypass = dirs_before_bypass;
+    dirs_before_bypass.sort();
+    assert_eq!(dirs_after_bypass, dirs_before_bypass);
+    assert!(filetime::FileTime::from_last_modification_time(&fs::metadata(private)?) > old_mtime);
+    run_incremental_bin(a, 12)?;
+
+    incremental_cargo(&test, a, "clean")
+        .args(["-p", "test-crate"])
+        .assert()
+        .try_success()?;
+    assert!(incremental_crate_dirs(a, "mylib")?.is_empty());
+    Ok(())
 }
 
 #[test_case(false ; "daemon")]
