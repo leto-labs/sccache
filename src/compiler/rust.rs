@@ -443,7 +443,7 @@ static ALLOWED_EMIT: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| ["link", "metadata", "dep-info"].iter().copied().collect());
 
 /// Version number for cache key.
-const CACHE_VERSION: &[u8] = b"7";
+const CACHE_VERSION: &[u8] = b"8";
 
 /// Run `rustc --emit=dep-info` to get the list of source files and env-deps.
 ///
@@ -1023,7 +1023,7 @@ where
                     rlib_dep_reader: self.rlib_dep_reader.clone(),
                     parsed_args: args,
                     incremental_settings: settings,
-                    rust_cache_linked: rust_cache_linked.effective(),
+                    rust_cache_linked,
                 }))
             }
             CompilerArguments::NotCompilation => CompilerArguments::NotCompilation,
@@ -2008,14 +2008,27 @@ fn parse_argument_iter(
         && emit
             .as_ref()
             .is_some_and(|emit| emit.contains("metadata") && !emit.contains("link"));
-    let linked_proc_macro = cfg!(target_os = "linux")
-        && rust_cache_linked.effective() == RustCacheLinked::ProcMacro
-        && linked_crate_type == Some("proc-macro")
+    let library = crate_types.rlib || crate_types.staticlib;
+    let linked_kind = if cfg!(target_os = "linux")
         && emit.as_ref().is_some_and(|emit| emit.contains("link"))
-        && !is_test;
+    {
+        match (is_test, linked_crate_type, rust_cache_linked) {
+            (true, None, RustCacheLinked::Tests | RustCacheLinked::All) => {
+                if library {
+                    cannot_cache!("crate-type", "explicit library type with --test".to_owned());
+                }
+                Some("test")
+            }
+            (false, Some("proc-macro"), stage) if stage.caches_proc_macros() => Some("proc-macro"),
+            (false, Some("bin"), RustCacheLinked::All) => Some("bin"),
+            _ => None,
+        }
+    } else {
+        None
+    };
     if let Some(kind) = linked_crate_type
         && !linked_check_enabled
-        && !linked_proc_macro
+        && linked_kind.is_none()
     {
         cannot_cache!("crate-type", kind.to_owned());
     }
@@ -2042,14 +2055,13 @@ fn parse_argument_iter(
     if !emit.is_empty() && !emit.contains("link") && !emit.contains("metadata") {
         return CompilerArguments::NotCompilation;
     }
-    let library = crate_types.rlib || crate_types.staticlib;
     let linked_check = if linked_check_enabled {
         // --test implies an executable even when Cargo omits --crate-type.
         linked_crate_type.or((is_test && !library).then_some("test"))
     } else {
         None
     };
-    if !library && linked_check.is_none() && !linked_proc_macro {
+    if !library && linked_check.is_none() && linked_kind.is_none() {
         cannot_cache!("crate-type", NO_CRATE_TYPE_PASSED.to_owned())
     }
     // We won't cache invocations that are outputting anything but
@@ -2058,12 +2070,12 @@ fn parse_argument_iter(
         cannot_cache!("unsupported --emit");
     }
 
-    let linked = if linked_proc_macro {
+    let linked = if let Some(kind) = linked_kind {
         if grouped_codegen {
             cannot_cache!("linked compilation with grouped codegen flags");
         }
         Some(try_or_cannot_cache!(
-            linked::Options::parse(&args),
+            linked::Options::parse(kind, &args),
             "linked Rust options"
         ))
     } else {
@@ -2412,7 +2424,7 @@ impl ParsedArguments {
             self.crate_types.rlib.then_some("rlib"),
             self.crate_types.staticlib.then_some("staticlib"),
             self.linked_check
-                .or(self.linked.as_ref().map(|_| "proc-macro")),
+                .or(self.linked.as_ref().map(|options| options.kind)),
         ]
         .into_iter()
         .flatten()
@@ -2700,7 +2712,7 @@ where
             let start = time::Instant::now();
             let result = hash_all_externs(
                 &abs_externs,
-                self.rust_cache_linked == RustCacheLinked::ProcMacro,
+                self.rust_cache_linked.caches_proc_macros(),
                 pool,
             )
             .await;
@@ -2827,9 +2839,13 @@ where
             );
         }
         let weak_toolchain_key = rust_dist_toolchain_weak_key(&m, &self.sysroot);
-        if let Some((identity, search)) = &linker {
-            identity.hash_key(&mut m, &env_vars, basedirs);
-            search.hash_key(&mut m, basedirs, &self.sysroot);
+        if let Some(options) = linked_options {
+            m.delimiter(b"rust-linked-v1");
+            m.delimiter(options.kind.as_bytes());
+            if let Some((identity, search)) = &linker {
+                identity.hash_key(&mut m, &env_vars, basedirs);
+                search.hash_key(&mut m, basedirs, &self.sysroot);
+            }
         }
         let remap_arguments = self.remap_arguments(&cwd, &env_vars, basedirs);
         let remap_strings: Vec<_> = remap_arguments
@@ -3012,6 +3028,15 @@ where
             outputs.retain(|o| o.ends_with(".rlib") || o.ends_with(".rmeta"));
         }
 
+        let linked_output = linked_options
+            .map(|_| {
+                let [name] = outputs.as_slice() else {
+                    bail!("expected one output from linked Rust compilation");
+                };
+                Ok(cwd.join(self.parsed_args.output_dir.join(name)))
+            })
+            .transpose()?;
+
         if self.parsed_args.emit.contains("metadata") {
             if linked_options.is_some() {
                 let rmeta = self.parsed_args.metadata_filename();
@@ -3114,21 +3139,22 @@ where
             .chain(abs_staticlibs)
             .collect();
 
-        let linked = linked_options.map(|options| linked::LinkedCompilation {
-            available: linker.map(|(_, search)| search),
-            uses_driver: options.uses_driver().unwrap_or(true),
-            output: cwd.join(
-                self.parsed_args.output_dir.join(
-                    outputs
-                        .keys()
-                        .find(|name| name.ends_with(".so"))
-                        .map_or("", String::as_str),
-                ),
-            ),
-            cwd: cwd.clone(),
-            sysroot: self.sysroot.clone(),
-            basedirs: basedirs.to_vec(),
-        });
+        let linked =
+            linked_options
+                .zip(linked_output)
+                .map(|(options, output)| linked::LinkedCompilation {
+                    available: linker.map(|(_, search)| search),
+                    uses_driver: options.uses_driver().unwrap_or(true),
+                    object_stem: format!(
+                        "{}{}",
+                        self.parsed_args.crate_name,
+                        extra_filename_from_args(&self.parsed_args.arguments)
+                    ),
+                    output,
+                    cwd: cwd.clone(),
+                    sysroot: self.sysroot.clone(),
+                    basedirs: basedirs.to_vec(),
+                });
         let first_build_output = if incremental.is_some()
             && self.incremental_settings.first_build == RustIncrementalFirstBuild::Plain
         {
@@ -4513,11 +4539,19 @@ LLVM version: 15.0.2
         };
         for stage in [Off, Check, ProcMacro, Tests, All] {
             let parsed = parse_linked_check(stage, emit, &[unit]);
-            let linked_proc_macro = cfg!(target_os = "linux")
-                && stage.effective() == ProcMacro
-                && unit == "--crate-type=proc-macro";
-            if stage != Off && metadata_only || linked_proc_macro {
-                assert!(matches!(parsed, CompilerArguments::Ok(_)), "{parsed:?}");
+            let links = cfg!(target_os = "linux")
+                && match unit {
+                    "--test" => matches!(stage, Tests | All),
+                    "--crate-type=bin" => stage == All,
+                    "--crate-type=proc-macro" => stage.caches_proc_macros(),
+                    _ => unreachable!(),
+                };
+            if stage != Off && metadata_only || links {
+                assert!(
+                    matches!(parsed, CompilerArguments::Ok(ref args)
+                        if args.linked.is_some() != metadata_only),
+                    "{parsed:?}"
+                );
             } else {
                 assert_eq!(
                     parsed,
@@ -6344,7 +6378,7 @@ foo.rs:
             compiler_shlibs_digests: vec![],
             dist_archive: None,
             incremental_settings: RustIncrementalSettings::default(),
-            rust_cache_linked: stage.effective(),
+            rust_cache_linked: stage,
             #[cfg(feature = "dist-client")]
             rlib_dep_reader: None,
             parsed_args,
@@ -6385,13 +6419,6 @@ foo.rs:
                 .map(OsString::from);
             parse_argument_iter(arguments, Path::new("/"), RustIncremental::Cache, stage)
         };
-        for stage in [Off, Check, ProcMacro, Tests, All] {
-            assert_eq!(
-                matches!(parse("--crate-type=proc-macro", "--emit=dep-info,link", &[], stage),
-                    CompilerArguments::Ok(args) if args.linked.is_some()),
-                stage.effective() == ProcMacro
-            );
-        }
         for stage in [Check, ProcMacro, Tests, All] {
             assert!(matches!(
                 parse("--crate-type=proc-macro", "--emit=dep-info,metadata", &["--extern", "proc_macro"], stage),
@@ -6409,27 +6436,28 @@ foo.rs:
             &["-Clink-dead-code"][..],
             &["-Csplit-debuginfo=unpacked"][..],
             &["-Csplit-debuginfo=packed"][..],
-            &["--crate-type=rlib"][..],
-            &["--crate-type=staticlib"][..],
-            &["--test"][..],
+            &["-Csave-temps"][..],
             &["-Clinker-flavor=msvc"][..],
             &["-Clinker-flavor=darwin-cc"][..],
             &["-Clinker-flavor=wasm-lld"][..],
         ] {
-            assert!(
-                matches!(
-                    parse("--crate-type=proc-macro", "--emit=link", flags, All),
-                    CompilerArguments::CannotCache(_, _)
-                ),
-                "{flags:?}"
-            );
+            for kind in ["--test", "--crate-type=bin", "--crate-type=proc-macro"] {
+                assert!(
+                    matches!(
+                        parse(kind, "--emit=link", flags, All),
+                        CompilerArguments::CannotCache(_, _)
+                    ),
+                    "{kind} {flags:?}"
+                );
+            }
         }
         for kind in [
             "--crate-type=proc-macro,rlib",
             "--crate-type=proc-macro,cdylib",
             "--crate-type=cdylib",
             "--crate-type=dylib",
-            "--crate-type=bin",
+            "--crate-type=rlib,bin",
+            "--crate-type=bin,staticlib",
         ] {
             assert!(
                 matches!(
@@ -6439,6 +6467,27 @@ foo.rs:
                 "{kind}"
             );
         }
+        for kind in ["--crate-type=bin", "--crate-type=proc-macro"] {
+            for flags in [
+                ["--crate-type=rlib"],
+                ["--crate-type=staticlib"],
+                ["--test"],
+            ] {
+                assert!(matches!(
+                    parse(kind, "--emit=link", &flags, All),
+                    CompilerArguments::CannotCache(_, _)
+                ));
+            }
+        }
+        assert!(matches!(
+            parse(
+                "--test",
+                "--emit=link",
+                &["--crate-type=rlib,staticlib"],
+                All
+            ),
+            CompilerArguments::CannotCache("crate-type", _)
+        ));
         assert!(matches!(
             parse(
                 "--crate-type=proc-macro",
@@ -6460,8 +6509,10 @@ foo.rs:
     }
 
     #[cfg(target_os = "linux")]
-    #[test]
-    fn test_rust_linked_key_checkout_and_env_deps() {
+    #[test_case(RustCacheLinked::ProcMacro, "--crate-type=proc-macro")]
+    #[test_case(RustCacheLinked::Tests, "--test")]
+    #[test_case(RustCacheLinked::All, "--crate-type=bin")]
+    fn test_rust_linked_key_checkout_and_env_deps(stage: RustCacheLinked, kind: &str) {
         let a = TestFixture::new();
         let b = TestFixture::new();
         for fixture in [&a, &b] {
@@ -6498,15 +6549,7 @@ foo.rs:
             )
             .key
         };
-        let linked = |fixture, arg, dep| {
-            key(
-                fixture,
-                RustCacheLinked::ProcMacro,
-                "--crate-type=proc-macro",
-                arg,
-                dep,
-            )
-        };
+        let linked = |fixture, arg, dep| key(fixture, stage, kind, arg, dep);
         let rlib = |fixture, stage, dep| {
             key(
                 fixture,
@@ -6529,14 +6572,11 @@ foo.rs:
         ] {
             assert_ne!(linked(&a, arg, Some(name)), linked(&b, arg, Some(name)));
             assert_eq!(
-                rlib(&a, RustCacheLinked::ProcMacro, Some(name)),
+                rlib(&a, stage, Some(name)),
                 rlib(&b, RustCacheLinked::Off, Some(name))
             );
         }
-        assert_eq!(
-            rlib(&a, RustCacheLinked::ProcMacro, None),
-            rlib(&a, RustCacheLinked::Off, None)
-        );
+        assert_eq!(rlib(&a, stage, None), rlib(&a, RustCacheLinked::Off, None));
     }
 
     #[test]

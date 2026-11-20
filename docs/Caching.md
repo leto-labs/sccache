@@ -24,8 +24,8 @@ In parallel, we also take into account in the hash:
   
 See https://github.com/mozilla/sccache/blob/8567bbe2ba493153e76177c1f9a6f98cc7ba419f/src/compiler/rust.rs#L122 for the full list
 
-Linked proc-macros use a separate lookup key and verify the linker inputs
-before restoring the dylib. See [linked proc-macros](Rust.md#linked-proc-macros).
+Linked Rust targets use a separate lookup key and verify the linker inputs
+before restoring the output. See [linked Rust outputs](Rust.md#linked-outputs).
 
 ### C/C++ compiler
 

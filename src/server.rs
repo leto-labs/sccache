@@ -24,6 +24,7 @@ use crate::compiler::{
 use crate::config;
 use crate::config::{
     Config, RustCacheLinked, RustIncrementalSettings, default_incremental_prune_days,
+    default_rust_cache_linked_max_entry_bytes,
 };
 use crate::dist;
 use crate::jobserver::Client;
@@ -772,8 +773,9 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info)
                 .with_rust_options(
                     config.rust_incremental,
-                    config.rust_cache_linked.effective(),
+                    config.rust_cache_linked,
                     config.incremental_prune_days(),
+                    config.rust_cache_linked_max_entry_bytes(),
                 );
         service.background_cache_writes = true;
 
@@ -1001,6 +1003,7 @@ where
 
     rust_incremental: RustIncrementalSettings,
     rust_cache_linked: RustCacheLinked,
+    pub(crate) rust_cache_linked_max_entry_bytes: u64,
     pub(crate) miss_explain: Option<Arc<MissExplain>>,
     pub(crate) incremental_prune_days: u64,
 
@@ -1128,6 +1131,7 @@ where
                         cache_mode: me.effective_cache_mode,
                         rust_incremental: me.rust_incremental,
                         rust_cache_linked: me.rust_cache_linked,
+                        rust_cache_linked_max_entry_bytes: me.rust_cache_linked_max_entry_bytes,
                         miss_explain: me.miss_explain.is_some(),
                         incremental_prune_days: me.incremental_prune_days,
                         max_size: me.storage.max_size().await.unwrap_or(None),
@@ -1234,6 +1238,7 @@ where
             effective_cache_mode,
             rust_incremental: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::default(),
+            rust_cache_linked_max_entry_bytes: default_rust_cache_linked_max_entry_bytes(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1251,9 +1256,11 @@ where
         settings: RustIncrementalSettings,
         rust_cache_linked: RustCacheLinked,
         prune_days: u64,
+        linked_max_entry_bytes: u64,
     ) -> Self {
         self.rust_incremental = settings;
         self.rust_cache_linked = rust_cache_linked;
+        self.rust_cache_linked_max_entry_bytes = linked_max_entry_bytes;
         self.incremental_prune_days = prune_days;
         self
     }
@@ -1275,6 +1282,7 @@ where
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::default(),
+            rust_cache_linked_max_entry_bytes: default_rust_cache_linked_max_entry_bytes(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1318,6 +1326,7 @@ where
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncrementalSettings::default(),
             rust_cache_linked: RustCacheLinked::default(),
+            rust_cache_linked_max_entry_bytes: default_rust_cache_linked_max_entry_bytes(),
             miss_explain: None,
             incremental_prune_days: default_incremental_prune_days(),
             compilers: Arc::default(),
@@ -1335,9 +1344,20 @@ where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let mut builder = length_delimited::Builder::new();
-        if self.storage.write_raw_objects() {
-            builder.max_frame_length(128 * 1024 * 1024);
-        }
+        let default_limit = if self.storage.write_raw_objects() {
+            128 * 1024 * 1024
+        } else {
+            8 * 1024 * 1024
+        };
+        let linked_limit = if self.rust_cache_linked.caches_proc_macros() {
+            // Client-side writes send the entry and its linker manifest in one frame.
+            self.rust_cache_linked_max_entry_bytes
+                .saturating_add(16 * 1024 * 1024)
+                .min(u64::from(u32::MAX)) as usize
+        } else {
+            0
+        };
+        builder.max_frame_length(default_limit.max(linked_limit));
         if let Ok(max_frame_length_str) = env::var("SCCACHE_MAX_FRAME_LENGTH") {
             if let Ok(max_frame_length) = max_frame_length_str.parse::<usize>() {
                 builder.max_frame_length(max_frame_length);
@@ -1893,6 +1913,9 @@ where
                                 Err(CacheStoreVeto::RustIncrementalSession) => {
                                     stats.rust_incremental_not_stored += 1;
                                 }
+                                Err(CacheStoreVeto::RustLinkedEntryTooLarge) => {
+                                    stats.rust_linked_entry_too_large += 1;
+                                }
                             }
                         }
                         CompileResult::NotCached(dt, duration) => {
@@ -2158,6 +2181,9 @@ pub struct ServerStats {
     pub rust_incremental_not_stored: u64,
     #[serde(skip)]
     pub miss_explain: MissExplainStats,
+    /// Linked Rust compiles that exceeded the entry size cap.
+    #[serde(skip)]
+    pub rust_linked_entry_too_large: u64,
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -2198,6 +2224,7 @@ impl std::ops::AddAssign for ServerStats {
         };
         self.rust_incremental_not_stored += rhs.rust_incremental_not_stored;
         self.miss_explain += rhs.miss_explain;
+        self.rust_linked_entry_too_large += rhs.rust_linked_entry_too_large;
     }
 }
 
@@ -2226,6 +2253,8 @@ mod server_info_stats {
         rust_incremental_not_stored: u64,
         #[serde(default)]
         miss_explain: MissExplainStats,
+        #[serde(default)]
+        rust_linked_entry_too_large: u64,
     }
 
     pub fn serialize<S: Serializer>(stats: &ServerStats, serializer: S) -> Result<S::Ok, S::Error> {
@@ -2234,6 +2263,7 @@ mod server_info_stats {
                 stats,
                 rust_incremental_not_stored: stats.rust_incremental_not_stored,
                 miss_explain: stats.miss_explain,
+                rust_linked_entry_too_large: stats.rust_linked_entry_too_large,
             }
             .serialize(serializer)
         } else {
@@ -2249,9 +2279,11 @@ mod server_info_stats {
                 mut stats,
                 rust_incremental_not_stored,
                 miss_explain,
+                rust_linked_entry_too_large,
             } = StatsJson::<ServerStats>::deserialize(deserializer)?;
             stats.rust_incremental_not_stored = rust_incremental_not_stored;
             stats.miss_explain = miss_explain;
+            stats.rust_linked_entry_too_large = rust_linked_entry_too_large;
             Ok(stats)
         } else {
             ServerStats::deserialize(deserializer)
@@ -2297,6 +2329,7 @@ impl Default for ServerStats {
             multi_level: None,
             rust_incremental_not_stored: 0,
             miss_explain: Default::default(),
+            rust_linked_entry_too_large: 0,
         }
     }
 }
@@ -2417,6 +2450,13 @@ impl ServerStats {
                 stats_vec,
                 self.rust_incremental_not_stored,
                 "Incremental: not stored, session reused"
+            );
+        }
+        if self.rust_linked_entry_too_large > 0 {
+            set_stat!(
+                stats_vec,
+                self.rust_linked_entry_too_large,
+                "Rust linked: not stored, entry too large"
             );
         }
         set_stat!(stats_vec, self.cache_write_errors, "Cache write errors");

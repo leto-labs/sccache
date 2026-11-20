@@ -6,7 +6,7 @@ sccache includes support for caching Rust compilation. This includes many caveat
 * `-o file` is not supported.
 * Compilation from stdin is not supported, a source file must be provided.
 * Values from `env!` require Rust >= 1.46 to be tracked in caching.
-* With `SCCACHE_BASEDIRS`, the values of variables read with `env!` or `option_env!` are hashed with the basedirs stripped, so a crate that bakes `env!("CARGO_MANIFEST_DIR")` into its outputs can get a cache hit from another checkout and use that checkout's path. `SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS=CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH` hashes those values verbatim, so only the crates that read them are cached per checkout. A procedural macro that reads the variable with `std::env::var` is not covered, as rustc does not list it in the dep-info. Listing `OUT_DIR` would stop sharing every crate that `include!`s generated code.
+* With `SCCACHE_BASEDIRS`, the values of variables read with `env!` or `option_env!` are hashed with the basedirs stripped by default, so a crate that bakes `env!("CARGO_MANIFEST_DIR")` into its outputs can get a cache hit from another checkout and use that checkout's path. `SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS=CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH` hashes those values verbatim, so only the crates that read them are cached per checkout. Linked outputs always hash these values verbatim. A procedural macro that reads the variable with `std::env::var` is not covered, as rustc does not list it in the dep-info. Listing `OUT_DIR` would stop sharing every crate that `include!`s generated code.
 * With `SCCACHE_BASEDIRS`, a hit can restore a crate compiled in another checkout, with that checkout's paths in its metadata and debug info. With `SCCACHE_BASEDIRS_REMAP_PATHS=1` in the environment of the compile, sccache passes rustc `--remap-path-prefix` so that these outputs are the same in every checkout. Paths under a basedir that holds the working directory become relative to the working directory, so diagnostics still lead to the files, but the compilation directory in the debug info is `.` and a debugger has to be started in the directory cargo ran rustc in. Other paths under a basedir that holds the output directory, such as the `OUT_DIR` of a crates.io dependency, are written under `/sccache/basedir`, which names no local file. A `--remap-path-prefix` of the build's own takes precedence where both match. Such compiles are not distributed.
 * Procedural macros that read files from the filesystem may not be cached properly.
 * With linked caching off, sccache identifies procedural macros by their crate metadata. Edits to native code linked into a proc-macro can leave that metadata unchanged.
@@ -15,7 +15,7 @@ If you are using Rust 1.18 or later, you can ask cargo to wrap all compilation w
 
 To compute the cache key of a crate, sccache runs `rustc --emit=dep-info` to list its source files, and `rustc --print file-names` to list its outputs. The server remembers what both found, and reuses it for a later compile of the crate with the same compiler, arguments, working directory, environment, externs, static libraries and target spec, as long as every listed source file still has the same contents. This lasts for the life of the server; nothing is written to the cache. As with the preprocessor cache, a file that was not listed does not invalidate it: for instance, adding `foo/mod.rs` next to an existing `foo.rs` keeps reusing the cached result instead of failing with an ambiguous module error.
 
-## Metadata-only target caching
+## Caching test, binary and proc-macro targets
 
 Set `rust_cache_linked = "check"` at the top level of the server config or
 set `SCCACHE_RUST_CACHE_LINKED=check` when starting the server. The environment
@@ -29,27 +29,27 @@ The stages are cumulative.
 | `off` | Default Rust caching rules |
 | `check` | Also caches tests, binaries, examples, benches and proc-macros when `--emit` includes `metadata` and omits `link` |
 | `proc-macro` | Also caches eligible linked proc-macros |
-| `tests` | Reserved for linked test harnesses |
-| `all` | Reserved for linked binaries, examples and build scripts |
+| `tests` | Also caches eligible linked unit and integration test harnesses |
+| `all` | Also caches eligible linked binaries, examples and build scripts |
 
 The `check` stage derives the `.rmeta` filename directly, including empty
 metadata files for tests and binaries. These lookups appear as Rust hits and misses in `--show-stats`.
 
-## Linked proc-macros
+### Linked outputs
 
-Use `SCCACHE_RUST_CACHE_LINKED=proc-macro` or set `rust_cache_linked = "proc-macro"`
-at the top level of the server config. Restart the server to change the
-setting. The default is `off`. The `tests` and `all` values warn at startup
-and use the `proc-macro` stage. Linked test harnesses, executables, `cdylib`
-and `dylib` currently compile uncached.
+Linked caching supports native Linux GNU targets with a GNU-style linker
+that supports `--dependency-file`. It covers `--crate-type proc-macro`,
+Cargo's `--test` invocations without an explicit crate type, and
+`--crate-type bin`, according to the selected stage. `cdylib` and `dylib`
+compile uncached.
 
-This stage also caches `--crate-type proc-macro` invocations that emit
-`link` on native Linux GNU targets with a GNU-style linker that supports
-`--dependency-file`.
-It restores the shared library via the usual temporary-file rename and can
-use the [disk cache's reflink support](Local.md#reflink-cache-hits).
-sccache regenerates dep-info for each checkout. Dependent Rust crates hash
-the whole ELF dylib, including any native code linked into it.
+sccache restores the output and its mode through a temporary-file rename,
+including with the [disk cache's reflink support](Local.md#reflink-cache-hits).
+The rename leaves any running executable or existing uplifted hard link on its
+old inode. Cargo can then uplift the new executable or run a restored build
+script to regenerate its outputs. sccache regenerates dep-info for each
+checkout. Dependent Rust crates hash the whole ELF proc-macro dylib, including
+any native code linked into it.
 
 The lookup key includes the usual Rust compilation inputs, the linker driver
 and linker executable digests and version output, the target and linker
@@ -68,8 +68,10 @@ are mapped to their relative paths and the manifest verifies the libraries
 in those directories.
 
 Variables read through `env!` or `option_env!` are also hashed verbatim for
-linked outputs. This keeps a path such as `CARGO_MANIFEST_DIR` tied to the
-checkout when the crate embeds it.
+linked outputs. A harness that embeds `CARGO_MANIFEST_DIR`,
+`CARGO_BIN_EXE_*` or `CARGO_TARGET_TMPDIR` will miss when that path changes.
+Files read with `include_bytes!` or `include_str!` are hashed from dep-info,
+including files outside the crate.
 
 On a miss rustc asks the linker to write its dependency file. The cache
 entry includes a manifest of the linker-reported input paths, sizes,
@@ -91,6 +93,14 @@ uncached. A finalized incremental session bypasses the cache. Linked
 compiles run locally. Nonempty `LD_PRELOAD`, `LD_AUDIT`, and
 `CCC_OVERRIDE_OPTIONS` also disable linked caching.
 
+The server skips storing linked compiles whose uncompressed compiler outputs
+exceed `rust_cache_linked_max_entry_bytes` (256 MiB by default). Set
+`SCCACHE_RUST_CACHE_LINKED_MAX_ENTRY` to override it in bytes. Both settings
+are read at server startup. Oversize compiles count under
+**Rust linked: not stored, entry too large** in `--show-stats`
+(`rust_linked_entry_too_large` in JSON). Linked entries share the disk cache's
+normal size limit and reflink accounting.
+
 ## Incremental compilation
 
 Cargo enables incremental compilation for workspace members and path
@@ -110,10 +120,10 @@ environment selects `cache` when the configured mode is `off`.
   cold-session rule to writes.
 
 Set `SCCACHE_RUST_INCREMENTAL=cache` in the build environment as well as on
-the server to bypass cache traffic before connecting. For metadata-only
-targets enabled by `rust_cache_linked`, also set the same linked cache mode
-in the build environment. Keep the client's basedirs settings aligned with
-the server's when using path remapping.
+the server to bypass cache traffic before connecting. For targets enabled by
+`rust_cache_linked`, also set the same linked cache mode in the build environment.
+Keep the client's basedirs settings aligned with the server's when using path
+remapping.
 Warm compiles that bypass in the client do not appear in server statistics.
 
 In either cache mode, a cache miss for a Rust target with a known metadata

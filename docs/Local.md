@@ -53,6 +53,8 @@ When the daemon compiles an object on a miss, it also tries to clone the aligned
 
 The disk cache limit uses each entry's expected on-disk size. On btrfs with 4 KiB sectors and a `zstd` compression property such as `zstd:1` on the cache directory, sccache estimates the size of raw entries in the background using zstd level 1 on 128 KiB chunks. It saves the estimate in the entry's `user.sccache.weight` extended attribute and reads it when loading the cache index. Other filesystems, existing entries without an estimate, and entries whose extended attributes cannot be read or written count at file length. Set the compression property before starting sccache. The estimate can differ from actual btrfs allocation.
 
+Linked Rust entries use the same accounting. Their [per-entry size cap](Rust.md#linked-outputs) applies to uncompressed compiler outputs before the entry is written.
+
 Eviction removes the cache's reference to shared extents. Reflinked worktree outputs remain intact through copy-on-write, and the filesystem frees those extents only when their last reference is gone.
 
 Older sccache versions treat hits on uncompressed entries as misses. Remove `reflink` from the TOML configuration before starting an older version.

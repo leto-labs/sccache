@@ -411,6 +411,12 @@ pub struct OpenCacheObject {
     file: fs::File,
 }
 
+impl OpenCacheObject {
+    pub(crate) fn size(&self) -> io::Result<u64> {
+        Ok(self.file.metadata()?.len())
+    }
+}
+
 /// Data to be stored in the compiler cache.
 pub struct CacheWrite {
     zip: ZipWriter<Cursor<Vec<u8>>>,

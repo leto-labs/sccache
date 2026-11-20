@@ -866,15 +866,30 @@ where
                                 error.downcast::<ProcessError>().map(|ProcessError(output)| (output, None))
                             });
                         match result {
-                            Ok((output, veto)) => {
+                            Ok((output, mut veto)) => {
                                 if output.status.success() && veto.is_none() {
                                     // Keep the linked output paired with the manifest while it is captured.
-                                    linked_outputs = Some(CacheWrite::open_objects(outputs.iter().cloned()));
-                                    let linked = linked.clone();
-                                    match pool.spawn_blocking(move || linked.finish_capture(&capture)).await {
-                                        Ok(Ok(manifest)) => link_manifest = Some(manifest),
-                                        Ok(Err(error)) => debug!("Could not record Rust link inputs: {error:#}"),
-                                        Err(error) => debug!("Could not verify Rust link inputs: {error:#}"),
+                                    let opened = CacheWrite::open_objects(outputs.iter().cloned())
+                                        .and_then(|objects| {
+                                            let size = objects.iter().try_fold(0_u64, |size, object| {
+                                                object.size().map(|len| size.saturating_add(len))
+                                            })?;
+                                            Ok((objects, size))
+                                        });
+                                    match opened {
+                                        Ok((_, size)) if size > service.rust_cache_linked_max_entry_bytes => {
+                                            veto = Some(CacheStoreVeto::RustLinkedEntryTooLarge);
+                                        }
+                                        Ok((objects, _)) => {
+                                            linked_outputs = Some(objects);
+                                            let linked = linked.clone();
+                                            match pool.spawn_blocking(move || linked.finish_capture(&capture)).await {
+                                                Ok(Ok(manifest)) => link_manifest = Some(manifest),
+                                                Ok(Err(error)) => debug!("Could not record Rust link inputs: {error:#}"),
+                                                Err(error) => debug!("Could not verify Rust link inputs: {error:#}"),
+                                            }
+                                        }
+                                        Err(error) => debug!("Could not open Rust link outputs: {error:#}"),
                                     }
                                 }
                                 Some((Cacheable::Yes, DistType::NoDist, output, veto))
@@ -971,9 +986,10 @@ where
                     optional: false,
                 });
                 let outputs = if let Some(outputs) = linked_outputs {
-                    outputs.and_then(|mut outputs| {
-                        outputs.extend(CacheWrite::open_objects(link_object)?);
-                        Ok(outputs)
+                    let mut outputs = outputs;
+                    CacheWrite::open_objects(link_object).map(|manifest| {
+                        outputs.extend(manifest);
+                        outputs
                     })
                 } else {
                     CacheWrite::open_objects(outputs)
@@ -1448,6 +1464,7 @@ pub struct CacheWriteInfo {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheStoreVeto {
     RustIncrementalSession,
+    RustLinkedEntryTooLarge,
 }
 
 pub struct CacheWriteFuture {
