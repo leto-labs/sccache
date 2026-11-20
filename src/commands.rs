@@ -342,7 +342,7 @@ fn run_server_process(config: &Config) -> Result<ServerStartup> {
 fn warn_rust_cache_linked_fallback(config: &Config) {
     if config.rust_cache_linked != config.rust_cache_linked.effective() {
         eprintln!(
-            "sccache: configured rust_cache_linked stage is not implemented yet, using check"
+            "sccache: configured rust_cache_linked stage is not implemented yet, using proc-macro"
         );
     }
 }

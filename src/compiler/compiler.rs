@@ -27,6 +27,7 @@ use crate::compiler::nvcc::Nvcc;
 use crate::compiler::nvcc::NvccHostCompiler;
 use crate::compiler::nvhpc::Nvhpc;
 use crate::compiler::ptxas::Ptxas;
+use crate::compiler::rust::linked;
 use crate::compiler::rust::{Rust, RustupProxy};
 use crate::compiler::tasking_vx::TaskingVX;
 use crate::config::{RustCacheLinked, RustIncrementalSettings};
@@ -665,12 +666,16 @@ where
                 manifest,
             }) => (key, compilation, weak_toolchain_key, manifest),
         };
+        let linked = compilation.linked_cache().cloned();
+        let dist_client = if linked.is_some() { None } else { dist_client };
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
         let cache_status = async {
             if cache_control == CacheControl::ForceNoCache {
                 Ok(Cache::None)
+            } else if linked.as_ref().is_some_and(|linked| !linked.available()) {
+                Ok(Cache::Miss)
             } else if cache_control == CacheControl::ForceRecache {
                 Ok(Cache::Recache)
             } else {
@@ -683,7 +688,23 @@ where
         // ahead ourselves with a compilation.
         let timeout = cache_read_timeout();
         let cache_status = async {
-            let res = tokio::time::timeout(timeout, cache_status).await;
+            let verify = async {
+                let cached = cache_status.await?;
+                match (linked.clone(), cached) {
+                    (Some(linked), Cache::Hit(mut entry)) => pool
+                        .spawn_blocking(move || match linked.verify(&mut entry) {
+                            Ok(()) => Cache::Hit(entry),
+                            Err(error) => {
+                                debug!("Rust link manifest rejected: {error:#}");
+                                Cache::Miss
+                            }
+                        })
+                        .await
+                        .context("could not verify the Rust link manifest"),
+                    (_, cached) => Ok(cached),
+                }
+            };
+            let res = tokio::time::timeout(timeout, verify).await;
             let duration = start.elapsed();
             (res, duration)
         };
@@ -792,7 +813,7 @@ where
                 let start = Instant::now();
 
                 #[cfg(feature = "dist-client")]
-                if may_dist
+                if dist_client.is_some()
                     && !compilation.is_locally_preprocessed()
                     && cache_control == CacheControl::Default
                 {
@@ -823,16 +844,64 @@ where
                         .await;
                 }
 
-                let (cacheable, dist_type, compiler_result, veto) = dist_or_local_compile(
-                    service,
-                    dist_client,
-                    creator,
-                    cwd,
-                    compilation,
-                    weak_toolchain_key,
-                    out_pretty.clone(),
-                )
-                .await?;
+                let mut link_manifest = None;
+                let mut linked_outputs = None;
+                let capture = if let Some(linked) = &linked
+                    && linked.available()
+                    && miss_type != MissType::ForcedNoCache
+                {
+                    linked.capture().and_then(|capture| {
+                        let command = compilation.compile_with_linker_depfile(&capture.path)?
+                            .context("could not pass a dependency file to the Rust linker")?;
+                        Ok(Some((linked, capture, command)))
+                    })
+                } else {
+                    Ok(None)
+                };
+                let captured = match capture {
+                    Ok(Some((linked, capture, command))) => {
+                        match run_local_compile(&*command, service, &creator).await {
+                            Ok((output, veto)) if output.status.success() => {
+                                if veto.is_none() {
+                                    // Keep the linked output paired with the manifest while it is captured.
+                                    linked_outputs = Some(CacheWrite::open_objects(outputs.iter().cloned()));
+                                    let linked = linked.clone();
+                                    match pool.spawn_blocking(move || linked.finish_capture(&capture)).await {
+                                        Ok(Ok(manifest)) => link_manifest = Some(manifest),
+                                        Ok(Err(error)) => debug!("Could not record Rust link inputs: {error:#}"),
+                                        Err(error) => debug!("Could not verify Rust link inputs: {error:#}"),
+                                    }
+                                }
+                                Some((Cacheable::Yes, DistType::NoDist, output, veto))
+                            }
+                            Ok(_) => None,
+                            Err(error) => {
+                                debug!("Could not compile Rust with a linker dependency file: {error:#}");
+                                None
+                            }
+                        }
+                    }
+                    Ok(None) => None,
+                    Err(error) => {
+                        debug!("Could not prepare Rust link dependency capture: {error:#}");
+                        None
+                    }
+                };
+                let (cacheable, dist_type, compiler_result, veto) = match captured {
+                    Some(result) => result,
+                    _ => {
+                        dist_or_local_compile(
+                            service,
+                            dist_client,
+                            creator,
+                            cwd,
+                            compilation,
+                            weak_toolchain_key,
+                            out_pretty.clone(),
+                        )
+                        .await?
+                    }
+                };
                 let duration_compilation = start.elapsed();
                 if !compiler_result.status.success() {
                     debug!(
@@ -880,13 +949,31 @@ where
                         compiler_result,
                     ));
                 }
+                if linked.is_some() && link_manifest.is_none() {
+                    return Ok((
+                        CompileResult::NotCacheable(dist_type, duration_compilation),
+                        compiler_result,
+                    ));
+                }
                 debug!(
                     "[{}]: Compiled in {}, storing in cache",
                     out_pretty,
                     fmt_duration_as_secs(&duration_compilation)
                 );
                 // Hold these inodes before replying. A later compile can replace the paths.
-                let outputs = CacheWrite::open_objects(outputs);
+                let link_object = link_manifest.as_ref().map(|manifest| FileObjectSource {
+                    key: linked::MEMBER.to_owned(),
+                    path: manifest.path().to_owned(),
+                    optional: false,
+                });
+                let outputs = if let Some(outputs) = linked_outputs {
+                    outputs.and_then(|mut outputs| {
+                        outputs.extend(CacheWrite::open_objects(link_object)?);
+                        Ok(outputs)
+                    })
+                } else {
+                    CacheWrite::open_objects(outputs)
+                };
                 let stdout = compiler_result.stdout.clone();
                 let stderr = compiler_result.stderr.clone();
                 let write_key = key.clone();
@@ -1229,6 +1316,17 @@ where
 
     fn is_locally_preprocessed(&self) -> bool {
         true
+    }
+
+    fn linked_cache(&self) -> Option<&linked::LinkedCompilation> {
+        None
+    }
+
+    fn compile_with_linker_depfile(
+        &self,
+        _path: &Path,
+    ) -> Result<Option<Box<dyn CompileCommand<T>>>> {
+        Ok(None)
     }
 
     /// Adjust the stdout replayed from a cache hit for this compilation.

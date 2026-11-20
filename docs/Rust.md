@@ -9,8 +9,7 @@ sccache includes support for caching Rust compilation. This includes many caveat
 * With `SCCACHE_BASEDIRS`, the values of variables read with `env!` or `option_env!` are hashed with the basedirs stripped, so a crate that bakes `env!("CARGO_MANIFEST_DIR")` into its outputs can get a cache hit from another checkout and use that checkout's path. `SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS=CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH` hashes those values verbatim, so only the crates that read them are cached per checkout. A procedural macro that reads the variable with `std::env::var` is not covered, as rustc does not list it in the dep-info. Listing `OUT_DIR` would stop sharing every crate that `include!`s generated code.
 * With `SCCACHE_BASEDIRS`, a hit can restore a crate compiled in another checkout, with that checkout's paths in its metadata and debug info. With `SCCACHE_BASEDIRS_REMAP_PATHS=1` in the environment of the compile, sccache passes rustc `--remap-path-prefix` so that these outputs are the same in every checkout. Paths under a basedir that holds the working directory become relative to the working directory, so diagnostics still lead to the files, but the compilation directory in the debug info is `.` and a debugger has to be started in the directory cargo ran rustc in. Other paths under a basedir that holds the output directory, such as the `OUT_DIR` of a crates.io dependency, are written under `/sccache/basedir`, which names no local file. A `--remap-path-prefix` of the build's own takes precedence where both match. Such compiles are not distributed.
 * Procedural macros that read files from the filesystem may not be cached properly.
-* A procedural macro is identified by its crate metadata, so a change to native code it links, with no change to its Rust source or dependencies, is not seen.
-* Crates that invoke the system linker cannot be cached. Examples are `bin`, `dylib`, `cdylib`, and `proc-macro` crates.
+* With linked caching off, sccache identifies procedural macros by their crate metadata. Edits to native code linked into a proc-macro can leave that metadata unchanged.
 
 If you are using Rust 1.18 or later, you can ask cargo to wrap all compilation with sccache by setting `RUSTC_WRAPPER=sccache` in your build environment.
 
@@ -29,13 +28,68 @@ The stages are cumulative.
 | --- | --- |
 | `off` | Default Rust caching rules |
 | `check` | Also caches tests, binaries, examples, benches and proc-macros when `--emit` includes `metadata` and omits `link` |
-| `proc-macro` | Reserved for linked proc-macros |
+| `proc-macro` | Also caches eligible linked proc-macros |
 | `tests` | Reserved for linked test harnesses |
 | `all` | Reserved for linked binaries, examples and build scripts |
 
-The reserved stages warn at startup and use `check`. The `check` stage derives
-the `.rmeta` filename directly, including empty metadata files for tests and
-binaries. These lookups appear as Rust hits and misses in `--show-stats`.
+The `check` stage derives the `.rmeta` filename directly, including empty
+metadata files for tests and binaries. These lookups appear as Rust hits and misses in `--show-stats`.
+
+## Linked proc-macros
+
+Use `SCCACHE_RUST_CACHE_LINKED=proc-macro` or set `rust_cache_linked = "proc-macro"`
+at the top level of the server config. Restart the server to change the
+setting. The default is `off`. The `tests` and `all` values warn at startup
+and use the `proc-macro` stage. Linked test harnesses, executables, `cdylib`
+and `dylib` currently compile uncached.
+
+This stage also caches `--crate-type proc-macro` invocations that emit
+`link` on native Linux GNU targets with a GNU-style linker that supports
+`--dependency-file`.
+It restores the shared library via the usual temporary-file rename and can
+use the [disk cache's reflink support](Local.md#reflink-cache-hits).
+sccache regenerates dep-info for each checkout. Dependent Rust crates hash
+the whole ELF dylib, including any native code linked into it.
+
+The lookup key includes the usual Rust compilation inputs, the linker driver
+and linker executable digests and version output, the target and linker
+arguments including ordered library search paths, and these environment
+variables.
+
+- `LIBRARY_PATH`, `LD_LIBRARY_PATH`, `LD_RUN_PATH`, `GCC_EXEC_PREFIX`, and
+  `COMPILER_PATH`
+- `SOURCE_DATE_EPOCH`, `SDKROOT`, `MACOSX_DEPLOYMENT_TARGET`,
+  `CCC_OVERRIDE_OPTIONS`, `LDEMULATION`, and variables prefixed with
+  `MOLD_` or `LLD_`
+
+The linker environment is hashed verbatim with one exception. Cargo puts
+checkout-specific directories in `LD_LIBRARY_PATH`, so entries under a basedir
+are mapped to their relative paths and the manifest verifies the libraries
+in those directories.
+
+Variables read through `env!` or `option_env!` are also hashed verbatim for
+linked outputs. This keeps a path such as `CARGO_MANIFEST_DIR` tied to the
+checkout when the crate embeds it.
+
+On a miss rustc asks the linker to write its dependency file. The cache
+entry includes a manifest of the linker-reported input paths, sizes,
+modification times, and content digests. It omits objects and other temporary
+files generated by rustc for that invocation. Paths under the sysroot or a
+configured basedir are resolved against the current build's corresponding
+directory. A hit requires every recorded file to exist and have the same
+content digest. sccache also checks relevant files in the library search
+directories so a newly shadowing library can invalidate the entry. Use
+trusted linkers, compiler drivers, toolchains, and cache storage. The check
+depends on the linker's report and the same input-tracking rules for
+procedural macros and compiler plugins as ordinary Rust caching.
+
+sccache skips storing a compile whose linker produces no usable dependency
+file. It runs unsupported linker flavors, multiple crate types, enabled
+rpath, linker-plugin LTO, explicit LTO, coverage, profile generation or use,
+sanitizers, link-dead-code, save-temps, thin archives, and split debuginfo other than `off`
+uncached. A finalized incremental session bypasses the cache. Linked
+compiles run locally. Nonempty `LD_PRELOAD`, `LD_AUDIT`, and
+`CCC_OVERRIDE_OPTIONS` also disable linked caching.
 
 ## Incremental compilation
 

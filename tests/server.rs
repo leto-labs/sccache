@@ -254,7 +254,9 @@ exec rustc "$@"
             .wait()
             .assert()
             .success()
-            .stderr(predicate::str::contains("not implemented yet, using check"));
+            .stderr(predicate::str::contains(
+                "not implemented yet, using proc-macro",
+            ));
     }
 
     #[test_case(None ; "stop RPC")]
