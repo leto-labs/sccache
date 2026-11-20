@@ -669,16 +669,19 @@ pub fn exit_status_from_code(code: i32) -> process::ExitStatus {
 }
 
 /// Write `data` to `writer` with bincode serialization, prefixed by a `u32` length.
-pub fn write_length_prefixed_bincode<W, S>(mut writer: W, data: S) -> Result<()>
+pub fn write_length_prefixed_bincode<W, S>(writer: W, data: S) -> Result<()>
 where
     W: Write,
     S: Serialize,
 {
-    let bytes = bincode::serialize(&data)?;
+    write_length_prefixed_bytes(writer, &bincode::serialize(&data)?)
+}
+
+pub(crate) fn write_length_prefixed_bytes(mut writer: impl Write, bytes: &[u8]) -> Result<()> {
     let mut len = [0; 4];
     BigEndian::write_u32(&mut len, bytes.len() as u32);
     writer.write_all(&len)?;
-    writer.write_all(&bytes)?;
+    writer.write_all(bytes)?;
     writer.flush()?;
     Ok(())
 }

@@ -14,7 +14,7 @@
 
 use crate::errors::*;
 use crate::net::Connection;
-use crate::protocol::{Request, Response};
+use crate::protocol::{self, Request, Response};
 use crate::util;
 use backon::BlockingRetryable;
 use byteorder::{BigEndian, ByteOrder};
@@ -41,7 +41,7 @@ impl ServerConnection {
     /// Send `request` to the server, read and return a `Response`.
     pub fn request(&mut self, request: Request) -> Result<Response> {
         trace!("ServerConnection::request");
-        util::write_length_prefixed_bincode(&mut self.writer, request)?;
+        util::write_length_prefixed_bytes(&mut self.writer, &protocol::encode_request(&request)?)?;
         trace!("ServerConnection::request: sent request");
         self.read_one_response()
     }
@@ -64,7 +64,7 @@ impl ServerConnection {
         let mut data = vec![0; len as usize];
         self.reader.read_exact(&mut data)?;
         trace!("Done reading");
-        Ok(bincode::deserialize(&data)?)
+        Ok(protocol::decode_response(&data)?)
     }
 }
 
