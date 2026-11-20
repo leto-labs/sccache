@@ -1054,5 +1054,18 @@ mod test {
         assert!(b.verify(&mut entry).is_err());
         fs::remove_file(path).unwrap();
         assert!(b.verify(&mut entry).is_err());
+
+        let path = a.cwd.join("libanswer.a");
+        fs::write(&path, "changed after capture started").unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_modified(capture.start + Duration::from_secs(1))
+            .unwrap();
+        let error = a.finish_capture(&capture).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("link input changed while compiling")
+        );
     }
 }

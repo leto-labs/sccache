@@ -860,9 +860,14 @@ where
                 };
                 let captured = match capture {
                     Ok(Some((linked, capture, command))) => {
-                        match run_local_compile(&*command, service, &creator).await {
-                            Ok((output, veto)) if output.status.success() => {
-                                if veto.is_none() {
+                        let result = run_local_compile(&*command, service, &creator)
+                            .await
+                            .or_else(|error| {
+                                error.downcast::<ProcessError>().map(|ProcessError(output)| (output, None))
+                            });
+                        match result {
+                            Ok((output, veto)) => {
+                                if output.status.success() && veto.is_none() {
                                     // Keep the linked output paired with the manifest while it is captured.
                                     linked_outputs = Some(CacheWrite::open_objects(outputs.iter().cloned()));
                                     let linked = linked.clone();
@@ -874,7 +879,6 @@ where
                                 }
                                 Some((Cacheable::Yes, DistType::NoDist, output, veto))
                             }
-                            Ok(_) => None,
                             Err(error) => {
                                 debug!("Could not compile Rust with a linker dependency file: {error:#}");
                                 None
