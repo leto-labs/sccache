@@ -1,7 +1,10 @@
 // Any copyright is dedicated to the Public Domain.
 // http://creativecommons.org/publicdomain/zero/1.0/
 
-use super::{CARGO, SccacheTest, incremental_stats, restart_sccache, zero_incremental_stats};
+use super::{
+    CARGO, SccacheTest, incremental_crate_dirs, incremental_stats, restart_sccache,
+    zero_incremental_stats,
+};
 use anyhow::{Context, Result, bail};
 use assert_cmd::prelude::*;
 use fs_err as fs;
@@ -533,6 +536,7 @@ fn test_rust_cargo_custom_harnesses(linker_name: &str) -> Result<()> {
             let mut command = fixture.cargo(checkout);
             command
                 .env("CARGO_INCREMENTAL", "1")
+                .env("SCCACHE_RUST_INCREMENTAL", "cache-no-bypass")
                 .env_remove("SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS");
             command
         };
@@ -559,6 +563,8 @@ fn test_rust_cargo_custom_harnesses(linker_name: &str) -> Result<()> {
                     .with_context(|| format!("missing metadata for {name}"))?;
                 assert!(a.join(deps).join(&metadata).is_file());
                 assert!(b.join(deps).join(&metadata).is_file());
+                assert!(incremental_crate_dirs(a, name)?.is_empty());
+                assert!(incremental_crate_dirs(b, name)?.is_empty());
             }
             continue;
         }
@@ -580,6 +586,7 @@ fn test_rust_cargo_custom_harnesses(linker_name: &str) -> Result<()> {
                 let suffix = filename.strip_prefix(&format!("{name}-")).unwrap();
                 assert!(!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
                 assert_ne!(fs::metadata(executable)?.mode() & 0o111, 0);
+                assert!(incremental_crate_dirs(checkout, name)?.is_empty());
             }
             if stage == "proc-macro" {
                 let stats = incremental_stats(test, 0, 0)?;

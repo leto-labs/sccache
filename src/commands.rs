@@ -16,7 +16,7 @@ use crate::cache::{CacheMode, IpcStorage, Storage, storage_from_config};
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry, connect_with_wait};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::{self, ColorMode, is_rmeta_artifact_notification};
-use crate::config::{Config, RustIncremental};
+use crate::config::{Config, RustIncremental, RustIncrementalSettings};
 use crate::jobserver::Client;
 use crate::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
@@ -555,6 +555,7 @@ fn handle_compile_response<T>(
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
+    rust_incremental: RustIncrementalSettings,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -598,6 +599,7 @@ where
         exe,
         cmdline,
         cwd,
+        rust_incremental,
         stdout,
         stderr,
     )
@@ -611,7 +613,7 @@ where
 ///   in which case its copy in compiler's stderr is dropped.
 #[allow(clippy::too_many_arguments)]
 fn handle_compile_result<T>(
-    mut creator: T,
+    creator: T,
     runtime: &mut Runtime,
     response: CompileResponse,
     finished: Option<CompileFinished>,
@@ -619,6 +621,7 @@ fn handle_compile_result<T>(
     exe: &Path,
     cmdline: Vec<OsString>,
     cwd: &Path,
+    rust_incremental: RustIncrementalSettings,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -644,8 +647,38 @@ where
         }
     }
 
+    // A caller that received metadata may already be compiling a dependent.
+    let plain = if forwarded_notification {
+        None
+    } else {
+        compiler::plain_first_build_arguments(exe, &cmdline, cwd, rust_incremental)
+    };
+    let args = plain.as_ref().map_or(cmdline.as_slice(), |(args, _)| args);
+    run_local_compile(
+        creator,
+        runtime,
+        exe,
+        args,
+        cwd,
+        forwarded_notification,
+        stdout,
+        stderr,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_local_compile<T: CommandCreatorSync>(
+    mut creator: T,
+    runtime: &mut Runtime,
+    exe: &Path,
+    args: &[OsString],
+    cwd: &Path,
+    forwarded_notification: bool,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<i32> {
     let mut cmd = creator.new_command_sync(exe);
-    cmd.args(&cmdline).current_dir(cwd);
+    cmd.args(args).current_dir(cwd);
     // `spawn` strips the jobserver from the environment, so without this
     // a compile we run ourselves (bins, tests, proc-macros, links) gets none
     // and rustc makes its own pool of one token per CPU. When it is opened by
@@ -714,6 +747,7 @@ pub fn do_compile<T>(
     cwd: &Path,
     path: Option<OsString>,
     env_vars: Vec<(OsString, OsString)>,
+    rust_incremental: RustIncrementalSettings,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -728,7 +762,16 @@ where
         Err(e) => return Err(e),
     };
     handle_compile_response(
-        creator, runtime, &mut conn, res, &exe_path, cmdline, cwd, stdout, stderr,
+        creator,
+        runtime,
+        &mut conn,
+        res,
+        &exe_path,
+        cmdline,
+        cwd,
+        rust_incremental,
+        stdout,
+        stderr,
     )
 }
 
@@ -747,6 +790,7 @@ pub fn do_compile_client_side<C>(
     cwd: &Path,
     path: Option<OsString>,
     env_vars: Vec<(OsString, OsString)>,
+    client_rust_incremental: RustIncrementalSettings,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<i32>
@@ -768,6 +812,7 @@ where
                 &exe_path,
                 cmdline,
                 cwd,
+                client_rust_incremental,
                 stdout,
                 stderr,
             );
@@ -784,6 +829,7 @@ where
             cwd,
             path,
             env_vars,
+            client_rust_incremental,
             stdout,
             stderr,
         );
@@ -831,6 +877,7 @@ where
         &exe_path,
         cmdline,
         cwd,
+        client_rust_incremental,
         stdout,
         stderr,
     )?;
@@ -1061,15 +1108,13 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 let exe_path = which_in(&exe, env::var_os("PATH"), &cwd)?;
                 let mut runtime = new_client_runtime()?;
                 local.session.refresh_mtime();
-                let result = handle_compile_result(
+                let result = run_local_compile(
                     ProcessCommandCreator::new(&jobserver),
                     &mut runtime,
-                    CompileResponse::UnhandledCompile,
-                    None,
-                    false,
                     &exe_path,
-                    local.arguments,
+                    &local.arguments,
                     &cwd,
+                    false,
                     &mut io::stdout(),
                     &mut io::stderr(),
                 );
@@ -1098,6 +1143,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                             &exe_path,
                             cmdline,
                             &cwd,
+                            config.rust_incremental,
                             &mut io::stdout(),
                             &mut io::stderr(),
                         )
@@ -1122,6 +1168,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                     &cwd,
                     env::var_os("PATH"),
                     env_vars,
+                    config.rust_incremental,
                     &mut io::stdout(),
                     &mut io::stderr(),
                 );
@@ -1137,6 +1184,7 @@ pub fn run_command(cmd: Command) -> Result<i32> {
                 &cwd,
                 env::var_os("PATH"),
                 env_vars,
+                config.rust_incremental,
                 &mut io::stdout(),
                 &mut io::stderr(),
             );
@@ -1272,7 +1320,18 @@ mod test {
         let mut runtime = make_runtime();
         let conn = ServerConnection::new(Box::new(stream)).unwrap();
         let exe = Path::new("rustc");
-        let args = ["input.rs", "-o", "output"].map(OsString::from).to_vec();
+        let args = [
+            "input.rs",
+            "--crate-name=output",
+            "--out-dir=.",
+            "-Cincremental=inc",
+        ]
+        .map(OsString::from)
+        .to_vec();
+        let incremental = RustIncrementalSettings {
+            mode: RustIncremental::Cache,
+            first_build: Default::default(),
+        };
         let path = env::var_os("PATH");
         let mut stdout = vec![];
         let mut stderr = vec![];
@@ -1286,6 +1345,7 @@ mod test {
                 dir.path(),
                 path,
                 vec![],
+                incremental,
                 &mut stdout,
                 &mut stderr,
             )
@@ -1305,12 +1365,14 @@ mod test {
                 dir.path(),
                 path,
                 env_vars,
+                incremental,
                 &mut stdout,
                 &mut stderr,
             )
         };
         server.join().unwrap();
         let output = dir.path().join("output");
+        assert!(!dir.path().join("inc").exists());
         if matches!(reply, CompileServerReply::CompileError) {
             assert_eq!(code.unwrap(), 1);
             assert_eq!(stderr, b"compiler error from server\n");
@@ -1366,15 +1428,13 @@ mod test {
                     OsString::from("sh"),
                     out.into(),
                 ];
-                handle_compile_result(
+                run_local_compile(
                     <ProcessCommandCreator as CommandCreatorSync>::new(client),
                     &mut runtime,
-                    CompileResponse::UnhandledCompile,
-                    None,
-                    false,
                     Path::new("/bin/sh"),
-                    cmdline,
+                    &cmdline,
                     Path::new("/"),
+                    false,
                     &mut vec![],
                     &mut vec![],
                 )
@@ -1454,6 +1514,7 @@ mod test {
             exe,
             cmdline,
             cwd,
+            RustIncrementalSettings::default(),
             &mut stdout,
             &mut stderr,
         )

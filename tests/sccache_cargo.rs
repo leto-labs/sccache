@@ -1189,6 +1189,117 @@ fn incremental_rmeta(checkout: &Path) -> Result<PathBuf> {
     bail!("missing mylib .rmeta in {checkout:?}")
 }
 
+#[test_case(true, false, false; "server unhandled")]
+#[test_case(true, true, false; "client side unhandled")]
+#[test_case(false, false, false; "server unreachable")]
+#[test_case(true, false, true; "incremental first build")]
+#[serial]
+fn test_rust_cargo_incremental_uncached_first_build(
+    server: bool,
+    client_side: bool,
+    incremental_first: bool,
+) -> Result<()> {
+    let test = SccacheTest::new(None)?;
+    let checkout = real_tempdir(&test)?.join("local");
+    fs::create_dir_all(checkout.join("src"))?;
+    fs::create_dir_all(checkout.join("tests"))?;
+    fs::write(
+        checkout.join("Cargo.toml"),
+        "[package]\nname = 'local-bin'\nversion = '0.1.0'\nedition = '2021'\n\
+         [[bin]]\nname = 'local_bin'\npath = 'src/main.rs'\ntest = false\n",
+    )?;
+    fs::write(
+        checkout.join("src/main.rs"),
+        r#"fn main() { println!("bin output"); }"#,
+    )?;
+    let config = checkout.join("sccache.toml");
+    let mut settings = String::from("rust_incremental = 'cache'\nrust_cache_linked = 'off'\n");
+    if incremental_first {
+        settings.push_str("rust_incremental_first_build = 'incremental'\n");
+    }
+    settings.push_str("[server]\nautostart = false\nconnect_wait_secs = 0\n");
+    fs::write(&config, settings)?;
+    if server {
+        restart_sccache(
+            &test,
+            Some(vec![(
+                "SCCACHE_CONF".into(),
+                config.to_str().context("non-Unicode config path")?.into(),
+            )]),
+        )?;
+    } else {
+        stop_sccache()?;
+    }
+
+    let cargo = || {
+        let mut cmd = incremental_cargo(&test, &checkout, "test");
+        cmd.env("SCCACHE_CONF", &config)
+            .env("SCCACHE_CLIENT_SIDE", if client_side { "1" } else { "0" })
+            .env_remove("SCCACHE_RUST_INCREMENTAL")
+            .env("CARGO_INCREMENTAL", "1");
+        cmd
+    };
+
+    let mut previous: Option<(PathBuf, Vec<PathBuf>)> = None;
+    for value in 0..3 {
+        fs::write(
+            checkout.join("tests/local_harness.rs"),
+            format!(
+                r#"
+#[test]
+fn reports_current_value() {{
+    let bin = std::process::Command::new(env!("CARGO_BIN_EXE_local_bin"))
+        .output().unwrap();
+    assert!(bin.status.success());
+    assert_eq!(bin.stdout, b"bin output\n");
+    println!("harness value: {value}");
+}}
+"#
+            ),
+        )?;
+        let build = cargo().arg("--no-run").assert().try_success()?;
+        if !server {
+            build.try_stderr(predicate::str::contains("could not connect to the server"))?;
+        }
+        cargo()
+            .args(["--", "--nocapture"])
+            .assert()
+            .try_success()?
+            .try_stdout(predicate::str::contains(format!("harness value: {value}")))?;
+
+        let bin_dirs = incremental_crate_dirs(&checkout, "local_bin")?;
+        assert_eq!(bin_dirs.len(), usize::from(incremental_first));
+        let harness_dirs = incremental_crate_dirs(&checkout, "local_harness")?;
+        if value == 0 && !incremental_first {
+            assert!(harness_dirs.is_empty(), "{harness_dirs:?}");
+            continue;
+        }
+
+        assert_eq!(harness_dirs.len(), 1, "{harness_dirs:?}");
+        assert!(private_incremental_dirs(&checkout, "local_harness")?.is_empty());
+        assert_no_working_sessions(&checkout, &["local_harness"])?;
+        let sessions: Vec<_> = fs::read_dir(&harness_dirs[0])?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("s-") && entry.path().is_dir()
+            })
+            .map(|entry| entry.path())
+            .collect();
+        assert!(!sessions.is_empty(), "{harness_dirs:?}");
+        if let Some((dir, old_sessions)) = &previous {
+            assert_eq!(&harness_dirs[0], dir);
+            assert!(
+                sessions
+                    .iter()
+                    .any(|session| !old_sessions.contains(session))
+            );
+        }
+        previous = Some((harness_dirs[0].clone(), sessions));
+    }
+    Ok(())
+}
+
 fn zero_incremental_stats() -> Result<()> {
     Command::new(SCCACHE_BIN.as_os_str())
         .arg("--zero-stats")
