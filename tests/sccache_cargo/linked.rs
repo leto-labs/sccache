@@ -25,6 +25,7 @@ fn native() {
 }
 "#;
 
+#[derive(Clone, Copy)]
 struct Linker {
     driver: &'static str,
     fuse_ld: Option<&'static str>,
@@ -479,6 +480,132 @@ fn test_rust_cargo_linked_harness_verbatim_paths() -> Result<()> {
         assert_ne!(keys[0], keys[1]);
     }
     tests(b).assert().try_success()?;
+    Ok(())
+}
+
+#[test_case("rust-lld")]
+#[test_case("mold")]
+#[test_case("bfd")]
+#[serial]
+fn test_rust_cargo_custom_harnesses(linker_name: &str) -> Result<()> {
+    let Some(linker) = Linker::probe(linker_name)? else {
+        return Ok(());
+    };
+    for stage in ["check", "proc-macro", "tests"] {
+        let fixture = Fixture::new(
+            linker,
+            stage,
+            &[("SCCACHE_RUST_INCREMENTAL", "cache-no-bypass")],
+        )?;
+        let Fixture { test, a, b, .. } = &fixture;
+        for (checkout, value) in [(a, "11"), (b, "22")] {
+            write_package(
+                checkout,
+                "custom-harnesses",
+                r#"
+                    [workspace]
+                    [[test]]
+                    name = "custom"
+                    harness = false
+                    [[test]]
+                    name = "plain"
+                    harness = false
+                "#,
+                &[
+                    ("fixture.txt", value),
+                    (
+                        "tests/custom.rs",
+                        r#"
+                            fn main() {
+                                let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+                                let value = std::fs::read_to_string(path.join("fixture.txt")).unwrap();
+                                assert_eq!(value, std::fs::read_to_string("fixture.txt").unwrap());
+                                println!("custom: {value}");
+                            }
+                        "#,
+                    ),
+                    ("tests/plain.rs", r#"fn main() { println!("plain: 42"); }"#),
+                ],
+            )?;
+        }
+
+        let cargo = |checkout| {
+            let mut command = fixture.cargo(checkout);
+            command
+                .env("CARGO_INCREMENTAL", "1")
+                .env_remove("SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS");
+            command
+        };
+        if stage == "check" {
+            for (checkout, hits, misses) in [(a, 0, 2), (b, 2, 0)] {
+                zero_incremental_stats()?;
+                cargo(checkout)
+                    .args(["check", "--offline", "--all-targets"])
+                    .assert()
+                    .try_success()?;
+                incremental_stats(test, hits, misses)?;
+            }
+            let deps = Path::new("target/debug/deps");
+            for name in ["custom", "plain"] {
+                let prefix = format!("lib{name}-");
+                let metadata = fs::read_dir(a.join(deps))?
+                    .map(|entry| entry.map(|entry| entry.file_name()))
+                    .collect::<std::io::Result<Vec<_>>>()?
+                    .into_iter()
+                    .find(|name| {
+                        let name = name.to_string_lossy();
+                        name.starts_with(&prefix) && name.ends_with(".rmeta")
+                    })
+                    .with_context(|| format!("missing metadata for {name}"))?;
+                assert!(a.join(deps).join(&metadata).is_file());
+                assert!(b.join(deps).join(&metadata).is_file());
+            }
+            continue;
+        }
+
+        for checkout in [a, b] {
+            zero_incremental_stats()?;
+            let artifacts =
+                test_artifacts(cargo(checkout).args(["test", "--offline", "--no-run"]))?;
+            for name in ["custom", "plain"] {
+                let executable = &artifacts[name];
+                assert_eq!(
+                    executable.parent(),
+                    Some(checkout.join("target/debug/deps").as_path())
+                );
+                let filename = executable
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap();
+                let suffix = filename.strip_prefix(&format!("{name}-")).unwrap();
+                assert!(!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                assert_ne!(fs::metadata(executable)?.mode() & 0o111, 0);
+            }
+            if stage == "proc-macro" {
+                let stats = incremental_stats(test, 0, 0)?;
+                assert_eq!(stats["not_cached"]["crate-type"], 2);
+                assert_eq!(stats["cache_writes"], 0);
+            } else if checkout == a {
+                incremental_stats(test, 0, 2)?;
+            } else {
+                incremental_stats(test, 1, 1)?;
+            }
+        }
+        if stage == "tests" {
+            assert_eq!(fixture.miss_keys("plain")?.len(), 1);
+            let keys = fixture.miss_keys("custom")?;
+            assert_eq!(keys.len(), 2);
+            assert_ne!(keys[0], keys[1]);
+            cargo(b)
+                .args(["test", "--offline"])
+                .assert()
+                .try_success()?
+                .try_stdout(
+                    predicate::str::contains("custom: 22")
+                        .and(predicate::str::contains("plain: 42")),
+                )?;
+        }
+    }
     Ok(())
 }
 

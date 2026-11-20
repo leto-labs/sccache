@@ -40,6 +40,7 @@ fn linker_env(name: &OsStr) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Options {
     pub(super) kind: &'static str,
+    implicit_bin: bool,
     driver: Option<String>,
     flavor: Option<String>,
     target: Option<String>,
@@ -50,10 +51,12 @@ pub(super) struct Options {
 impl Options {
     pub(super) fn parse(
         kind: &'static str,
+        implicit_bin: bool,
         arguments: &[Argument<ArgData>],
     ) -> std::result::Result<Self, &'static str> {
         let mut options = Self {
             kind,
+            implicit_bin,
             driver: None,
             flavor: None,
             target: None,
@@ -146,6 +149,19 @@ impl Options {
         }
         options.uses_driver()?;
         Ok(options)
+    }
+
+    pub(super) fn output_name<'a>(
+        &self,
+        outputs: &'a [String],
+        executable_name: &str,
+    ) -> Result<Option<&'a str>> {
+        match outputs {
+            [name] if !self.implicit_bin || name == executable_name => Ok(Some(name)),
+            // Crate-level attributes can override rustc's default crate type.
+            _ if self.implicit_bin => Ok(None),
+            _ => bail!("expected one output from linked Rust compilation"),
+        }
     }
 
     pub(super) fn uses_driver(&self) -> std::result::Result<bool, &'static str> {
@@ -912,6 +928,31 @@ mod test {
     use super::*;
     use crate::cache::CacheWrite;
     use std::io::Cursor;
+
+    #[test]
+    fn test_linked_implicit_bin_output_name() {
+        let options = Options::parse("test", true, &[]).unwrap();
+        let executable = "foo-abc".to_owned();
+        let library = "libfoo-abc.so".to_owned();
+        assert_eq!(
+            options
+                .output_name(std::slice::from_ref(&executable), "foo-abc")
+                .unwrap(),
+            Some("foo-abc")
+        );
+        assert_eq!(
+            options
+                .output_name(std::slice::from_ref(&library), "foo-abc")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            options
+                .output_name(&[executable, library], "foo-abc")
+                .unwrap(),
+            None
+        );
+    }
 
     #[test]
     fn test_linked_refuses_thin_archives() {

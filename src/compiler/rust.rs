@@ -1819,6 +1819,7 @@ fn parse_argument_iter(
     };
     let mut linked_crate_type: Option<&'static str> = None;
     let mut is_test = false;
+    let mut has_test_cfg = false;
     let mut extra_filename = None;
     let mut externs = vec![];
     let mut sysroot_proc_macro = false;
@@ -1950,7 +1951,9 @@ fn parse_argument_iter(
             Some(Json(_)) => {
                 has_json = true;
             }
-            Some(PassThrough(_)) => (),
+            Some(PassThrough(value)) => {
+                has_test_cfg |= arg.flag_str() == Some("--cfg") && value == "test";
+            }
             Some(Target(target)) => match target {
                 ArgTarget::Path(json_path) => target_json = Some(json_path.to_owned()),
                 ArgTarget::Unsure(_) => cannot_cache!("target unsure"),
@@ -2009,16 +2012,21 @@ fn parse_argument_iter(
             .as_ref()
             .is_some_and(|emit| emit.contains("metadata") && !emit.contains("link"));
     let library = crate_types.rlib || crate_types.staticlib;
+    // Cargo omits the crate type for custom test harnesses and passes --cfg test.
+    let implicit_kind = (!library).then_some(if is_test || has_test_cfg {
+        "test"
+    } else {
+        "bin"
+    });
     let linked_kind = if cfg!(target_os = "linux")
         && emit.as_ref().is_some_and(|emit| emit.contains("link"))
     {
         match (is_test, linked_crate_type, rust_cache_linked) {
-            (true, None, RustCacheLinked::Tests | RustCacheLinked::All) => {
-                if library {
-                    cannot_cache!("crate-type", "explicit library type with --test".to_owned());
-                }
-                Some("test")
+            (true, None, RustCacheLinked::Tests | RustCacheLinked::All) if library => {
+                cannot_cache!("crate-type", "explicit library type with --test".to_owned());
             }
+            (_, None, RustCacheLinked::Tests) if implicit_kind == Some("test") => implicit_kind,
+            (_, None, RustCacheLinked::All) => implicit_kind,
             (false, Some("proc-macro"), stage) if stage.caches_proc_macros() => Some("proc-macro"),
             (false, Some("bin"), RustCacheLinked::All) => Some("bin"),
             _ => None,
@@ -2056,8 +2064,7 @@ fn parse_argument_iter(
         return CompilerArguments::NotCompilation;
     }
     let linked_check = if linked_check_enabled {
-        // --test implies an executable even when Cargo omits --crate-type.
-        linked_crate_type.or((is_test && !library).then_some("test"))
+        linked_crate_type.or(implicit_kind)
     } else {
         None
     };
@@ -2075,7 +2082,7 @@ fn parse_argument_iter(
             cannot_cache!("linked compilation with grouped codegen flags");
         }
         Some(try_or_cannot_cache!(
-            linked::Options::parse(kind, &args),
+            linked::Options::parse(kind, !is_test && linked_crate_type.is_none(), &args),
             "linked Rust options"
         ))
     } else {
@@ -3028,14 +3035,41 @@ where
             outputs.retain(|o| o.ends_with(".rlib") || o.ends_with(".rmeta"));
         }
 
-        let linked_output = linked_options
-            .map(|_| {
-                let [name] = outputs.as_slice() else {
-                    bail!("expected one output from linked Rust compilation");
-                };
-                Ok(cwd.join(self.parsed_args.output_dir.join(name)))
-            })
-            .transpose()?;
+        let plain_first_build = incremental.is_some()
+            && self.incremental_settings.first_build == RustIncrementalFirstBuild::Plain;
+        let (linked, first_build_output) = if let Some(options) = linked_options {
+            let object_stem = format!(
+                "{}{}",
+                self.parsed_args.crate_name,
+                extra_filename_from_args(&self.parsed_args.arguments)
+            );
+            let name = options.output_name(&outputs, &object_stem)?;
+            let output = cwd.join(
+                self.parsed_args
+                    .output_dir
+                    .join(name.unwrap_or(&object_stem)),
+            );
+            let first_build_output = (plain_first_build && name.is_some()).then(|| output.clone());
+            (
+                Some(linked::LinkedCompilation {
+                    available: name.and(linker).map(|(_, search)| search),
+                    uses_driver: options.uses_driver().unwrap_or(true),
+                    output,
+                    object_stem,
+                    cwd: cwd.clone(),
+                    sysroot: self.sysroot.clone(),
+                    basedirs: basedirs.to_vec(),
+                }),
+                first_build_output,
+            )
+        } else {
+            let first_build_output = if plain_first_build {
+                self.parsed_args.metadata_output()
+            } else {
+                None
+            };
+            (None, first_build_output)
+        };
 
         if self.parsed_args.emit.contains("metadata") {
             if linked_options.is_some() {
@@ -3139,32 +3173,6 @@ where
             .chain(abs_staticlibs)
             .collect();
 
-        let linked =
-            linked_options
-                .zip(linked_output)
-                .map(|(options, output)| linked::LinkedCompilation {
-                    available: linker.map(|(_, search)| search),
-                    uses_driver: options.uses_driver().unwrap_or(true),
-                    object_stem: format!(
-                        "{}{}",
-                        self.parsed_args.crate_name,
-                        extra_filename_from_args(&self.parsed_args.arguments)
-                    ),
-                    output,
-                    cwd: cwd.clone(),
-                    sysroot: self.sysroot.clone(),
-                    basedirs: basedirs.to_vec(),
-                });
-        let first_build_output = if incremental.is_some()
-            && self.incremental_settings.first_build == RustIncrementalFirstBuild::Plain
-        {
-            linked
-                .as_ref()
-                .map(|linked| linked.output.clone())
-                .or_else(|| self.parsed_args.metadata_output())
-        } else {
-            None
-        };
         Ok(HashResult {
             key: m.finish(),
             manifest,
@@ -4523,51 +4531,58 @@ LLVM version: 15.0.2
         parse_arguments(&args, Path::new("."), RustIncremental::Cache, stage)
     }
 
-    #[test_case("--test", NO_CRATE_TYPE_PASSED, true ; "test metadata")]
-    #[test_case("--test", NO_CRATE_TYPE_PASSED, false ; "test link")]
-    #[test_case("--crate-type=bin", "bin", true ; "bin metadata")]
-    #[test_case("--crate-type=bin", "bin", false ; "bin link")]
-    #[test_case("--crate-type=proc-macro", "proc-macro", true ; "proc macro metadata")]
-    #[test_case("--crate-type=proc-macro", "proc-macro", false ; "proc macro link")]
-    fn test_parse_linked_check(unit: &str, reason: &str, metadata_only: bool) {
+    #[test_case(&["--test"], "test", NO_CRATE_TYPE_PASSED ; "test")]
+    #[test_case(&["--cfg", "test"], "test", NO_CRATE_TYPE_PASSED ; "custom test")]
+    #[test_case(&["--cfg=test"], "test", NO_CRATE_TYPE_PASSED ; "custom test equals cfg")]
+    #[test_case(&[], "bin", NO_CRATE_TYPE_PASSED ; "custom bench")]
+    #[test_case(&["--cfg=feature=\"test\""], "bin", NO_CRATE_TYPE_PASSED ; "test feature")]
+    #[test_case(&["--crate-type=bin"], "bin", "bin" ; "bin")]
+    #[test_case(&["--crate-type=bin", "--cfg", "test"], "bin", "bin" ; "bin with test cfg")]
+    #[test_case(&["--crate-type=proc-macro"], "proc-macro", "proc-macro" ; "proc macro")]
+    fn test_parse_linked_check(unit: &[&str], kind: &str, reason: &str) {
         use RustCacheLinked::{All, Check, Off, ProcMacro, Tests};
 
-        let emit = if metadata_only {
-            "dep-info,metadata"
-        } else {
-            "dep-info,metadata,link"
-        };
         for stage in [Off, Check, ProcMacro, Tests, All] {
-            let parsed = parse_linked_check(stage, emit, &[unit]);
             let links = cfg!(target_os = "linux")
-                && match unit {
-                    "--test" => matches!(stage, Tests | All),
-                    "--crate-type=bin" => stage == All,
-                    "--crate-type=proc-macro" => stage.caches_proc_macros(),
+                && match kind {
+                    "test" => matches!(stage, Tests | All),
+                    "bin" => stage == All,
+                    "proc-macro" => stage.caches_proc_macros(),
                     _ => unreachable!(),
                 };
-            if stage != Off && metadata_only || links {
-                assert!(
-                    matches!(parsed, CompilerArguments::Ok(ref args)
-                        if args.linked.is_some() != metadata_only),
-                    "{parsed:?}"
-                );
-            } else {
-                assert_eq!(
-                    parsed,
-                    CompilerArguments::CannotCache("crate-type", Some(reason.into()))
-                );
+            for (emit, checkable, linkable) in [
+                ("dep-info,metadata", stage != Off, false),
+                ("dep-info,link", false, links),
+                ("dep-info,metadata,link", false, links),
+            ] {
+                let parsed = parse_linked_check(stage, emit, unit);
+                if checkable || linkable {
+                    assert!(
+                        matches!(parsed, CompilerArguments::Ok(ref args)
+                            if args.linked_check == checkable.then_some(kind)
+                            && args.linked.as_ref().map(|options| options.kind)
+                                == linkable.then_some(kind)),
+                        "{stage:?} {unit:?} {emit}: {parsed:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        parsed,
+                        CompilerArguments::CannotCache("crate-type", Some(reason.into())),
+                        "{stage:?} {unit:?} {emit}"
+                    );
+                }
             }
         }
     }
 
-    #[test_case("--test", &[], "" ; "test without suffix")]
-    #[test_case("--crate-type=bin", &["-Cextra-filename=-abc"], "-abc" ; "bin with suffix")]
-    #[test_case("--crate-type=proc-macro", &["-Cextra-filename=-first", "-Cextra_filename=-last"], "-last" ; "proc macro last suffix")]
-    fn test_linked_check_metadata_output(unit: &str, extra: &[&str], suffix: &str) {
-        let args = [&[unit], extra].concat();
+    #[test_case(&["--test"], "" ; "test without suffix")]
+    #[test_case(&["--cfg", "test", "-Cextra-filename=-abc"], "-abc" ; "custom test with suffix")]
+    #[test_case(&[], "" ; "custom bench without suffix")]
+    #[test_case(&["--crate-type=bin", "-Cextra-filename=-abc"], "-abc" ; "bin with suffix")]
+    #[test_case(&["--crate-type=proc-macro", "-Cextra-filename=-first", "-Cextra_filename=-last"], "-last" ; "proc macro last suffix")]
+    fn test_linked_check_metadata_output(args: &[&str], suffix: &str) {
         let CompilerArguments::Ok(parsed) =
-            parse_linked_check(RustCacheLinked::Check, "dep-info,metadata", &args)
+            parse_linked_check(RustCacheLinked::Check, "dep-info,metadata", args)
         else {
             panic!("expected cacheable metadata-only target");
         };
@@ -4587,9 +4602,8 @@ LLVM version: 15.0.2
     #[test_case("dep-info,metadata", &["--crate-type=bin,lib"], "crate-type", Some("bin") ; "mixed library and bin")]
     #[test_case("dep-info,metadata", &["--crate-type=lib", "--crate-type=bin"], "crate-type", Some("bin") ; "bin after lib")]
     #[test_case("dep-info,metadata", &["--crate-type=bin", "--crate-type=lib"], "crate-type", Some("bin") ; "lib after bin")]
-    #[test_case("dep-info,metadata", &[], "crate-type", Some(NO_CRATE_TYPE_PASSED) ; "inferred crate type")]
-    #[test_case("dep-info,metadata,obj", &["--test"], "unsupported --emit", None ; "unsupported emit")]
-    #[test_case("dep-info,metadata", &["--test", "-o", "out/meta"], "-o", None ; "explicit output file")]
+    #[test_case("dep-info,metadata,obj", &["--cfg=test"], "unsupported --emit", None ; "unsupported emit")]
+    #[test_case("dep-info,metadata", &["--cfg=test", "-o", "out/meta"], "-o", None ; "explicit output file")]
     #[test_case("dep-info,metadata", &["--test", "--emit=link"], "more than one --emit", None ; "repeated emit")]
     #[test_case("dep-info,metadata", &["--test", "-Cincremental=inc", "-Csave-temps"], "incremental with save-temps", None ; "incremental with save temps")]
     #[test_case("dep-info,metadata", &["--crate-type=bin", "-Cincremental=inc", "-Csplit-debuginfo=unpacked", "-g"], "incremental with unpacked split debuginfo", None ; "incremental with unpacked debuginfo")]
@@ -6441,7 +6455,12 @@ foo.rs:
             &["-Clinker-flavor=darwin-cc"][..],
             &["-Clinker-flavor=wasm-lld"][..],
         ] {
-            for kind in ["--test", "--crate-type=bin", "--crate-type=proc-macro"] {
+            for kind in [
+                "--test",
+                "--cfg=test",
+                "--crate-type=bin",
+                "--crate-type=proc-macro",
+            ] {
                 assert!(
                     matches!(
                         parse(kind, "--emit=link", flags, All),
