@@ -25,6 +25,8 @@ use crate::config;
 use crate::config::{Config, RustIncremental};
 use crate::dist;
 use crate::jobserver::Client;
+pub use crate::miss_explain::MissExplainStats;
+use crate::miss_explain::{Manifest, MissExplain};
 use crate::mock_command::{CommandCreatorSync, ProcessCommandCreator};
 use crate::protocol::{
     self, Compile, CompileFinished, CompileResponse, Request, Response, StorageHandshakeInfo,
@@ -519,6 +521,9 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     let dist_client = DistClientContainer::new(config, &pool);
 
     let notify = env::var_os("SCCACHE_STARTUP_NOTIFY");
+    let miss_explain = env::var_os("SCCACHE_MISS_EXPLAIN")
+        .filter(|path| !path.is_empty())
+        .map(|path| Arc::new(MissExplain::new(&config.fallback_cache.dir, path.into())));
 
     let raw_storage = match storage_from_config(config, &pool) {
         Ok(storage) => storage,
@@ -573,7 +578,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     storage,
                     cache_mode,
                     config.rust_incremental,
-                );
+                )
+                .with_miss_explain(miss_explain);
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -594,7 +600,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     storage,
                     cache_mode,
                     config.rust_incremental,
-                );
+                )
+                .with_miss_explain(miss_explain);
                 Ok((
                     srv.local_addr().unwrap(),
                     Box::new(move |f| srv.run(f)) as Box<dyn FnOnce(_) -> _>,
@@ -618,7 +625,8 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
                     storage,
                     cache_mode,
                     config.rust_incremental,
-                );
+                )
+                .with_miss_explain(miss_explain);
                 Ok((
                     srv.local_addr()
                         .unwrap_or_else(|| crate::net::SocketAddr::UnixAbstract(p.clone())),
@@ -718,6 +726,11 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             timeout: Duration::from_secs(get_idle_timeout()),
             wait,
         }
+    }
+
+    fn with_miss_explain(mut self, miss_explain: Option<Arc<MissExplain>>) -> Self {
+        self.service.miss_explain = miss_explain;
+        self
     }
 
     /// Configures how long this server will be idle before shutting down.
@@ -915,6 +928,7 @@ where
     effective_cache_mode: CacheMode,
 
     rust_incremental: RustIncremental,
+    pub(crate) miss_explain: Option<Arc<MissExplain>>,
 
     /// A cache of known compiler info.
     compilers: Arc<RwLock<CompilerMap<C>>>,
@@ -1039,6 +1053,7 @@ where
                         preprocessor_cache_mode_config: me.storage.preprocessor_cache_mode_config(),
                         cache_mode: me.effective_cache_mode,
                         rust_incremental: me.rust_incremental,
+                        miss_explain: me.miss_explain.is_some(),
                         max_size: me.storage.max_size().await.unwrap_or(None),
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
@@ -1141,6 +1156,7 @@ where
             storage,
             effective_cache_mode,
             rust_incremental: RustIncremental::Off,
+            miss_explain: None,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1172,6 +1188,7 @@ where
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncremental::Off,
+            miss_explain: None,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt,
@@ -1212,6 +1229,7 @@ where
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
             rust_incremental: RustIncremental::Off,
+            miss_explain: None,
             compilers: Arc::default(),
             compiler_proxies: Arc::default(),
             rt: rt.clone(),
@@ -1316,6 +1334,28 @@ where
     /// See [`SccacheService::notification_tx`] for more.
     pub fn notification_tx(&self) -> Option<&futures::channel::mpsc::UnboundedSender<Vec<u8>>> {
         self.notification_tx.as_ref()
+    }
+
+    pub(crate) async fn record_rust_miss(
+        &self,
+        explainer: Arc<MissExplain>,
+        key: String,
+        manifest: Arc<Manifest>,
+    ) {
+        match self
+            .rt
+            .spawn_blocking(move || explainer.record(&key, &manifest))
+            .await
+        {
+            Ok(Ok(classification)) => self
+                .stats
+                .lock()
+                .await
+                .miss_explain
+                .increment(classification),
+            Ok(Err(err)) => debug!("Could not log Rust cache miss: {err:#}"),
+            Err(err) => debug!("Could not run Rust cache miss logging: {err:#}"),
+        }
     }
 
     async fn merge_stats(&self, delta: ServerStats) {
@@ -2021,6 +2061,8 @@ pub struct ServerStats {
     /// Incremental compiles that did not confirm a cold session.
     #[serde(skip)]
     pub rust_incremental_not_stored: u64,
+    #[serde(skip)]
+    pub miss_explain: MissExplainStats,
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -2060,6 +2102,7 @@ impl std::ops::AddAssign for ServerStats {
             (None, b) => b,
         };
         self.rust_incremental_not_stored += rhs.rust_incremental_not_stored;
+        self.miss_explain += rhs.miss_explain;
     }
 }
 
@@ -2077,7 +2120,7 @@ pub struct ServerInfo {
 }
 
 mod server_info_stats {
-    use super::ServerStats;
+    use super::{MissExplainStats, ServerStats};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[derive(Serialize, Deserialize)]
@@ -2086,6 +2129,8 @@ mod server_info_stats {
         stats: T,
         #[serde(default)]
         rust_incremental_not_stored: u64,
+        #[serde(default)]
+        miss_explain: MissExplainStats,
     }
 
     pub fn serialize<S: Serializer>(stats: &ServerStats, serializer: S) -> Result<S::Ok, S::Error> {
@@ -2093,6 +2138,7 @@ mod server_info_stats {
             StatsJson {
                 stats,
                 rust_incremental_not_stored: stats.rust_incremental_not_stored,
+                miss_explain: stats.miss_explain,
             }
             .serialize(serializer)
         } else {
@@ -2107,8 +2153,10 @@ mod server_info_stats {
             let StatsJson {
                 mut stats,
                 rust_incremental_not_stored,
+                miss_explain,
             } = StatsJson::<ServerStats>::deserialize(deserializer)?;
             stats.rust_incremental_not_stored = rust_incremental_not_stored;
+            stats.miss_explain = miss_explain;
             Ok(stats)
         } else {
             ServerStats::deserialize(deserializer)
@@ -2153,6 +2201,7 @@ impl Default for ServerStats {
             dist_errors: u64::default(),
             multi_level: None,
             rust_incremental_not_stored: 0,
+            miss_explain: Default::default(),
         }
     }
 }
@@ -2246,6 +2295,28 @@ impl ServerStats {
         set_stat!(stats_vec, self.cache_timeouts, "Cache timeouts");
         set_stat!(stats_vec, self.cache_read_errors, "Cache read errors");
         set_stat!(stats_vec, self.forced_recaches, "Forced recaches");
+        if self.miss_explain != MissExplainStats::default() {
+            set_stat!(
+                stats_vec,
+                self.miss_explain.new,
+                "Rust misses explained (new)"
+            );
+            set_stat!(
+                stats_vec,
+                self.miss_explain.own_input,
+                "Rust misses explained (own-input)"
+            );
+            set_stat!(
+                stats_vec,
+                self.miss_explain.dependency,
+                "Rust misses explained (dependency)"
+            );
+            set_stat!(
+                stats_vec,
+                self.miss_explain.unchanged,
+                "Rust misses explained (unchanged)"
+            );
+        }
         if self.rust_incremental_not_stored > 0 {
             set_stat!(
                 stats_vec,

@@ -10,11 +10,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{ArgCodegen, CodeGen, ParsedArguments};
-use crate::compiler::args::Argument;
-use crate::util::{Digest, HashToDigest};
+use super::ParsedArguments;
 use filetime::FileTime;
-use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
@@ -26,54 +23,11 @@ pub(crate) struct IncrementalSession {
 
 impl IncrementalSession {
     pub(super) fn from_parsed(args: &ParsedArguments) -> Option<Self> {
-        let metadata = args
-            .arguments
-            .iter()
-            .filter_map(|arg| match arg.get_data() {
-                Some(CodeGen(ArgCodegen {
-                    opt,
-                    value: Some(value),
-                })) if opt == "metadata" => Some(value.as_str()),
-                _ => None,
-            })
-            .collect();
-        let is_test = args
-            .arguments
-            .iter()
-            .any(|arg| matches!(arg, Argument::UnknownFlag(flag) if flag == "--test"));
-        let crate_types: Vec<_> = [
-            args.crate_types.rlib.then_some("rlib"),
-            args.crate_types.staticlib.then_some("staticlib"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        Some(Self::new(
-            args.incremental_dir.as_deref()?,
-            &args.crate_name,
-            metadata,
-            &crate_types,
-            is_test,
-        ))
-    }
-
-    fn new(
-        dir: &Path,
-        crate_name: &str,
-        mut metadata: Vec<&str>,
-        crate_types: &[&str],
-        is_test: bool,
-    ) -> Self {
-        metadata.sort_unstable();
-        let mut digest = Digest::new();
-        digest.delimiter(b"rust-incremental-argv");
-        (crate_name, metadata, crate_types, is_test).hash(&mut HashToDigest {
-            digest: &mut digest,
-        });
-        let hash = digest.finish();
-        Self {
-            path: dir.join(format!("{crate_name}-sccache-{}", &hash[..16])),
-        }
+        let dir = args.incremental_dir.as_deref()?;
+        let hash = args.unit_hash(b"rust-incremental-argv");
+        Some(Self {
+            path: dir.join(format!("{}-sccache-{}", args.crate_name, &hash[..16])),
+        })
     }
 
     pub(crate) fn refresh_mtime(&self) {

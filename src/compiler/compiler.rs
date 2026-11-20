@@ -581,6 +581,7 @@ where
         storage: Arc<dyn Storage>,
         basedirs: &[Vec<u8>],
         cache_control: CacheControl,
+        explain_miss: bool,
     ) -> Result<HashResult<T>>;
 
     /// Return the state of any `--color` option passed to the compiler.
@@ -638,6 +639,7 @@ where
                 storage.clone(),
                 &basedirs,
                 cache_control,
+                service.miss_explain.is_some(),
             )
             .await;
         debug!(
@@ -645,7 +647,7 @@ where
             out_pretty,
             fmt_duration_as_secs(&start.elapsed())
         );
-        let (key, compilation, weak_toolchain_key) = match result {
+        let (key, compilation, weak_toolchain_key, manifest) = match result {
             Err(e) => {
                 return match e.downcast::<ProcessError>() {
                     Ok(ProcessError(output)) => {
@@ -659,7 +661,8 @@ where
                 key,
                 compilation,
                 weak_toolchain_key,
-            }) => (key, compilation, weak_toolchain_key),
+                manifest,
+            }) => (key, compilation, weak_toolchain_key, manifest),
         };
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
@@ -810,6 +813,15 @@ where
                         .await;
                 }
 
+                let explanation = service.miss_explain.clone().zip(manifest.map(Arc::new));
+                if miss_type == MissType::Normal
+                    && let Some((explainer, manifest)) = &explanation
+                {
+                    service
+                        .record_rust_miss(explainer.clone(), key.clone(), manifest.clone())
+                        .await;
+                }
+
                 let (cacheable, dist_type, compiler_result, veto) = dist_or_local_compile(
                     service,
                     dist_client,
@@ -894,10 +906,21 @@ where
 
                     let start = Instant::now();
                     storage.put(&write_key, entry).await?;
+                    let duration = start.elapsed();
+                    if let Some((explainer, manifest)) = explanation {
+                        match pool
+                            .spawn_blocking(move || explainer.remember(write_key, &manifest))
+                            .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => debug!("Could not store Rust miss history: {err:#}"),
+                            Err(err) => debug!("Could not run Rust miss history write: {err:#}"),
+                        }
+                    }
                     debug!("[{}]: Stored in cache successfully!", out_pretty);
                     Ok(CacheWriteInfo {
                         object_file_pretty: out_pretty,
-                        duration: start.elapsed(),
+                        duration,
                     })
                 };
                 let future = CacheWriteFuture {
@@ -1264,6 +1287,7 @@ where
 {
     /// The hash key of the inputs.
     pub key: String,
+    pub(crate) manifest: Option<crate::miss_explain::Manifest>,
     /// An object to use for the actual compilation, if necessary.
     pub compilation: Box<dyn Compilation<T> + 'static>,
     /// A weak key that may be used to identify the toolchain
@@ -2758,6 +2782,7 @@ LLVM version: 6.0",
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         &[],
                         CacheControl::Default,
+                        false,
                     )
                     .wait()
                     .unwrap()
@@ -2831,6 +2856,7 @@ LLVM version: 6.0",
                     Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                     &[],
                     CacheControl::Default,
+                    false,
                 )
                 .wait()
                 .unwrap()
@@ -2909,6 +2935,7 @@ LLVM version: 6.0",
                     Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                     &[],
                     CacheControl::Default,
+                    false,
                 )
                 .wait()
                 .unwrap()
@@ -3007,6 +3034,7 @@ LLVM version: 6.0",
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         &[],
                         CacheControl::Default,
+                        false,
                     )
                     .wait()
                     .unwrap()
@@ -3075,6 +3103,7 @@ LLVM version: 6.0",
                         Arc::new(MockStorage::new(None, preprocessor_cache_mode)),
                         &[],
                         CacheControl::Default,
+                        false,
                     )
                     .wait()
                     .unwrap()
