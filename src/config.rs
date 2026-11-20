@@ -314,6 +314,7 @@ pub struct DiskCacheConfig {
     pub size: u64,
     pub preprocessor_cache_mode: PreprocessorCacheModeConfig,
     pub rw_mode: CacheModeConfig,
+    pub reflink: bool,
 }
 
 impl Default for DiskCacheConfig {
@@ -323,6 +324,7 @@ impl Default for DiskCacheConfig {
             size: default_disk_cache_size(),
             preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
             rw_mode: CacheModeConfig::ReadWrite,
+            reflink: false,
         }
     }
 }
@@ -866,6 +868,7 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
 #[derive(Debug)]
 pub struct EnvConfig {
     cache: CacheConfigs,
+    disk_reflink: Option<bool>,
     basedirs: Option<Vec<String>>,
     dist_cache_dir: Option<PathBuf>,
     client_side_mode: Option<bool>,
@@ -1247,6 +1250,7 @@ fn config_from_env() -> Result<EnvConfig> {
             parse_size(&v).ok_or_else(|| anyhow!("SCCACHE_CACHE_SIZE value is invalid: {v:?}"))
         })
         .transpose()?;
+    let disk_reflink = bool_from_env_var("SCCACHE_DISK_REFLINK")?;
 
     let mut preprocessor_mode_config = PreprocessorCacheModeConfig::activated();
     let preprocessor_mode_overridden = if let Some(value) = bool_from_env_var("SCCACHE_DIRECT")? {
@@ -1272,6 +1276,7 @@ fn config_from_env() -> Result<EnvConfig> {
             size: disk_sz.unwrap_or_else(default_disk_cache_size),
             preprocessor_cache_mode: preprocessor_mode_config,
             rw_mode: disk_rw_mode,
+            reflink: false,
         })
     } else {
         None
@@ -1329,6 +1334,7 @@ fn config_from_env() -> Result<EnvConfig> {
     Ok(EnvConfig {
         rust_incremental,
         cache,
+        disk_reflink,
         basedirs,
         dist_cache_dir,
         client_side_mode,
@@ -1465,12 +1471,22 @@ impl Config {
 
         let EnvConfig {
             cache,
+            disk_reflink,
             basedirs: env_basedirs,
             dist_cache_dir: env_dist_cache_dir,
             client_side_mode: env_client_side_mode,
             rust_incremental: env_rust_incremental,
         } = env_conf;
+        let file_reflink = conf_caches.disk.as_ref().map(|disk| disk.reflink);
         conf_caches.merge(cache);
+        if let Some(reflink) = disk_reflink.or(file_reflink)
+            && (reflink || conf_caches.disk.is_some())
+        {
+            conf_caches
+                .disk
+                .get_or_insert_with(Default::default)
+                .reflink = reflink;
+        }
 
         if let Some(cache_dir) = env_dist_cache_dir {
             dist.cache_dir = cache_dir;
@@ -1894,8 +1910,48 @@ fn test_redis_io_timeout_from_env() {
 }
 
 #[test]
+#[serial(config_from_env)]
+fn test_disk_reflink_config() {
+    let env_var = "SCCACHE_DISK_REFLINK";
+    let from_configs = |vars: &[(&str, Option<&str>)], file: &str| {
+        let env = temp_env::with_vars(vars, || config_from_env().unwrap());
+        Config::from_env_and_file_configs(env, toml::from_str(file).unwrap()).unwrap()
+    };
+
+    assert!(!from_configs(&[(env_var, None)], "").fallback_cache.reflink);
+    assert!(
+        from_configs(&[(env_var, Some("true"))], "")
+            .fallback_cache
+            .reflink
+    );
+    let disabled = from_configs(
+        &[
+            (env_var, Some("false")),
+            ("SCCACHE_DIR", None),
+            ("SCCACHE_CACHE_SIZE", None),
+            ("SCCACHE_DIRECT", None),
+            ("SCCACHE_LOCAL_RW_MODE", None),
+        ],
+        "",
+    );
+    assert!(disabled.cache_configs.disk.is_none());
+    let file = "[cache.disk]\nreflink = true\nsize = '7g'\n";
+    assert!(
+        from_configs(&[(env_var, None), ("SCCACHE_DIR", Some("cache"))], file)
+            .fallback_cache
+            .reflink
+    );
+    let config =
+        from_configs(&[(env_var, Some("false")), ("SCCACHE_DIR", None)], file).fallback_cache;
+    assert!(!config.reflink);
+    assert_eq!(config.size, 7 * 1024 * 1024 * 1024);
+    assert!(temp_env::with_var(env_var, Some("invalid"), config_from_env).is_err());
+}
+
+#[test]
 fn config_overrides() {
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: CacheConfigs {
             azure: Some(AzureCacheConfig {
                 connection_string: None,
@@ -1910,6 +1966,7 @@ fn config_overrides() {
                 size: 5,
                 preprocessor_cache_mode: Default::default(),
                 rw_mode: CacheModeConfig::ReadWrite,
+                reflink: false,
             }),
             redis: Some(RedisCacheConfig {
                 endpoint: Some("myotherredisurl".to_owned()),
@@ -1935,6 +1992,7 @@ fn config_overrides() {
                 size: 15,
                 preprocessor_cache_mode: Default::default(),
                 rw_mode: CacheModeConfig::ReadWrite,
+                reflink: false,
             }),
             memcached: Some(MemcachedCacheConfig {
                 url: "memurl".to_owned(),
@@ -1984,6 +2042,7 @@ fn config_overrides() {
                     size: 5,
                     preprocessor_cache_mode: Default::default(),
                     rw_mode: CacheModeConfig::ReadWrite,
+                    reflink: false,
                 }),
                 memcached: Some(MemcachedCacheConfig {
                     url: "memurl".to_owned(),
@@ -2007,6 +2066,7 @@ fn config_overrides() {
                 size: 5,
                 preprocessor_cache_mode: Default::default(),
                 rw_mode: CacheModeConfig::ReadWrite,
+                reflink: false,
             },
             dist: Default::default(),
             server_startup_timeout: None,
@@ -2023,6 +2083,7 @@ fn config_overrides() {
 fn config_basedirs_overrides() {
     // Test that env variable takes precedence over file config
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: vec!["C:/env/basedir".to_string()].into(),
         dist_cache_dir: None,
@@ -2044,6 +2105,7 @@ fn config_basedirs_overrides() {
 
     // Test that file config is used when env is None
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -2065,6 +2127,7 @@ fn config_basedirs_overrides() {
 
     // Test that env config is used when env is set but empty
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
         dist_cache_dir: None,
@@ -2086,6 +2149,7 @@ fn config_basedirs_overrides() {
 
     // Test that both empty results in empty
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
         dist_cache_dir: None,
@@ -2111,6 +2175,7 @@ fn config_basedirs_overrides() {
 fn config_basedirs_overrides() {
     // Test that env variable takes precedence over file config
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: vec!["/env/basedir".to_string()].into(),
         dist_cache_dir: None,
@@ -2132,6 +2197,7 @@ fn config_basedirs_overrides() {
 
     // Test that file config is used when env is None
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -2153,6 +2219,7 @@ fn config_basedirs_overrides() {
 
     // Test that env config is used when env is set but empty
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
         dist_cache_dir: None,
@@ -2174,6 +2241,7 @@ fn config_basedirs_overrides() {
 
     // Test that both empty results in empty
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: vec![].into(),
         dist_cache_dir: None,
@@ -2193,6 +2261,7 @@ fn config_basedirs_overrides() {
     let config = Config::from_env_and_file_configs(env_conf, file_conf).unwrap();
     assert!(config.basedirs.is_empty());
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3069,6 +3138,7 @@ key_prefix = "cosprefix"
                     size: 7 * 1024 * 1024 * 1024,
                     preprocessor_cache_mode: PreprocessorCacheModeConfig::activated(),
                     rw_mode: CacheModeConfig::ReadWrite,
+                    reflink: false,
                 }),
                 gcs: Some(GCSCacheConfig {
                     bucket: "bucket".to_owned(),
@@ -3298,6 +3368,7 @@ fn test_integration_config_normalizes_and_strips() {
     use std::borrow::Cow;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3336,6 +3407,7 @@ fn test_integration_normalized_path_with_double_slashes() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3370,6 +3442,7 @@ fn test_integration_windows_path_normalization() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3405,6 +3478,7 @@ fn test_integration_cow_borrowed_when_no_match() {
     use std::borrow::Cow;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3440,6 +3514,7 @@ fn test_integration_cow_borrowed_when_empty_basedirs() {
     use std::borrow::Cow;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3474,6 +3549,7 @@ fn test_integration_multiple_basedirs_longest_match() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3513,6 +3589,7 @@ fn test_integration_paths_with_dots_normalized() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,
@@ -3548,6 +3625,7 @@ fn test_integration_windows_mixed_slashes() {
     use crate::util::strip_basedirs;
 
     let env_conf = EnvConfig {
+        disk_reflink: None,
         cache: Default::default(),
         basedirs: None,
         dist_cache_dir: None,

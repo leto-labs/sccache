@@ -604,6 +604,95 @@ fn test_rust_cargo_basedirs_other_checkout() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn test_rust_cargo_disk_reflink_other_checkout() -> Result<()> {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+
+    let probe_dir = tempfile::tempdir()?;
+    let mut source = tempfile::NamedTempFile::new_in(probe_dir.path())?;
+    source.write_all(&[0; 4096])?;
+    let dest = tempfile::NamedTempFile::new_in(probe_dir.path())?;
+    // SAFETY: FICLONE takes a source fd by value and both files remain open.
+    if unsafe { libc::ioctl(dest.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == -1 {
+        eprintln!(
+            "skipping cargo reflink check: FICLONE failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return Ok(());
+    }
+
+    let test_info = SccacheTest::new(None)?;
+    let root = real_tempdir(&test_info)?;
+    let [a, b] = ["a", "b"].map(|name| root.join(name));
+    let config = root.join("sccache.toml");
+    let log = root.join("server.log");
+    fs::write(&config, "[cache.disk]\nreflink = true\n")?;
+    restart_sccache(
+        &test_info,
+        Some(vec![
+            ("SCCACHE_CONF".into(), config.to_str().unwrap().into()),
+            (
+                "SCCACHE_BASEDIRS".into(),
+                std::env::join_paths([&a, &b])?.into_string().unwrap(),
+            ),
+            ("SCCACHE_LOG".into(), "info".into()),
+            ("SCCACHE_ERROR_LOG".into(), log.to_str().unwrap().into()),
+        ]),
+    )?;
+    write_out_dir_crate(&a)?;
+    let target_a = cargo_build(&test_info, &a)?;
+    let mut raw_entries = 0;
+    for entry in walkdir::WalkDir::new(root.join("cache")) {
+        let entry = entry?;
+        if entry.file_type().is_file() && entry.file_name() != "CACHEDIR.TAG" {
+            let zip = zip::ZipArchive::new(fs::File::open(entry.path())?)?;
+            assert!(
+                zip.file_names()
+                    .any(|name| name.unwrap().starts_with("raw/"))
+            );
+            raw_entries += 1;
+        }
+    }
+    assert_eq!(raw_entries, 2);
+
+    Command::new(SCCACHE_BIN.as_os_str())
+        .arg("--zero-stats")
+        .assert()
+        .try_success()?;
+    write_out_dir_crate(&b)?;
+    let target_b = cargo_build(&test_info, &b)?;
+
+    let mut rlibs = 0;
+    for entry in walkdir::WalkDir::new(&target_b) {
+        let path = entry?.into_path();
+        if path.extension().is_some_and(|ext| ext == "rlib") {
+            let relative = path.strip_prefix(&target_b)?;
+            assert_eq!(
+                fs::read(&path)?,
+                fs::read(target_a.join(relative))?,
+                "{relative:?}"
+            );
+            rlibs += 1;
+        }
+    }
+    assert!(rlibs >= 2);
+    test_info
+        .show_stats()?
+        .try_stdout(predicates::str::contains(r#""cache_hits":{"counts":{"Rust":2}"#).from_utf8())?
+        .try_stdout(
+            predicates::str::contains(r#""cache_misses":{"counts":{},"adv_counts":{}}"#)
+                .from_utf8(),
+        )?
+        .try_success()?;
+    let log = fs::read_to_string(log)?;
+    assert!(!log.contains("Disk cache reflink failed"), "{log}");
+    eprintln!("verified {rlibs} byte-equal rlibs, two Rust hits and no reflink fallback");
+    Ok(())
+}
+
 /// With `SCCACHE_BASEDIRS_REMAP_PATHS`, the outputs a hit restores in the second checkout
 /// do not name the first one.
 #[test_case(false ; "configured basedirs")]

@@ -20,7 +20,7 @@ use crate::lru_disk_cache::{Error as LruError, LruDiskCache, ReadSeek, Result as
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::ffi::OsStr;
-use std::io::{BufWriter, Read, Write};
+use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,6 +41,7 @@ pub struct DiskCache {
     preprocessor_cache: Arc<Mutex<LazyDiskCache>>,
     rw_mode: CacheMode,
     basedirs: Vec<Vec<u8>>,
+    reflink: bool,
 }
 
 impl DiskCache {
@@ -68,8 +69,45 @@ impl DiskCache {
             })),
             rw_mode,
             basedirs,
+            reflink: false,
         }
     }
+
+    pub(super) fn with_reflink(mut self, requested: bool) -> Self {
+        if requested {
+            let lru = self.lru.lock().unwrap();
+            let root = lru.path();
+            match probe_reflink(root) {
+                Ok(()) => self.reflink = true,
+                Err(error) => warn!(
+                    "Disk cache reflinks unavailable in {}: {error}",
+                    root.display()
+                ),
+            }
+        }
+        self
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn probe_reflink(root: &Path) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    fs_err::create_dir_all(root)?;
+    let mut source = tempfile::NamedTempFile::new_in(root)?;
+    source.write_all(&[0; 4096])?;
+    let destination = tempfile::NamedTempFile::new_in(root)?;
+    // SAFETY: FICLONE takes a source fd by value. Both files are open for the call.
+    let result = unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_reflink(_root: &Path) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 /// Open the entry at `key`, leaving its file times alone in a read-only cache (see `get_untouched`).
@@ -77,10 +115,10 @@ fn open_entry<K: AsRef<OsStr>>(
     cache: &mut LruDiskCache,
     key: K,
     rw_mode: CacheMode,
-) -> LruResult<Box<dyn ReadSeek>> {
+) -> LruResult<fs_err::File> {
     match rw_mode {
-        CacheMode::ReadOnly => cache.get_untouched(key),
-        CacheMode::ReadWrite => cache.get(key),
+        CacheMode::ReadOnly => cache.get_file_untouched(key),
+        CacheMode::ReadWrite => cache.get_file(key),
     }
 }
 
@@ -104,6 +142,7 @@ impl CacheStorage for DiskCache {
         let lru = self.lru.clone();
         let key = key.to_owned();
         let rw_mode = self.rw_mode;
+        let reflink = self.reflink;
 
         self.pool
             .spawn_blocking(move || {
@@ -119,7 +158,7 @@ impl CacheStorage for DiskCache {
                     }
                     Err(_) => unreachable!(),
                 };
-                let hit = CacheRead::from(io)?;
+                let hit = CacheRead::from_file(io, reflink)?;
                 Ok(Cache::Hit(hit))
             })
             .await?
@@ -192,6 +231,10 @@ impl CacheStorage for DiskCache {
         self.put_raw(key, data.into()).await
     }
 
+    fn write_raw_objects(&self) -> bool {
+        self.reflink
+    }
+
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
         trace!("DiskCache::put_raw({}, {} bytes)", key, data.len());
 
@@ -253,7 +296,8 @@ impl PreprocessorCacheStorage for DiskCache {
             key,
             self.rw_mode,
         )
-        .ok())
+        .ok()
+        .map(|file| Box::new(file) as Box<dyn ReadSeek>))
     }
     async fn put_preprocessor_cache_entry(
         &self,
@@ -303,6 +347,7 @@ mod tests {
         );
 
         assert_eq!(disk.cache_type_name(), "disk");
+        assert!(!disk.write_raw_objects());
     }
 
     const KEY: &str = "0123456789abcdef";
@@ -316,6 +361,18 @@ mod tests {
             rw_mode,
             vec![],
         )
+    }
+
+    #[test]
+    fn test_disk_cache_reflink_probe_failure_keeps_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        std::fs::write(&root, b"").unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let disk = disk_cache(&root, &runtime, CacheMode::ReadWrite).with_reflink(true);
+        assert!(!disk.write_raw_objects());
     }
 
     enum Stored {

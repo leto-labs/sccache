@@ -82,6 +82,8 @@ connection_string = "BlobEndpoint=https://example.blob.core.windows.net/;SharedA
 [cache.disk]
 dir = "/tmp/.cache/sccache"
 size = 7516192768 # 7 GiBytes
+# Enable reflink hits for a standalone Linux disk cache. See docs/Local.md.
+reflink = false
 
 # See the local docs on more explanations about this mode
 [cache.disk.preprocessor_cache_mode]
@@ -264,6 +266,7 @@ export SCCACHE_MULTILEVEL_WRITE_ERROR_POLICY="all"
 
 * `SCCACHE_DIR` local on disk artifact cache directory
 * `SCCACHE_CACHE_SIZE` maximum size of the local on disk cache i.e. `2G` - default is 10G
+* `SCCACHE_DISK_REFLINK` enable reflink cache hits on supported Linux filesystems (default: `false`)
 * `SCCACHE_DIRECT` enable/disable preprocessor caching (see [the local doc](Local.md))
 * `SCCACHE_LOCAL_RW_MODE` the mode that the cache will operate in (`READ_ONLY` or `READ_WRITE`)
 

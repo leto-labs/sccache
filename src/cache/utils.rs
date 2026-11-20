@@ -12,8 +12,6 @@
 
 use fs_err as fs;
 
-use std::path::Path;
-
 use crate::errors::*;
 
 /// Normalize key `abcdef` into `a/b/c/abcdef`
@@ -34,17 +32,17 @@ pub(in crate::cache) fn get_file_mode(_file: &fs::File) -> Result<Option<u32>> {
 }
 
 #[cfg(unix)]
-pub(in crate::cache) fn set_file_mode(path: &Path, mode: u32) -> Result<()> {
+pub(in crate::cache) fn set_file_mode(file: &std::fs::File, mode: u32) -> Result<()> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
     let p = Permissions::from_mode(mode);
-    fs::set_permissions(path, p)?;
+    file.set_permissions(p)?;
     Ok(())
 }
 
 #[cfg(windows)]
 #[allow(clippy::unnecessary_wraps)]
-pub(in crate::cache) fn set_file_mode(_path: &Path, _mode: u32) -> Result<()> {
+pub(in crate::cache) fn set_file_mode(_file: &std::fs::File, _mode: u32) -> Result<()> {
     Ok(())
 }
 
