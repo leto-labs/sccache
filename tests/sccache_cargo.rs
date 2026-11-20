@@ -5,6 +5,10 @@
 
 pub mod helpers;
 
+#[cfg(target_os = "linux")]
+#[path = "sccache_cargo/linked.rs"]
+mod linked;
+
 use anyhow::{Context, Result, bail};
 use helpers::{CARGO, CRATE_DIR, cargo_clean, stop_sccache};
 
@@ -2560,20 +2564,8 @@ fn write_linked_proc_macro_workspace(root: &Path) -> Result<()> {
         root.join("Cargo.toml"),
         "[workspace]\nmembers = [\"nat\", \"mid\", \"pm\", \"user\"]\nresolver = \"2\"\n",
     )?;
-    for (name, extra, source) in [
-        (
-            "nat",
-            "",
-            r#"
-            unsafe extern "C" { fn answer() -> i32; }
-            pub fn value() -> i32 { unsafe { answer() } }
-        "#,
-        ),
-        (
-            "mid",
-            "[dependencies]\nnat = { path = \"../nat\" }\n",
-            "pub fn value() -> i32 { nat::value() }",
-        ),
+    write_linked_native_crates(root)?;
+    for (name, manifest, source) in [
         (
             "pm",
             "[lib]\nproc-macro = true\n[dependencies]\nmid = { path = \"../mid\" }\n",
@@ -2589,20 +2581,34 @@ fn write_linked_proc_macro_workspace(root: &Path) -> Result<()> {
             "pub fn answer() -> i32 { pm::answer!() }",
         ),
     ] {
-        let dir = root.join(name);
-        fs::create_dir_all(dir.join("src"))?;
-        fs::write(
-            dir.join("Cargo.toml"),
-            format!(
-                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n{extra}"
-            ),
-        )?;
-        fs::write(dir.join("src/lib.rs"), source)?;
+        linked::write_package(&root.join(name), name, manifest, &[("src/lib.rs", source)])?;
     }
     fs::write(
         root.join("user/src/main.rs"),
         "fn main() { println!(\"{}\", user::answer()); }",
     )?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn write_linked_native_crates(root: &Path) -> Result<()> {
+    for (name, manifest, source) in [
+        (
+            "nat",
+            "",
+            r#"
+            unsafe extern "C" { fn answer() -> i32; }
+            pub fn value() -> i32 { unsafe { answer() } }
+        "#,
+        ),
+        (
+            "mid",
+            "[dependencies]\nnat = { path = \"../nat\" }\n",
+            "pub fn value() -> i32 { nat::value() }",
+        ),
+    ] {
+        linked::write_package(&root.join(name), name, manifest, &[("src/lib.rs", source)])?;
+    }
     fs::write(
         root.join("nat/answer.c"),
         "int answer(void) { return 42; }\n",
@@ -2618,6 +2624,10 @@ fn write_linked_proc_macro_workspace(root: &Path) -> Result<()> {
             assert!(Command::new("cc").args(["-c", "answer.c", "-o"]).arg(&object).status().unwrap().success());
             assert!(Command::new("ar").arg("crs").arg(archive).arg(object).status().unwrap().success());
             println!("cargo:rerun-if-changed=answer.c");
+            let earlier = env::current_dir().unwrap().parent().unwrap().join("earlier");
+            if earlier.is_dir() {
+                println!("cargo:rustc-link-search=native={}", earlier.display());
+            }
             println!("cargo:rustc-link-search=native={}", out.display());
             println!("cargo:rustc-link-lib=static=answer");
         }
