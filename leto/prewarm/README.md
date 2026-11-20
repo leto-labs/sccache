@@ -74,6 +74,7 @@ wrapper and the stats client. The config and cache roots honor
 | `PREWARM_MAX_PAUSE_SECONDS` | `900`. Total pause allowance per attempt, in seconds. |
 | `PREWARM_LOAD_CMD` | Optional test or host override. Bash command printing one load number. |
 | `PREWARM_SCCACHE_BIN` | `sccache` on the configured PATH. Use the project's client binary for stats if the wrapper selects its own. |
+| `SCCACHE_CLIENT_SIDE` | `1`. Set it in the project config to override the pre-warm default. |
 
 Match the lane's toolchain, client settings, Rust flags, and Cargo profiles.
 The runner leaves Rust flags, incremental settings, and build paths to Cargo
@@ -99,10 +100,22 @@ applies `ionice -c3`. The service also sets `CPUWeight=idle`, `Nice=19`, and
 `IOSchedulingClass=idle`. It defers a build above the load limit, stops the
 active Cargo process group when load rises above it, and continues the group
 when load returns to the limit or below. When the pause allowance expires it
-kills the build group and leaves that tip eligible for retry. The shared
-sccache daemon is outside the Cargo process group. Work executed by the
-daemon itself can continue at the daemon's priority. With lane client-side
-compilation, compiler children inherit the runner's priority and pause.
+kills the build group and leaves that tip eligible for retry.
+
+Pre-warm enables client-side compilation. Cargo's sccache clients run the
+compiler as their own child process and use the shared daemon as a cache
+gateway. This keeps compiler work inside Cargo's process group and the
+service's cgroup, where the idle settings and load gate apply. Both modes
+use the same cache-key pipeline.
+[Client-side compilation architecture](../../docs/Architecture.md#client-side-mode-sccache_client_side)
+
+Client-side mode currently writes compressed entries even when the daemon
+uses raw entries for reflinks. Lane hits on entries written by pre-warm
+therefore copy the outputs. The fork will address this separately.
+
+Keep `SCCACHE_LOG` unset for pre-warm because setting it disables client-side
+mode. With a server-side override, compiles run at the daemon's priority and
+can continue while Cargo is paused.
 
 The wrapper still applies the project's benchmark controls. For a timing
 run that requires an idle host or fixed cache contents, stop the project's
