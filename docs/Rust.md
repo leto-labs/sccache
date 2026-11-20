@@ -274,14 +274,18 @@ sccache --stop-server
 The server appends a JSON line for each Rust cache lookup that returns a
 miss. `new` means there is no history for the crate's compilation identity.
 `own-input` lists inputs such as a source file, an environment variable, or
-the argument digest. `dependency` names the changed externs. `unchanged`
-means the same key was previously stored and is now missing. For a changed
-key, the server compares against the stored manifest with the fewest
+a specific argument such as `arg:-C opt-level`. `dependency` names the changed
+externs. `unchanged` means the same key was previously stored and is now missing.
+For a changed key, the server compares against the stored manifest with the fewest
 differences. Source and library paths use the same basedir stripping as the
-key. Arguments and environment values appear only as digests. The reader
-follows changed extern artifact names to earlier misses in the same
-checkout and reports unresolved externs when a producer is absent from the
-log. Pass `--json` to include the root crates in JSON output.
+key. Argument components are grouped by flag and include the option name for
+`-C` and `-Z` and the full value for `--cfg`. All other argument values and all
+environment values are recorded as digests. Comparisons against older
+manifests can show the old `arguments` component being replaced by individual
+argument components. The reader follows changed extern artifact names to
+earlier misses in the same checkout and reports unresolved externs when a
+producer is absent from the log. Pass `--json` to include the root crates in
+JSON output.
 
 The server stores up to four distinct keys per crate identity under
 `$SCCACHE_DIR/explain` as it writes cache entries. This history survives a
