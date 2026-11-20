@@ -286,18 +286,21 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let entry = CacheWrite::from_objects(
-                [FileObjectSource {
-                    key: "object".into(),
-                    path: output.path().into(),
-                    optional: false,
-                }],
-                runtime.handle(),
-                storage.write_raw_objects(),
-            )
-            .await
-            .unwrap();
-            storage.put("01", entry).await.unwrap();
+            storage
+                .put_objects(
+                    "01",
+                    CacheWrite::open_objects([FileObjectSource {
+                        key: "object".into(),
+                        path: output.path().into(),
+                        optional: false,
+                    }])
+                    .unwrap(),
+                    vec![],
+                    vec![],
+                    runtime.handle(),
+                )
+                .await
+                .unwrap();
         });
         daemon.join().unwrap();
     }

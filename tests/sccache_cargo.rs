@@ -727,6 +727,13 @@ fn test_rust_cargo_disk_reflink_other_checkout(client_side: bool) -> Result<()> 
         .find(|entry| entry.file_name() == rlib.as_str())
         .context("rlib missing in checkout A")?;
     let source = source.path().strip_prefix(&target_a)?;
+    if !client_side {
+        assert_eq!(
+            shared_extent_at(&fs::File::open(target_a.join(source))?, 0)?,
+            shared_extent_at(&fs::File::open(&entry)?, offset)?,
+            "checkout A and the cache must share a physical extent after the miss"
+        );
+    }
 
     write_crate(&b)?;
     let target_b = cargo_build(&test_info, &b)?;
@@ -761,9 +768,14 @@ fn test_rust_cargo_disk_reflink_other_checkout(client_side: bool) -> Result<()> 
     let log = fs::read_to_string(log)?;
     assert!(!log.contains("Disk cache reflink failed"), "{log}");
     assert_eq!(log.contains("handle_client: storage_put_raw"), client_side);
+    let shared = if client_side {
+        "B and cache"
+    } else {
+        "A, B and cache"
+    };
     eprintln!(
         "verified {raw_entries} raw entries ({weighted_entries} weighted), \
-         {rlibs} byte-equal rlibs, two Rust hits, and a shared FIEMAP extent in B and cache"
+         {rlibs} byte-equal rlibs, two Rust hits, and a shared FIEMAP extent in {shared}"
     );
     Ok(())
 }

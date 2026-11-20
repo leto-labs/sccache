@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::cache::cache_io::{Cache, CacheMode, CacheRead, CacheWrite};
+use crate::cache::cache_io::{Cache, CacheMode, CacheRead, CacheWrite, OpenCacheObject};
 use crate::cache::multilevel::MultiLevelStats;
 #[cfg(any_cache_remote)]
 use crate::cache::utils::normalize_key;
@@ -77,6 +77,17 @@ pub trait Storage: Send + Sync {
     /// Returns a `Future` that will provide the result or error when the put is
     /// finished.
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration>;
+
+    async fn put_objects(
+        &self,
+        key: &str,
+        objects: Vec<OpenCacheObject>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        pool: &tokio::runtime::Handle,
+    ) -> Result<Duration> {
+        put_packed_objects(self, key, objects, stdout, stderr, pool).await
+    }
 
     fn write_raw_objects(&self) -> bool {
         false
@@ -364,6 +375,24 @@ impl Storage for RemoteStorage {
 
         Ok(start.elapsed())
     }
+}
+
+pub(super) async fn put_packed_objects(
+    storage: &(impl Storage + ?Sized),
+    key: &str,
+    objects: Vec<OpenCacheObject>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    pool: &tokio::runtime::Handle,
+) -> Result<Duration> {
+    let mut entry = CacheWrite::from_open_objects(objects, pool, storage.write_raw_objects())
+        .await
+        .context("failed to zip up compiler outputs")?;
+    entry.put_stdout(&stdout)?;
+    entry.put_stderr(&stderr)?;
+    let start = Instant::now();
+    storage.put(key, entry).await?;
+    Ok(start.elapsed())
 }
 
 #[cfg(test)]

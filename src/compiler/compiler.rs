@@ -891,22 +891,9 @@ where
                 let write_key = key.clone();
                 let out_pretty = out_pretty.clone();
                 let future = async move {
-                    let start_create_artifact = Instant::now();
-                    let mut entry =
-                        CacheWrite::from_open_objects(outputs?, &pool, storage.write_raw_objects())
-                            .await
-                            .context("failed to zip up compiler outputs")?;
-                    entry.put_stdout(&stdout)?;
-                    entry.put_stderr(&stderr)?;
-                    debug!(
-                        "[{}]: Created cache artifact in {}",
-                        out_pretty,
-                        fmt_duration_as_secs(&start_create_artifact.elapsed())
-                    );
-
-                    let start = Instant::now();
-                    storage.put(&write_key, entry).await?;
-                    let duration = start.elapsed();
+                    let duration = storage
+                        .put_objects(&write_key, outputs?, stdout, stderr, &pool)
+                        .await?;
                     if let Some((explainer, manifest)) = explanation {
                         match pool
                             .spawn_blocking(move || explainer.remember(write_key, &manifest))
