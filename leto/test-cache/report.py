@@ -140,7 +140,7 @@ def aggregate(rows, start, end, known_flakes=(), benchmark=None):
                     "prior_outcome": dict(different), "outcome": dict(outcome),
                     "prior_run_id": before["run_id"], "run_id": row["run_id"],
                     "prior_time_ns": before["time_ns"], "time_ns": now, "count": 0,
-                    "classification": "known flake" if test_id in known_flakes else "unclassified nondeterminism",
+                    "classification": mismatch_class(test_id, known_flakes, different, outcome),
                 })
                 mismatch["count"] += 1
             if row["outcome"] == {"exit": 0} and eligible_attempt(row) and test_id not in known_flakes:
@@ -187,12 +187,42 @@ FIELDS = ("time_ns", "key", "binary", "worktree", "run_id", "mtime", "digest", "
           "outcome", "project", "binary_id", "test", "attempt", "stress")
 
 
+def ancestors(path):
+    parents = {"/"}
+    while path and path != "/":
+        path = os.path.dirname(path.rstrip("/"))
+        parents.add(path or "/")
+    return parents
+
+
+def observed_class(row, observed):
+    """The runner's class, except that looking up the checkout's ancestor
+    directories (canonicalize, current_dir) does not make a test impure."""
+    purity = observed.get("class")
+    if (purity == "other" and (observed.get("reason") or "").startswith("read outside")
+            and not observed.get("outside_writes")):
+        allowed = ancestors(row.get("worktree") or "") | {"/tmp"}
+        if all(path in allowed for path in observed.get("other_reads", [])):
+            purity = "files" if observed.get("checkout_reads") else "pure"
+    return purity
+
+
 def slim(row):
     # Observed path sets dominate the records; aggregation needs only the class.
     kept = {field: row[field] for field in FIELDS if field in row}
     observed = row.get("observer")
-    kept["observer"] = {"class": observed.get("class")} if isinstance(observed, dict) else observed
+    kept["observer"] = {"class": observed_class(row, observed)} if isinstance(observed, dict) else observed
     return kept
+
+
+CANCEL_SIGNALS = {2, 15}
+
+
+def mismatch_class(test_id, known_flakes, *outcomes):
+    # SIGINT/SIGTERM come from a cancelled run (Ctrl-C, nextest fail-fast), not the test.
+    if any(dict(outcome).get("signal") in CANCEL_SIGNALS for outcome in outcomes):
+        return "cancelled run"
+    return "known flake" if test_id in known_flakes else "unclassified nondeterminism"
 
 
 def select_logs(directory, kind, first_day, last_day, max_bytes):
@@ -265,9 +295,11 @@ def markdown(week, report):
     ]:
         hit = totals["would_be"][category]
         lines.append(f"| {label} | {hit['count']:,} | {hit['seconds']:.2f} |")
-    mismatches = report["mismatches"]
+    cancelled = [row for row in report["mismatches"] if row["classification"] == "cancelled run"]
+    mismatches = [row for row in report["mismatches"] if row["classification"] != "cancelled run"]
     lines += ["", "Stage 2 figures are candidates before file manifest verification.", "",
-              "## Mismatches", "", f"{len(mismatches):,} distinct key/outcome changes."]
+              "## Mismatches", "", f"{len(mismatches):,} distinct key/outcome changes, "
+              f"plus {len(cancelled):,} from cancelled runs (SIGINT/SIGTERM), not listed."]
     for row in mismatches[:20]:
         lines.append(f"- {table_text(row['project'])} / {table_text(row['binary_id'])} / "
                      f"`{table_text(row['test']).replace(chr(96), '')}` · {row['prior_outcome']} → "

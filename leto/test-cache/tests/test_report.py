@@ -11,6 +11,22 @@ spec.loader.exec_module(report)
 
 
 class ReportTest(unittest.TestCase):
+    def test_checkout_ancestor_lookups_stay_pure(self):
+        row = {"worktree": "/home/u/.t3/worktrees/p/lane"}
+        lookups = {"class": "other", "reason": "read outside checkout and allowed system paths",
+                   "other_reads": ["/", "/home", "/home/u/.t3/worktrees/p"], "checkout_reads": []}
+        self.assertEqual(report.observed_class(row, lookups), "pure")
+        self.assertEqual(report.observed_class(row, {**lookups, "checkout_reads": ["/x"]}), "files")
+        foreign = {**lookups, "other_reads": ["/home/u/.aws/credentials"]}
+        self.assertEqual(report.observed_class(row, foreign), "other")
+        self.assertEqual(report.observed_class(row, {**lookups, "outside_writes": ["/var/x"]}), "other")
+
+    def test_cancelled_runs_are_not_nondeterminism(self):
+        cancelled = report.mismatch_class(("p", "b", "t"), set(), (("signal", 2),), (("exit", 0),))
+        self.assertEqual(cancelled, "cancelled run")
+        flaky = report.mismatch_class(("p", "b", "t"), set(), (("exit", 101),), (("exit", 0),))
+        self.assertEqual(flaky, "unclassified nondeterminism")
+
     def test_weekly_fixture(self):
         fixture = ROOT / "tests/fixtures/shadow.jsonl"
         rows = [json.loads(line) for line in fixture.read_text().splitlines()]
