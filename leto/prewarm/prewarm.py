@@ -15,6 +15,7 @@ import sys
 import time
 import tomllib
 from typing import NamedTuple
+from uuid import uuid4
 
 
 DEFAULT_COMMANDS = "check --workspace --all-targets;test --workspace --no-run"
@@ -22,7 +23,9 @@ CARGO = ["bash", "scripts/cargo.sh"]
 
 
 class PrewarmError(Exception):
-    pass
+    def __init__(self, message, result="failed"):
+        super().__init__(message)
+        self.result = result
 
 
 def timestamp():
@@ -128,6 +131,22 @@ def cargo_env(checkout, settings):
     return env
 
 
+def command_plan(settings):
+    commands = [shlex.split(part) for part in settings.get("PREWARM_COMMANDS", DEFAULT_COMMANDS).split(";")]
+    if any(not args or args[0].startswith(("-", "+")) for args in commands):
+        raise PrewarmError("PREWARM_COMMANDS must contain Cargo subcommands separated by semicolons")
+    budgets = [float(part) for part in settings.get("PREWARM_COMMAND_TIMEOUTS", "900").split(";")]
+    if (len(budgets) not in (1, len(commands))
+            or any(budget <= 0 or not math.isfinite(budget) for budget in budgets)):
+        raise PrewarmError("PREWARM_COMMAND_TIMEOUTS needs one positive finite value or one per command")
+    if len(budgets) == 1:
+        budgets *= len(commands)
+    memory_max = settings.get("PREWARM_MEMORY_MAX", "8G")
+    if not re.fullmatch(r"[1-9][0-9]*[KMGT]?", memory_max):
+        raise PrewarmError("PREWARM_MEMORY_MAX must be positive bytes or a size such as 8G")
+    return zip(commands, budgets, strict=True), memory_max
+
+
 class CpuSample(NamedTuple):
     taken_at: float
     cpus: int
@@ -186,7 +205,7 @@ class ResourceGate:
                 or not 0 <= self.max_pressure <= 100):
             raise PrewarmError("invalid resource gate thresholds or sample interval")
 
-    def cpu_sample(self):
+    def cpu_sample(self, build_running=False):
         with (self.proc / "stat").open() as stat:
             # Guest time is already included in user and nice.
             counters = list(map(int, stat.readline().split()[1:9]))
@@ -197,7 +216,8 @@ class ResourceGate:
                 cpus += 1
         total = sum(counters)
         busy = total - counters[3] - counters[4]
-        if self.cpu_stat is not None:
+        # The command scope is a sibling of the service, so only the tree includes both.
+        if not build_running and self.cpu_stat is not None:
             try:
                 for line in self.cpu_stat.read_text().splitlines():
                     name, _, value = line.partition(" ")
@@ -271,31 +291,59 @@ def signal_group(process, sig):
         pass
 
 
-def build(checkout, args, env, gate, pause_budget, status, log, interrupted):
+def stop_scope(unit, env, log):
+    control = ["systemctl", "--user"]
+    stop = subprocess.run([*control, "stop", unit], env=env, capture_output=True, text=True, timeout=15)
+    state = capture([*control, "show", "--property=LoadState,Result", unit], env=env,
+                    stderr=log, timeout=10)
+    properties = dict(line.split("=", 1) for line in state.splitlines())
+    result = properties.get("Result")
+    if result and result != "success":
+        subprocess.run([*control, "reset-failed", unit], env=env, stdout=log,
+                       stderr=log, timeout=10)
+    if stop.returncode and properties.get("LoadState") != "not-found":
+        raise PrewarmError(f"could not stop command scope {unit}: {stop.stderr.strip()}")
+    return result
+
+
+def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, log, interrupted):
     command = [*CARGO, *args]
-    log_event(log, f"running {shlex.join(command)}")
+    entry = {"command": shlex.join(command), "budget_seconds": budget, "result": "failed"}
+    status["commands"].append(entry)
+    unit = f"leto-prewarm-command-{uuid4().hex}.scope"
+    script_dir = Path(__file__).resolve().parent
+    bounded = script_dir / "leto-bounded"
+    if not bounded.is_file():
+        bounded = script_dir.parent / "bounded.sh"
+    scope = [bounded, "--scope-unit", unit, "--mem", memory_max,
+             "--timeout", str(math.ceil(budget) + 5), "--"]
+    log_event(log, f"running {entry['command']} (budget {budget:g}s, memory {memory_max})")
     started = time.monotonic()
+    deadline = started + budget
     paused_at = None
     cpu_streak_since = None
-    previous = gate.cpu_sample()
     try:
-        with subprocess.Popen(command, cwd=checkout, env=env, stdout=log,
+        previous = gate.cpu_sample(build_running=True)
+        with subprocess.Popen([*scope, *command], cwd=checkout, env=env, stdout=log,
                               stderr=subprocess.STDOUT, start_new_session=True) as process:
             try:
                 while True:
                     interrupted()
-                    timeout = gate.poll
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise PrewarmError(f"command time budget reached ({budget:g}s)", "timed_out")
+                    timeout = min(gate.poll, remaining)
                     if paused_at is not None:
                         remaining = pause_budget - status["paused_seconds"] - (time.monotonic() - paused_at)
                         if remaining <= 0:
                             raise PrewarmError("maximum pause time reached; retrying on the next trigger")
-                        timeout = min(gate.poll, remaining)
+                        timeout = min(timeout, remaining)
                     try:
                         code = process.wait(timeout=timeout)
                     except subprocess.TimeoutExpired:
-                        if paused_at is not None and timeout < gate.poll:
-                            raise PrewarmError("maximum pause time reached; retrying on the next trigger")
-                        current = gate.cpu_sample()
+                        if timeout < gate.poll:
+                            continue
+                        current = gate.cpu_sample(build_running=True)
                         spare = gate.spare_cpus(previous, current)
                         paused = paused_at is not None
                         cpu_ready = spare is not None and spare >= gate.min_spare
@@ -326,17 +374,28 @@ def build(checkout, args, env, gate, pause_budget, status, log, interrupted):
                         continue
                     interrupted()
                     if code:
-                        raise PrewarmError(f"{shlex.join(command)} exited with status {code}")
+                        raise PrewarmError(f"{entry['command']} exited with status {code}")
                     break
             finally:
                 if process.returncode is None:
                     signal_group(process, signal.SIGKILL)
+                    process.wait()
+                scope_result = stop_scope(unit, env, log)
+                if scope_result == "oom-kill":
+                    raise PrewarmError(f"command scope OOM kill (MemoryMax={memory_max})", "oom")
+                if scope_result == "timeout":
+                    raise PrewarmError(f"command scope runtime limit reached ({budget:g}s budget)", "timed_out")
+        entry["result"] = "succeeded"
+    except PrewarmError as error:
+        entry["result"] = error.result
+        raise
     finally:
         now = time.monotonic()
         if paused_at is not None:
             status["paused_seconds"] += now - paused_at
         elapsed = now - started
         status["build_seconds"] += elapsed
+        entry["duration_seconds"] = round(elapsed, 3)
         log_event(log, f"finished {args[0]} after {elapsed:.2f}s")
 
 
@@ -419,9 +478,7 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
     pause_budget = float(settings.get("PREWARM_MAX_PAUSE_SECONDS", 900))
     if jobs < 1 or pause_budget < 0 or not math.isfinite(pause_budget):
         raise PrewarmError("jobs must be positive and the pause budget must be finite and nonnegative")
-    commands = [shlex.split(part) for part in settings.get("PREWARM_COMMANDS", DEFAULT_COMMANDS).split(";")]
-    if any(not args or args[0].startswith(("-", "+")) for args in commands):
-        raise PrewarmError("PREWARM_COMMANDS must contain Cargo subcommands separated by semicolons")
+    commands, memory_max = command_plan(settings)
 
     reason = gate.startup_blocker(interrupted)
     if reason is not None:
@@ -435,17 +492,19 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
         return "unchanged"
 
     env = cargo_env(checkout, settings)
+    env.update(SCCACHE_CLIENT_SIDE="required", SCCACHE_SERVER_AUTOSTART="false")
     before = stats_snapshot(checkout, env, settings)
     log_event(log, f"warming {tip} with {jobs} private Cargo jobs")
     try:
-        for args in commands:
+        for args, budget in commands:
             reason = gate.startup_blocker(interrupted)
             if reason is not None:
-                log_event(log, f"deferred {tip}: {reason}")
+                status["deferred_command"] = shlex.join(args)
+                log_event(log, f"deferred {tip} before {status['deferred_command']}: {reason}")
                 return "deferred"
             job_position = args.index("--") if "--" in args else len(args)
             args[job_position:job_position] = ["-j", str(jobs)]
-            build(checkout, args, env, gate, pause_budget, status, log, interrupted)
+            build(checkout, args, env, gate, budget, memory_max, pause_budget, status, log, interrupted)
         interrupted()
         write_atomic(marker, f"{tip}\n")
         status["last_warmed_commit"] = tip
@@ -497,12 +556,12 @@ def run(project, clean):
 
         started = time.monotonic()
         status = {"result": "failed", "tip_commit": None, "last_warmed_commit": None,
-                  "build_seconds": 0.0, "paused_seconds": 0.0, "disk": None}
+                  "build_seconds": 0.0, "paused_seconds": 0.0, "commands": [], "disk": None}
         try:
             status["last_warmed_commit"] = marker.read_text().strip() if marker.exists() else None
             validate_checkout(checkout)
             config = read_config(configdir / "leto-prewarm" / f"{project}.conf")
-            settings = {**os.environ, "SCCACHE_CLIENT_SIDE": "1", **config}
+            settings = {**os.environ, **config}
             ensure_compression(state, settings.get("PREWARM_COMPRESSION", "zstd:1"), log)
             if clean:
                 if checkout.exists():
@@ -511,6 +570,8 @@ def run(project, clean):
             else:
                 status["result"] = prewarm(checkout, marker, settings, status, log, interrupted)
         except (PrewarmError, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+            if isinstance(error, PrewarmError):
+                status["result"] = error.result
             status["error"] = str(error)
             log_event(log, f"{project}: {error}")
         finally:
@@ -529,7 +590,7 @@ def run(project, clean):
             log_event(log, f"{project}: {status['result']} tip={status['tip_commit']} "
                       f"last_warmed={status['last_warmed_commit']} in {status['duration_seconds']:.2f}s "
                       f"(build {status['build_seconds']:.2f}s, paused {status['paused_seconds']:.2f}s)")
-        return int(status["result"] == "failed")
+        return int("error" in status)
 
 
 def main():

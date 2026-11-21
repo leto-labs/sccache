@@ -16,7 +16,7 @@ use crate::cache::{CacheMode, CacheStorage as _, IpcStorage, storage_from_config
 use crate::client::{ServerConnection, connect_to_server, connect_with_retry, connect_with_wait};
 use crate::cmdline::{Command, StatsFormat};
 use crate::compiler::{self, ColorMode, is_rmeta_artifact_notification};
-use crate::config::{Config, RustIncremental, RustIncrementalSettings};
+use crate::config::{Config, RustIncremental, RustIncrementalSettings, client_side_required};
 use crate::jobserver::Client;
 use crate::lru_disk_cache::CACHEDIR_TAG_FILE_NAME;
 use crate::mock_command::{CommandChild, CommandCreatorSync, ProcessCommandCreator, RunCommand};
@@ -826,7 +826,7 @@ where
         }
         Err(e) => return Err(e),
     };
-    if handshake.miss_explain {
+    if handshake.miss_explain && !client_side_required() {
         return do_compile(
             C::new(jobserver),
             runtime,

@@ -328,6 +328,8 @@ The server stores up to four distinct keys per crate identity under
 server restart, and existing cache hits do not populate it. Keep the log
 outside the cache entry directories. The log appends across builds and restarts.
 This mode routes client-side builds through the server for diagnostics.
+Builds using `SCCACHE_CLIENT_SIDE=required` stay in the client and skip
+this diagnostic log.
 Warm incremental compiles that bypass the cache produce no miss record.
 Remove the setting and any environment override, then restart the server to
 turn the mode off.

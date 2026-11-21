@@ -100,6 +100,7 @@ cat >"$tmp/bin/sccache" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ "$SCCACHE_SERVER_PORT" == 4250 ]]
+[[ "$SCCACHE_CLIENT_SIDE" == required && "$SCCACHE_SERVER_AUTOSTART" == false ]]
 if [[ "$*" == '--show-stats --stats-format=json' ]]; then
   count=$(wc -l <"$FIXTURE_CONTROL/sccache.log")
   printf '{"effective_cache_mode":"ReadWrite","stats":{"compile_requests":%s,"cache_hits":{"counts":{}},"cache_misses":{"counts":{"Rust":%s}},"cache_writes":%s}}\n' \
@@ -116,6 +117,43 @@ exec "$@"
 EOF
 chmod +x "$tmp/bin/sccache"
 
+cat >"$tmp/bin/systemd-run" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$1 $2 $3 $4" == '--user --scope --quiet --unit=leto-prewarm-command-'*.scope ]]
+[[ "$LETO_BOUNDED" == 1 ]]
+unit=${4#--unit=}
+shift 4
+printf '%s|%s\n' "$unit" "$*" >>"$FIXTURE_CONTROL/scopes.log"
+while [[ $1 == -p ]]; do shift 2; done
+[[ $1 == -- ]]
+shift
+if [[ -e "$FIXTURE_CONTROL/oom" ]]; then
+  printf 'oom-kill\n' >"$FIXTURE_CONTROL/$unit"
+  kill -KILL "$$"
+fi
+exec "$@"
+EOF
+cat >"$tmp/bin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == --user && ${!#} == leto-prewarm-command-*.scope ]]
+unit=${!#}
+case $2 in
+  stop) printf '%s\n' "$unit" >>"$FIXTURE_CONTROL/stops.log" ;;
+  show)
+    if [[ -f "$FIXTURE_CONTROL/$unit" ]]; then
+      printf 'LoadState=loaded\nResult=%s\n' "$(cat "$FIXTURE_CONTROL/$unit")"
+    else
+      printf 'LoadState=not-found\nResult=success\n'
+    fi
+    ;;
+  reset-failed) rm -- "$FIXTURE_CONTROL/$unit" ;;
+  *) exit 2 ;;
+esac
+EOF
+chmod +x "$tmp/bin/systemd-run" "$tmp/bin/systemctl"
+
 cat >"$repo/scripts/cargo.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -123,6 +161,13 @@ set -euo pipefail
 printf '%s|%s|%s|%s\n' "$*" "${FIXTURE_EXTRA:-}" "${SCCACHE_BASEDIRS:-}" "${SCCACHE_CLIENT_SIDE:-}" \
   >>"$FIXTURE_CONTROL/cargo.log"
 export RUSTC_WRAPPER="${FIXTURE_CONTROL%/*}/bin/sccache"
+if [[ -e "$FIXTURE_CONTROL/busy-after" ]]; then
+  cargo "$@"
+  printf 'MemTotal: 1000 kB\nMemAvailable: 100 kB\n' >"$FIXTURE_CONTROL/meminfo"
+  # PREWARM_* is deliberately absent from the wrapper environment.
+  mv -- "$FIXTURE_CONTROL/meminfo" "${FIXTURE_CONTROL%/*}/proc/meminfo"
+  exit
+fi
 exec cargo "$@"
 EOF
 
@@ -130,6 +175,9 @@ cat >"$repo/Cargo.toml" <<'EOF'
 [workspace]
 members = ["crate"]
 resolver = "3"
+
+[profile.fast]
+inherits = "release"
 EOF
 cat >"$repo/crate/Cargo.toml" <<'EOF'
 [package]
@@ -230,11 +278,13 @@ wait_for test -s "$PREWARM_PROC_ROOT/stat"
 SCCACHE_CLIENT_SIDE=0 run
 status_is warmed "$tip"
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 2 ]] || fail "expected both Cargo commands"
-grep -Fxq "check --workspace --all-targets -j 1|value from project config|$checkout|1" \
+grep -Fxq "check --workspace --all-targets -j 1|value from project config|$checkout|required" \
   "$FIXTURE_CONTROL/cargo.log" || fail "expected project env, checkout-based normalization and client-side mode"
-grep -Fxq "test --workspace --no-run -j 1|value from project config|$checkout|1" \
+grep -Fxq "test --workspace --no-run -j 1|value from project config|$checkout|required" \
   "$FIXTURE_CONTROL/cargo.log" || fail "missing default test build"
-grep -Eq '^1[|].*--crate-name fixture' "$FIXTURE_CONTROL/sccache.log" || fail "sccache did not get client-side mode"
+grep -Eq '^required[|].*--crate-name fixture' "$FIXTURE_CONTROL/sccache.log" || fail "sccache did not get client-side mode"
+grep -q 'MemoryMax=8G -p MemorySwapMax=0 .* -p OOMPolicy=kill -p CPUWeight=idle' \
+  "$FIXTURE_CONTROL/scopes.log" || fail "missing default cap or idle scope properties"
 grep -Eq 'shared sccache delta \{"compile_requests": [1-9]' "$log" || fail "missing stats delta"
 [[ ! -e "$repo/target" ]] || fail "canonical repo received build output"
 printf 'ok - spare CPU starts a client-side build with project env, private jobs, stats and disk status\n'
@@ -252,11 +302,10 @@ SCCACHE_CLIENT_SIDE=1 run
 status_is warmed "$tip"
 [[ $(git -C "$checkout" rev-parse HEAD) == "$tip" ]] || fail "checkout did not advance"
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 4 ]] || fail "new tip did not build"
-tail -n 2 "$FIXTURE_CONTROL/cargo.log" | grep -Fxq 'check --workspace --all-targets -j 1|value from project config||0' \
-  || fail "Cargo did not get the client-side override or its configured basedirs"
-grep -Eq '^0[|].*--crate-name fixture' "$FIXTURE_CONTROL/sccache.log" || fail "sccache did not get the client-side override"
+tail -n 2 "$FIXTURE_CONTROL/cargo.log" | grep -Fxq 'check --workspace --all-targets -j 1|value from project config||required' \
+  || fail "Cargo did not get required client-side mode or its configured basedirs"
 sed -i '/^SCCACHE_CLIENT_SIDE=/d' "$config"
-printf 'ok - new packed branch tip builds and respects Cargo config and the client-side override\n'
+printf 'ok - new packed branch tip builds with Cargo-configured basedirs and required client-side mode\n'
 
 last_warmed=$tip
 change_tip 3
@@ -357,6 +406,67 @@ set_cpu 0 0
 run
 status_is warmed "$tip"
 printf 'ok - pause timeout leaves the tip eligible for retry\n'
+
+last_warmed=$tip
+change_tip 7
+export PREWARM_COMMANDS='test --workspace --no-run --profile fast;check --workspace --all-targets'
+export PREWARM_COMMAND_TIMEOUTS='10;20'
+export PREWARM_MEMORY_MAX=96M
+: >"$FIXTURE_CONTROL/cargo.log"
+touch "$FIXTURE_CONTROL/busy-after"
+run
+status_is deferred "$last_warmed"
+[[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 1 ]] || fail "later command ran after memory became scarce"
+grep -Fq '"deferred_command": "check --workspace --all-targets"' "$state/status.json" \
+  || fail "deferred command missing from status"
+rm -- "$FIXTURE_CONTROL/busy-after"
+set_memory 500
+: >"$FIXTURE_CONTROL/cargo.log"
+run
+status_is warmed "$tip"
+mapfile -t commands < <(cut -d '|' -f 1 "$FIXTURE_CONTROL/cargo.log")
+[[ ${commands[*]} == 'test --workspace --no-run --profile fast -j 1 check --workspace --all-targets -j 1' ]] \
+  || fail "commands did not run in configured order"
+python3 - "$state/status.json" <<'PY'
+import json
+import sys
+status = json.load(open(sys.argv[1]))
+assert [(c["result"], c["budget_seconds"]) for c in status["commands"]] == [
+    ("succeeded", 10), ("succeeded", 20)
+], status
+PY
+grep -q 'MemoryMax=96M -p MemorySwapMax=0' "$FIXTURE_CONTROL/scopes.log" || fail "custom memory cap missing"
+printf 'ok - command order, individual budgets, custom memory cap and per-command admission\n'
+
+last_warmed=$tip
+change_tip 8
+: >"$FIXTURE_CONTROL/cargo.log"
+rm -- "$FIXTURE_CONTROL/rustc.pid"
+touch "$FIXTURE_CONTROL/hold"
+if PREWARM_COMMAND_TIMEOUTS='1;20' "$runner" fixture >"$tmp/run.log"; then
+  fail "expired command budget reported success"
+fi
+status_is timed_out "$last_warmed"
+grep -q '"error": "command time budget reached (1s)"' "$state/status.json" || fail "timeout reason missing"
+[[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 1 ]] || fail "a command ran after the timeout"
+rustc_pid=$(cat "$FIXTURE_CONTROL/rustc.pid")
+if ps -o state= -p "$rustc_pid" | grep -Eq '^[^ZX]$'; then
+  fail "command timeout left the compiler running"
+fi
+rm -- "$FIXTURE_CONTROL/hold"
+printf 'ok - command timeout kills the compiler group and leaves the tip eligible for retry\n'
+
+touch "$FIXTURE_CONTROL/oom"
+if "$runner" fixture >"$tmp/run.log"; then fail "scope OOM reported success"; fi
+status_is oom "$last_warmed"
+grep -q 'command scope OOM kill (MemoryMax=96M)' "$state/status.json" || fail "scope OOM reason missing"
+[[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 1 ]] || fail "a command ran after the OOM kill"
+diff -u <(cut -d '|' -f 1 "$FIXTURE_CONTROL/scopes.log") "$FIXTURE_CONTROL/stops.log" \
+  || fail "command scopes were not stopped"
+rm -- "$FIXTURE_CONTROL/oom"
+run
+status_is warmed "$tip"
+printf 'ok - scope OOM ends the attempt, records the reason and leaves the tip eligible for retry\n'
 
 mkdir -p "$tmp/outside"
 touch "$tmp/outside/keep"

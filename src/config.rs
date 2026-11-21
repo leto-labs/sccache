@@ -1047,6 +1047,10 @@ pub(crate) fn parse_bool(env_var_name: &str, value: &str) -> Result<bool> {
     }
 }
 
+pub(crate) fn client_side_required() -> bool {
+    env::var("SCCACHE_CLIENT_SIDE").as_deref() == Ok("required")
+}
+
 fn skip_cache_check_from_env() -> Result<bool> {
     Ok(bool_from_env_var("SCCACHE_SKIP_CACHE_CHECK")?.unwrap_or(false))
 }
@@ -1437,7 +1441,11 @@ fn config_from_env() -> Result<EnvConfig> {
         .transpose()?;
 
     let dist_cache_dir = env::var_os("SCCACHE_DIST_CLIENT_CACHE_DIR").map(PathBuf::from);
-    let client_side_mode = bool_from_env_var("SCCACHE_CLIENT_SIDE")?;
+    let client_side_mode = if client_side_required() {
+        Some(true)
+    } else {
+        bool_from_env_var("SCCACHE_CLIENT_SIDE")?
+    };
 
     let rust_incremental = match env::var("SCCACHE_RUST_INCREMENTAL") {
         Ok(value) => Some(match value.as_str() {
@@ -1636,6 +1644,11 @@ impl Config {
             .unwrap_or_default();
 
         let mut config = Self::from_env_and_file_configs(env_conf, file_conf)?;
+        if client_side_required() && !config.client_side_mode {
+            bail!(
+                "SCCACHE_CLIENT_SIDE=required is incompatible with SCCACHE_LOG or distributed compilation"
+            );
+        }
         config.skip_cache_check = skip_cache_check;
         Ok(config)
     }

@@ -275,3 +275,66 @@ fn test_incremental_and_non_incremental_cache_keys() {
     assert_eq!(info["stats"]["cache_hits"]["counts"]["Rust"], 2);
     assert_eq!(info["stats"]["cache_misses"]["counts"]["Rust"], 2);
 }
+
+#[test]
+fn test_required_client_side_bypasses_miss_explain() {
+    let workspace = tempdir().unwrap();
+    let root = workspace.path();
+    let log = root.join("misses.jsonl");
+    fs::write(root.join("lib.rs"), "pub fn answer() -> u32 { 42 }\n").unwrap();
+    let port = 4325;
+    let _stop_server = StopServer(port);
+    let command = || {
+        let mut cmd = Command::cargo_bin("sccache").unwrap();
+        cmd.current_dir(root)
+            .env("SCCACHE_SERVER_PORT", port.to_string())
+            .env_remove("SCCACHE_SERVER_UDS")
+            .env_remove("SCCACHE_LOG")
+            .env("SCCACHE_CONF", root.join("missing-config"))
+            .env("SCCACHE_DIR", root.join("cache"));
+        cmd
+    };
+    command()
+        .arg("--start-server")
+        .env("SCCACHE_MISS_EXPLAIN", &log)
+        .assert()
+        .success();
+
+    let compile = |client_side, cfg| {
+        command()
+            .env("SCCACHE_CLIENT_SIDE", client_side)
+            .arg(var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .args([
+                "lib.rs",
+                "--crate-name=probe",
+                "--crate-type=lib",
+                "--emit=metadata,link",
+                "--out-dir=.",
+                "--cfg",
+                cfg,
+            ])
+            .assert()
+            .success();
+    };
+    compile("required", "bounded");
+    assert!(!log.exists());
+    compile("required", "bounded");
+    let stats = command()
+        .args(["--show-stats", "--stats-format=json"])
+        .assert()
+        .success();
+    let info: serde_json::Value = serde_json::from_slice(&stats.get_output().stdout).unwrap();
+    assert_eq!(info["stats"]["cache_hits"]["counts"]["Rust"], 1, "{info}");
+    compile("1", "diagnostics");
+    assert!(!fs::read(&log).unwrap().is_empty());
+
+    command()
+        .arg("--show-stats")
+        .env("SCCACHE_CLIENT_SIDE", "required")
+        .env("SCCACHE_LOG", "debug")
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "SCCACHE_CLIENT_SIDE=required is incompatible",
+        ));
+}

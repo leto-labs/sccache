@@ -193,3 +193,8 @@ removed. It is currently mutually exclusive with:
 
 If either is in use, the setting is ignored and sccache stays in server-side
 mode.
+
+Set `SCCACHE_CLIENT_SIDE=required` to keep compiler processes inside the
+caller's cgroup. This mode rejects logging and distributed compilation. If
+the daemon enables miss diagnostics, the client still compiles locally and
+uses it as a cache gateway.

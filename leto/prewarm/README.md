@@ -7,18 +7,22 @@ project has a lock, a last-successful commit marker, a log, and a status file
 under `~/.cache/leto-maintenance/prewarm/<project>/`. Failed or deferred builds
 are retried on the next trigger. The runner records a commit only after every
 configured Cargo command succeeds.
+See [the proposed fleet settings](proposed-confs.md) for project command lists
+and their sizing estimates.
 
 ## Installation for Core
 
-Use Linux with Git, GNU coreutils, util-linux, Python 3.11 or newer, the Leto
-sccache client, and the project's usual Rust toolchain. Use a running shared
-sccache server. The client selected for stats must connect to that server and
-report `effective_cache_mode` in JSON. The default client port is 4226.
+Use Linux with cgroup v2 and systemd 253 or newer, Git, GNU coreutils, util-linux,
+Python 3.11 or newer, a Leto sccache client that supports
+`SCCACHE_CLIENT_SIDE=required`, and the project's usual Rust toolchain. Use a
+running shared sccache server. The stats client must connect to that server
+and report `effective_cache_mode` in JSON. The default client port is 4226.
 
 From this fork's checkout, run as the build user:
 
 ```sh
 install -Dm755 leto/prewarm/prewarm.py ~/.local/bin/leto-prewarm
+install -Dm755 leto/bounded.sh ~/.local/bin/leto-bounded
 install -Dm644 leto/prewarm/systemd/leto-prewarm@.service ~/.config/systemd/user/leto-prewarm@.service
 install -Dm644 leto/prewarm/systemd/leto-prewarm@.timer ~/.config/systemd/user/leto-prewarm@.timer
 mkdir -p ~/.config/leto-prewarm
@@ -60,14 +64,17 @@ The config uses one `NAME=value` per line. Quote values containing spaces or
 Values are literal after shell-style quote removal. `PREWARM_REPO` supports
 `~` expansion. Other settings can use absolute paths. Project settings override
 the inherited environment. Keys without the `PREWARM_` prefix go to the Cargo
-wrapper and the stats client. The config and cache roots honor
+wrapper and the stats client. The runner sets `SCCACHE_CLIENT_SIDE=required`
+and `SCCACHE_SERVER_AUTOSTART=false` for warming. The config and cache roots honor
 `XDG_CONFIG_HOME` and `XDG_CACHE_HOME`.
 
 | Setting | Default and purpose |
 | --- | --- |
 | `PREWARM_REPO` | Required. Canonical Git checkout. |
 | `PREWARM_BRANCH` | `main`. Local branch to warm. |
-| `PREWARM_COMMANDS` | `check --workspace --all-targets;test --workspace --no-run`. Semicolon-separated Cargo argument lists, beginning with a subcommand that accepts `-j`. The runner supplies `-j`. |
+| `PREWARM_COMMANDS` | `check --workspace --all-targets;test --workspace --no-run`. Semicolon-separated Cargo argument lists in priority order, highest first. Each begins with a subcommand that accepts `-j`, which the runner supplies. |
+| `PREWARM_COMMAND_TIMEOUTS` | `900`. Wall seconds per command, including pauses. Use one positive value for every command or a semicolon-separated value for each entry in `PREWARM_COMMANDS`. |
+| `PREWARM_MEMORY_MAX` | `8G`. Hard cap on each Cargo command and its descendants, with swap disabled. Accepts positive bytes or a size with a systemd suffix (`K`, `M`, `G`, `T`). |
 | `PREWARM_JOBS` | A quarter of the CPUs in the runner's affinity, rounded down with a minimum of one. |
 | `PREWARM_MIN_SPARE_CPUS` | `8`. Minimum host-wide spare logical CPUs after accounting for the runner's own usage. |
 | `PREWARM_PAUSE_AFTER` | `60`. Seconds of sustained CPU shortage before pausing Cargo. |
@@ -79,7 +86,6 @@ wrapper and the stats client. The config and cache roots honor
 | `PREWARM_COMPRESSION` | `zstd:1`. btrfs compression property set on the pre-warm folder and, once, on its existing directories. sccache clones pre-warm outputs into the cache and a clone keeps the source's compression, so an uncompressed tree inflates the cache on disk. Empty disables it. Ignored on other filesystems. |
 | `PREWARM_PROC_ROOT`, `PREWARM_CGROUP_ROOT` | Test overrides for `/proc` and `/sys/fs/cgroup`. |
 | `PREWARM_SCCACHE_BIN` | `sccache` on the configured PATH. Use the project's client binary for stats if the wrapper selects its own. |
-| `SCCACHE_CLIENT_SIDE` | `1`. Set it in the project config to override the pre-warm default. |
 
 Match the lane's toolchain, client settings, Rust flags, and Cargo profiles.
 The runner leaves Rust flags, incremental settings, and build paths to Cargo
@@ -102,18 +108,23 @@ project config where appropriate so pre-warm also leaves those slots free.
 
 The runner sets niceness to 19 (the usual `nice -n 19` for a manual run) and
 applies `ionice -c3`. The service also sets `CPUWeight=idle`, `Nice=19`, and
-`IOSchedulingClass=idle`. Lane work keeps scheduling priority. The resource
-gate estimates whether an idle-priority build can make progress and checks
-that the host has memory available for it.
+`IOSchedulingClass=idle`. Each Cargo command inherits those process priorities
+and runs in a transient user scope with `CPUWeight=idle`, `MemoryMax` and
+`MemorySwapMax=0`. The runner uses `leto/bounded.sh` to launch these scopes and
+manages their lifecycle so it can capture systemd's OOM result and write it
+to status after the scope exits. The supervisor is outside the command
+scope and stops it to terminate any remaining descendants. The scope also has a
+systemd runtime limit as a fallback. Lane work keeps scheduling priority.
 
 - The one-minute load average on devbox (64 logical CPUs) is often around 90,
   and on worker-02 (96 logical CPUs) it is often around 170. Load average
   counts runnable tasks and tasks in uninterruptible sleep. A threshold at
   half the CPU count can defer pre-warm indefinitely. The runner samples the
   host-wide CPU counters in `/proc/stat` and treats idle and I/O wait as
-  unused CPU. It subtracts its cgroup's CPU usage, read from `cpu.stat` via
-  `/proc/self/cgroup`. If cgroup usage is unavailable, it sums user and system
-  CPU time from the process tree. This keeps pre-warm's own CPU use from
+  unused CPU. Between commands it subtracts its cgroup's CPU usage, read from
+  `cpu.stat` via `/proc/self/cgroup`. While building or when cgroup usage is
+  unavailable, it sums CPU time from the process tree, which includes the
+  command scope. This keeps pre-warm's own CPU use from
   causing a pause.
 - The runner defers a new build below eight spare CPUs. During a build it
   stops the Cargo process group after 60 seconds below the threshold and
@@ -132,23 +143,26 @@ config to reflect how much CPU the build needs to make useful progress.
 On devbox, account for the pinned CPU partition when interpreting the
 host-wide totals. Adjust `PREWARM_JOBS` for the runner's affinity on either
 host, and raise the memory threshold if lane builds need more headroom.
-The pause allowance still applies across all commands in an attempt. When
-it expires, the runner kills the build group and retries on the next trigger.
+The gate runs before each command. When the host becomes busy between
+commands, the runner defers the rest of the attempt. The pause allowance
+applies across all commands in an attempt. A command timeout, pause timeout,
+or scope OOM ends the attempt and leaves the commit eligible for retry.
 
-Pre-warm enables client-side compilation. Cargo's sccache clients run the
+Pre-warm requires client-side compilation. Cargo's sccache clients run the
 compiler as their own child process and use the shared daemon as a cache
-gateway. This keeps compiler work inside Cargo's process group and the
-service's cgroup, where the idle settings and resource gate apply. Both modes
-use the same cache-key pipeline.
+gateway. This keeps compiler work inside Cargo's scope, where the idle
+settings, memory cap and resource gate apply. Both modes use the same
+cache-key pipeline.
 [Client-side compilation architecture](../../docs/Architecture.md#client-side-mode-sccache_client_side)
 
-Client-side mode currently writes compressed entries even when the daemon
-uses raw entries for reflinks. Lane hits on entries written by pre-warm
-therefore copy the outputs. The fork will address this separately.
+On btrfs, a compatible client and daemon can use a same-user Unix socket to
+reflink compatible output files into the cache. See
+[reflink cache hits](../../docs/Local.md#reflink-cache-hits).
 
-Keep `SCCACHE_LOG` unset for pre-warm because setting it disables client-side
-mode. With a server-side override, compiles run at the daemon's priority and
-can continue while Cargo is paused.
+Keep `SCCACHE_LOG` unset and leave distributed compilation disabled for
+pre-warm. The required client mode rejects these settings. When the server has
+miss diagnostics enabled, pre-warm requests still use the cache and skip
+server-side miss logging.
 
 The wrapper still applies the project's benchmark controls. For a timing
 run that requires an idle host or fixed cache contents, stop the project's
@@ -159,7 +173,9 @@ timer and service first, then start the timer again when the run is finished.
 `prewarm.log` records the tip, build output, timing, disk use, and deltas for
 compile requests, hits, misses, and writes. These are shared-server counters,
 so concurrent lanes also contribute to them. `status.json` records the latest
-attempt, the last successfully warmed commit, timings, and disk use. Check
+attempt, the last successfully warmed commit, per-command budgets and
+results, timings, and disk use. It records `oom` for a scope OOM kill and
+`timed_out` for a command that runs out of time. Check
 both files to confirm a merge warmed, then compare hits and build time for
 the same commands in a fresh lane. Existing incremental sessions can bypass
 the cache or skip cache writes, and some crate types are uncacheable. The
