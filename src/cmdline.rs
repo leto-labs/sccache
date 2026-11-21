@@ -213,23 +213,32 @@ pub fn try_parse() -> Result<Command> {
                 _ => {
                     if let (Some(path), Some(exe_filename)) = (env::var_os("PATH"), exe.file_name())
                     {
+                        // Without another program of this name, args[0] stays this
+                        // executable and every compile would run sccache again, without end.
+                        let refuse = || {
+                            anyhow!(
+                                "invoked as `{}`, but no other program of that name is in \
+                                 PATH; refusing to run itself as the compiler (name the binary \
+                                 `sccache` to use it as a wrapper)",
+                                exe.display()
+                            )
+                        };
                         match which_in(exe_filename, Some(&path), &cwd) {
                             Ok(ref full_path)
                                 if full_path.canonicalize()?
                                     == env::current_exe()?.canonicalize()? =>
                             {
-                                if let Some(dir) = full_path.parent() {
-                                    let path = env::join_paths(
-                                        env::split_paths(&path).filter(|p| p != dir),
-                                    )
-                                    .ok();
-                                    if let Ok(full_path) = which_in(exe_filename, path, &cwd) {
-                                        args[0] = full_path.into();
-                                    }
+                                let path = full_path.parent().and_then(|dir| {
+                                    env::join_paths(env::split_paths(&path).filter(|p| p != dir))
+                                        .ok()
+                                });
+                                match which_in(exe_filename, path, &cwd) {
+                                    Ok(full_path) => args[0] = full_path.into(),
+                                    Err(_) => return Err(refuse()),
                                 }
                             }
                             Ok(full_path) => args[0] = full_path.into(),
-                            Err(_) => {}
+                            Err(_) => return Err(refuse()),
                         }
                         args.insert(0, env!("CARGO_PKG_NAME").into());
                     }

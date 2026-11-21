@@ -161,3 +161,59 @@ fn test_clap_output_and_exit_codes() {
         .stdout("")
         .stderr(predicate::str::contains("--no-such-option"));
 }
+
+// A copy of sccache under another name masquerades as the compiler of that
+// name. When no other program has the name, it used to run itself as the
+// compiler, which re-executed it without end and exhausted a host.
+#[test]
+#[cfg(unix)]
+fn renamed_binary_refuses_to_run_itself_as_the_compiler() -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let tempdir = tempfile::Builder::new()
+        .prefix("sccache_renamed")
+        .tempdir()?;
+    let renamed = tempdir.path().join("renamed-sccache");
+    fs::copy(*SCCACHE_BIN, &renamed)?;
+    let system_path = std::env::var_os("PATH").unwrap_or_default();
+    let with_self = std::env::join_paths(
+        std::iter::once(tempdir.path().to_path_buf()).chain(std::env::split_paths(&system_path)),
+    )?;
+    for (program, path) in [
+        (renamed.as_os_str(), system_path.clone()),
+        (std::ffi::OsStr::new("renamed-sccache"), with_self),
+    ] {
+        // A regression would recurse or hang, so the child gets a hard deadline.
+        let mut child = Command::new(program)
+            .args(["rustc", "-vV"])
+            .env("PATH", path)
+            .env("SCCACHE_CLIENT_SIDE", "1")
+            .env("SCCACHE_SERVER_AUTOSTART", "0")
+            .env("SCCACHE_DIR", tempdir.path().join("cache"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait()?.is_none() {
+            if Instant::now() > deadline {
+                child.kill()?;
+                panic!("{program:?} did not exit within 10 s");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output()?;
+        assert!(!output.status.success());
+        // Parse errors are printed to stdout.
+        let printed = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            printed.contains("refusing to run itself"),
+            "{program:?}: {:?}: {printed}",
+            output.status
+        );
+    }
+    Ok(())
+}
