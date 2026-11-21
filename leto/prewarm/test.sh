@@ -210,6 +210,7 @@ PREWARM_POLL_SECONDS=0.1
 PREWARM_PAUSE_AFTER=0.5
 PREWARM_RESUME_AFTER=0.4
 PREWARM_MAX_PAUSE_SECONDS=10
+PREWARM_PAUSE_LOCKS="$tmp/missing.lock;$tmp/bench.lock"
 FIXTURE_EXTRA='value from project config'
 CARGO_MAKEFLAGS='-j --jobserver-auth=fifo:/nonexistent'
 MAKEFLAGS='-j --jobserver-auth=fifo:/nonexistent'
@@ -355,6 +356,18 @@ wait_for process_stopped "$rustc_pid"
 set_pressure 20
 wait_for resume_count_is 3
 printf 'ok - enabled CPU pressure gate pauses Cargo until avg60 drops\n'
+
+exec {bench_lock}>"$tmp/bench.lock"
+flock -x "$bench_lock"
+wait_for grep -q 'paused pid=.*pause lock .*bench.lock is held' "$tmp/background.log"
+wait_for process_stopped "$rustc_pid"
+sleep 0.5
+process_stopped "$rustc_pid" || fail "resumed while a pause lock was held"
+flock -u "$bench_lock"
+exec {bench_lock}>&-
+wait_for resume_count_is 4
+grep -q 'resumed pid=.*pause locks free' "$tmp/background.log" || fail "lock release did not resume Cargo"
+printf 'ok - an exclusively held pause lock stops Cargo until it is released\n'
 
 rm -- "$FIXTURE_CONTROL/hold"
 settled

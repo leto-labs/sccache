@@ -199,6 +199,11 @@ class ResourceGate:
         self.pause_after = float(settings.get("PREWARM_PAUSE_AFTER", 60))
         self.resume_after = float(settings.get("PREWARM_RESUME_AFTER", 30))
         self.poll = float(settings.get("PREWARM_POLL_SECONDS", 5))
+        # Projects hold these exclusively during timed runs (FairFill's
+        # bench-quiet.sh, Longbow's quiet host); pre-warm pauses while they do.
+        self.locks = [Path(os.path.expanduser(os.path.expandvars(path.strip())))
+                      for path in settings.get("PREWARM_PAUSE_LOCKS", "").split(";") if path.strip()]
+        self.lock_poll = min(1.0, self.poll) if self.locks else self.poll
         if (not all(math.isfinite(value) and value >= 0 for value in
                     (self.min_spare, self.pause_after, self.resume_after, self.poll))
                 or self.poll == 0 or not 0 <= self.min_mem < 0.95
@@ -238,6 +243,38 @@ class ResourceGate:
         busy = after.cpus * (after.busy - before.busy) / total
         own = max(0, after.own_seconds - before.own_seconds) / elapsed
         return after.cpus - max(0, busy - own)
+
+    def lock_blocker(self):
+        """The first pause lock someone holds exclusively, as a reason, or None.
+
+        A shared, non-blocking flock succeeds unless there is an exclusive holder;
+        it is released at once, so it never delays the holder's own locking for long.
+        """
+        for path in self.locks:
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                return f"cannot check pause lock {path}: {error.strerror}"
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return f"pause lock {path} is held"
+            finally:
+                os.close(fd)
+        return None
+
+    def wait_for_locks(self, interrupted, budget):
+        """Wait up to `budget` seconds for the pause locks; return (waited, reason)."""
+        started = time.monotonic()
+        while (reason := self.lock_blocker()) is not None:
+            waited = time.monotonic() - started
+            if waited >= budget:
+                return waited, reason
+            interrupted()
+            time.sleep(min(self.lock_poll, budget - waited))
+        return time.monotonic() - started, None
 
     def cpu_shortage(self, spare):
         return f"spare CPU {spare:.2f} < {self.min_spare:g}"
@@ -321,6 +358,7 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
     started = time.monotonic()
     deadline = started + budget
     paused_at = None
+    paused_for_lock = False
     cpu_streak_since = None
     try:
         previous = gate.cpu_sample(build_running=True)
@@ -332,7 +370,7 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise PrewarmError(f"command time budget reached ({budget:g}s)", "timed_out")
-                    timeout = min(gate.poll, remaining)
+                    timeout = min(gate.lock_poll, remaining)
                     if paused_at is not None:
                         remaining = pause_budget - status["paused_seconds"] - (time.monotonic() - paused_at)
                         if remaining <= 0:
@@ -341,7 +379,29 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
                     try:
                         code = process.wait(timeout=timeout)
                     except subprocess.TimeoutExpired:
-                        if timeout < gate.poll:
+                        lock = gate.lock_blocker()
+                        if lock is not None and paused_at is None:
+                            signal_group(process, signal.SIGSTOP)
+                            paused_at = time.monotonic()
+                            paused_for_lock = True
+                            cpu_streak_since = None
+                            log_event(log, f"paused pid={process.pid}: {lock}")
+                            continue
+                        if paused_for_lock:
+                            if lock is not None:
+                                continue
+                            # The timed run is over; only memory or pressure can hold us now.
+                            paused_for_lock = False
+                            if gate.memory_or_pressure_blocker(resuming=True) is None:
+                                status["paused_seconds"] += time.monotonic() - paused_at
+                                paused_at = None
+                                if status["paused_seconds"] >= pause_budget:
+                                    raise PrewarmError("maximum pause time reached; retrying on the next trigger")
+                                signal_group(process, signal.SIGCONT)
+                                previous = gate.cpu_sample(build_running=True)
+                                log_event(log, f"resumed pid={process.pid}: pause locks free")
+                            continue
+                        if time.monotonic() - previous.taken_at < gate.poll:
                             continue
                         current = gate.cpu_sample(build_running=True)
                         spare = gate.spare_cpus(previous, current)
@@ -362,7 +422,7 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
                             paused_at = time.monotonic()
                             cpu_streak_since = None
                             log_event(log, f"paused pid={process.pid}: {reason}")
-                        elif paused and reason is None and streak >= gate.resume_after:
+                        elif paused and reason is None and lock is None and streak >= gate.resume_after:
                             status["paused_seconds"] += time.monotonic() - paused_at
                             if status["paused_seconds"] >= pause_budget:
                                 paused_at = None
@@ -497,6 +557,12 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
     log_event(log, f"warming {tip} with {jobs} private Cargo jobs")
     try:
         for args, budget in commands:
+            waited, reason = gate.wait_for_locks(interrupted, max(0.0, pause_budget - status["paused_seconds"]))
+            status["paused_seconds"] += waited
+            if reason is not None:
+                status["deferred_command"] = shlex.join(args)
+                log_event(log, f"deferred {tip} before {status['deferred_command']}: {reason}")
+                return "deferred"
             reason = gate.startup_blocker(interrupted)
             if reason is not None:
                 status["deferred_command"] = shlex.join(args)

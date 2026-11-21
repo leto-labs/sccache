@@ -83,6 +83,7 @@ and `SCCACHE_SERVER_AUTOSTART=false` for warming. The config and cache roots hon
 | `PREWARM_MAX_CPU_PRESSURE` | `80`. Maximum CPU pressure `some avg60` percentage. Set to `0` to disable this gate. |
 | `PREWARM_POLL_SECONDS` | `5`. CPU sample interval before starting Cargo and while it runs. |
 | `PREWARM_MAX_PAUSE_SECONDS` | `900`. Total pause allowance per attempt, in seconds. |
+| `PREWARM_PAUSE_LOCKS` | Unset. Semicolon-separated lock files (`~` and `$VAR` expand; `${VAR:-default}` does not). While anyone holds one with an exclusive `flock` (FairFill's `scripts/bench-quiet.sh` holds `~/.cache/fairfill-bench/measurement.lock` during timed runs; Longbow's quiet host uses `~/.cache/longbow/locks/quiet-host.lock`), pre-warm waits before each command and pauses a running one (SIGSTOP), checking every second, then resumes as soon as the locks are free. The wait counts against `PREWARM_MAX_PAUSE_SECONDS`. A missing lock file counts as free. |
 | `PREWARM_COMPRESSION` | `zstd:1`. btrfs compression property set on the pre-warm folder and, once, on its existing directories. sccache clones pre-warm outputs into the cache and a clone keeps the source's compression, so an uncompressed tree inflates the cache on disk. Empty disables it. Ignored on other filesystems. |
 | `PREWARM_PROC_ROOT`, `PREWARM_CGROUP_ROOT` | Test overrides for `/proc` and `/sys/fs/cgroup`. |
 | `PREWARM_SCCACHE_BIN` | `sccache` on the configured PATH. Use the project's client binary for stats if the wrapper selects its own. |
