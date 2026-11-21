@@ -1,6 +1,15 @@
 # FairFill nextest integration
 
-The patch selects the devbox installation built from sccache commit `36a65426`. Set `LETO_TEST_CACHE=off` to opt out.
+The devbox runner is built from sccache commit `4c75a082`. Set `LETO_TEST_CACHE=off` to opt out.
+
+For an existing integration, update the runner path in `scripts/cargo.sh`.
+
+```diff
+-  leto_test_runner="$HOME/.local/opt/leto-test-runner-36a65426/bin/leto-test-runner"
++  leto_test_runner="$HOME/.local/opt/leto-test-runner-4c75a082/bin/leto-test-runner"
+```
+
+For a fresh integration, apply the patch below.
 
 ```diff
 diff --git a/scripts/cargo.sh b/scripts/cargo.sh
@@ -12,7 +21,7 @@ diff --git a/scripts/cargo.sh b/scripts/cargo.sh
 
 +# Collect test-result evidence during nextest runs when the runner is installed.
 +if [[ ${1:-} == nextest && ${LETO_TEST_CACHE:-} != off ]]; then
-+  leto_test_runner="$HOME/.local/opt/leto-test-runner-36a65426/bin/leto-test-runner"
++  leto_test_runner="$HOME/.local/opt/leto-test-runner-4c75a082/bin/leto-test-runner"
 +  if [[ -x $leto_test_runner ]]; then
 +    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$leto_test_runner"
 +    export LETO_TEST_CACHE_WORKSPACE="$PWD" LETO_TEST_CACHE_PROJECT=fairfill
