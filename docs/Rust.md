@@ -156,6 +156,42 @@ Without remapping, debug paths can differ. The script exits nonzero if a
 harness is missing, normalized bytes differ, raw bytes differ with remapping
 enabled, or a restored test fails.
 
+### Soaking stage `all`
+
+On a shared host, run the two-checkout driver in a private network namespace.
+Replace the paths with the project repository, a fresh work directory, and
+the sccache binary under test.
+
+```sh
+leto/test-sandboxed.sh leto/linked-soak-host.sh /work/project /work/soak-all 4241 \
+  "$PWD/target/release/sccache" --all --remap
+```
+
+The driver starts a private server in stage `all`. It runs
+`cargo build --workspace --bins --examples --message-format=json` and
+`cargo test --workspace --no-run --message-format=json` to fill the cache.
+The soak then runs both commands in the second checkout, once with the cache
+and once with `SCCACHE_NO_CACHE=1`. With an already warmed cache, point the
+comparison script directly at the second checkout from inside the namespace.
+
+```sh
+SCCACHE_BASEDIRS_REMAP_PATHS=1 leto/linked-soak.sh /work/checkout-b \
+  --targets all --warm-checkout /work/checkout-a
+```
+
+The report includes raw and stripped comparisons for bins, examples, test
+harnesses, and build-script executables. For each build-script execution it
+compares the `OUT_DIR` tree file by file and Cargo's `output` file, which
+contains the build script's stdout and `cargo:` directives. UTF-8 text comparisons
+replace the absolute checkout and Cargo target paths with placeholders. The
+driver supplies both checkouts for this normalization. The soak fails on
+missing outputs or normalized differences, and `--remap` also requires raw
+byte equality.
+
+Use `--run` to run the restored test harnesses. Repeat
+`--run-bins 'my-bin "argument with spaces"'` to smoke-run named restored
+binaries with their arguments.
+
 ## Incremental compilation
 
 Cargo enables incremental compilation for workspace members and path
