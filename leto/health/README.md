@@ -35,7 +35,11 @@ host TOML separately. It records the installed binary's version and SHA-256
 along with the server-reported version when available.
 
 Cache fill uses the server's tracked, potentially weighted size and cap when
-available. The disk columns record GNU `du` apparent and allocated bytes.
+available. A full cache sits at its cap by design, so the report warns only
+when the tracked size exceeds the cap by more than 1%. "On disk" divides the
+physical footprint (btrfs extents when compsize ran, else allocated bytes) by
+the cap and warns above 110%: reflink weights estimate compressed size, so a
+btrfs cache can hold far more logical bytes than its cap. The disk columns record GNU `du` apparent and allocated bytes.
 On btrfs, passwordless `sudo -n compsize` adds extent figures when it finishes
 within 60 seconds. The two-level cache entry count has a two-second budget.
 Both cache walks and incremental `du` run at idle CPU and I/O priority.

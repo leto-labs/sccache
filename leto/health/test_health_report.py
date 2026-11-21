@@ -145,7 +145,7 @@ class HealthReportTest(unittest.TestCase):
         self.assertEqual(report["config"]["shutdown_drain_secs"], 300)
         cache = report["cache"]
         self.assertEqual((cache["cap_bytes"], cache["fill_pct"], cache["fill_basis"]),
-                         (1000, 97, "server_size_bytes"))
+                         (1000, 102, "server_size_bytes"))
         self.assertGreaterEqual(cache["apparent_bytes"], 8192)
         self.assertGreaterEqual(cache["allocated_bytes"], 8192)
         self.assertEqual(cache["entry_count"], 1)
@@ -184,7 +184,7 @@ class HealthReportTest(unittest.TestCase):
             expected = int(subprocess.check_output(["du", "-s", "-B1", str(path)]).split()[0])
             self.assertEqual(incremental[key], expected)
 
-        for message in ("RSS exceeds", "95% of cap", "over 3 hours", "12 commits behind", "invalid JSON"):
+        for message in ("RSS exceeds", "tracked size exceeds cap", "of cap on disk", "over 3 hours", "12 commits behind", "invalid JSON"):
             self.assertTrue(any(message in warning for warning in report["warnings"]), report["warnings"])
         text = REPORT["markdown"](report)
         for content in ("## Server", "## Cache", "## Misses · last 24 h", "## Miss log",
@@ -207,7 +207,7 @@ class HealthReportTest(unittest.TestCase):
         proc = subprocess.run([sys.executable, HERE / "health-report.py", *self.argv, "--format", "markdown",
                                "--out", out], capture_output=True, check=True)
         self.assertEqual(proc.stdout, b"")
-        self.assertIn("97.0%", out.read_text())
+        self.assertIn("102.0%", out.read_text())
 
     def test_automatic_fast_scan_extrapolates_by_project(self):
         for index in range(101):

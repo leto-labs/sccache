@@ -13,7 +13,7 @@
     "rust_linked_entry_too_large": 5,
     "miss_explain": {"new": 9, "own-input": 8, "dependency": 7, "unchanged": 6}
   },
-  "cache_size": 970,
+  "cache_size": 1020,
   "max_cache_size": 1000,
   "version": "test-daemon",
   "effective_cache_mode": "Server"

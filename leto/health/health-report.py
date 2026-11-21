@@ -246,7 +246,7 @@ def cache_report(config, info, warnings):
     cache = {"dir": str(path), "cap_bytes": cap, "server_size_bytes": tracked,
              "apparent_bytes": None, "allocated_bytes": None,
              "btrfs_extent_bytes": None, "entry_count": None, "fill_pct": None,
-             "fill_basis": None}
+             "fill_basis": None, "disk_pct": None}
     for key, flags in (("allocated_bytes", []), ("apparent_bytes", ["--apparent-size"])):
         try:
             cache[key] = int(du([*flags, "-H", "--", path]).split(b"\t", 1)[0])
@@ -270,9 +270,16 @@ def cache_report(config, info, warnings):
         if type(used) is int and type(cap) is int and cap > 0:
             cache["fill_basis"] = basis
             cache["fill_pct"] = round(100 * used / cap, 2)
-            if 100 * used > 95 * cap:
-                warnings.append(f"Cache exceeds 95% of cap ({cache['fill_pct']:.2f}%)")
+            # LRU eviction keeps a full cache at its cap, so only overshoot is news.
+            if 100 * used > 101 * cap:
+                warnings.append(f"Cache tracked size exceeds cap ({cache['fill_pct']:.2f}%)")
             break
+    # Reflink weights estimate compressed size, so on btrfs compare the real extents.
+    disk = (cache["btrfs_extent_bytes"] or {}).get("disk_usage") or cache["allocated_bytes"]
+    if type(disk) is int and type(cap) is int and cap > 0:
+        cache["disk_pct"] = round(100 * disk / cap, 2)
+        if 100 * disk > 110 * cap:
+            warnings.append(f"Cache uses {cache['disk_pct']:.2f}% of cap on disk")
     return cache
 
 
@@ -678,10 +685,10 @@ def markdown(report):
                     f"{display(stats.get('rust_incremental_not_stored'))} / "
                     f"{display(stats.get('rust_linked_entry_too_large'))}", summarize(stats.get("miss_explain", {}))]]),
                 "## Cache",
-                table(["Directory", "Cap", "Apparent", "Allocated", "btrfs extents", "Entries", "Fill", "Reflink"], [[
+                table(["Directory", "Cap", "Apparent", "Allocated", "btrfs extents", "Entries", "Fill", "On disk", "Reflink"], [[
                     cache["dir"], gib(cache["cap_bytes"]), gib(cache["apparent_bytes"]), gib(cache["allocated_bytes"]),
                     gib((cache["btrfs_extent_bytes"] or {}).get("disk_usage")), cache["entry_count"],
-                    display(cache["fill_pct"], "%"), config["reflink"]]]) + "\n" + table(
+                    display(cache["fill_pct"], "%"), display(cache["disk_pct"], "%"), config["reflink"]]]) + "\n" + table(
                     ["Linked stage", "Linked entry cap", "Shutdown drain", "Autostart", "Connect wait"], [[
                         config["rust_cache_linked"], gib(config["rust_cache_linked_max_entry_bytes"]),
                         display(config["shutdown_drain_secs"], " s"), config["autostart"],

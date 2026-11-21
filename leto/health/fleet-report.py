@@ -54,7 +54,7 @@ def headline(report):
         with_suffix(stats.get("hit_rate_pct", {}).get("rust"), "%"),
         with_suffix(misses.get("total")),
         f"{cause} ({counts[cause]})" if cause else "—",
-        with_suffix(report.get("cache", {}).get("fill_pct"), "%"),
+        with_suffix(report.get("cache", {}).get("disk_pct"), "%"),
         lags or "—",
         str(len(report["warnings"])),
         with_suffix(report["runtime_seconds"], " s"),
@@ -63,7 +63,7 @@ def headline(report):
 
 def markdown(fleet):
     lines = ["# Fleet build health", "", fleet["generated_at"], "",
-             "| Host | Rust hit rate | Misses/24h | Top miss cause | Cache fill | Pre-warm lag | Warnings | Runtime |",
+             "| Host | Rust hit rate | Misses/24h | Top miss cause | Cache on disk | Pre-warm lag | Warnings | Runtime |",
              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     warnings = []
     for host, report in fleet["hosts"].items():
