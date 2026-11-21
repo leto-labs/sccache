@@ -10,6 +10,8 @@
 # Usage: leto/test-sandboxed.sh [command ...]
 #   leto/test-sandboxed.sh cargo test --locked --test system -- basedirs
 set -euo pipefail
+# Test runs start private daemons; run them capped and torn down (leto/bounded.sh).
+[[ -n ${LETO_BOUNDED:-} ]] || exec "$(dirname "$(readlink -f "$0")")/bounded.sh" --timeout "${LETO_TIMEOUT:-5400}" -- "$(readlink -f "$0")" "$@"
 cd "$(dirname "$(readlink -f "$0")")/.."
 # Under $HOME, not /tmp: tests that need btrfs reflinks probe their temp dir
 # and skip on other filesystems (on the workers /tmp is ext4). Not inside the

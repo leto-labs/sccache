@@ -13,6 +13,8 @@
 #   --remap    SCCACHE_BASEDIRS_REMAP_PATHS=1: require raw byte equality
 # The shared server is never used: the run has its own port, config and cache.
 set -euo pipefail
+# Private soaks run capped and are torn down afterwards (leto/bounded.sh).
+[[ -n ${LETO_BOUNDED:-} ]] || exec "$(dirname "$(readlink -f "$0")")/bounded.sh" --timeout "${LETO_TIMEOUT:-10800}" -- bash "$(readlink -f "$0")" "$@"
 repo=$(readlink -f "${1:?repo}"); work=${2:?workdir}; port=${3:?port}; bin=$(readlink -f "${4:?sccache binary}")
 shift 4
 soak_args=() targets=tests reflink=false remap=
