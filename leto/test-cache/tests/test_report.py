@@ -20,6 +20,8 @@ class ReportTest(unittest.TestCase):
         foreign = {**lookups, "other_reads": ["/home/u/.aws/credentials"]}
         self.assertEqual(report.observed_class(row, foreign), "other")
         self.assertEqual(report.observed_class(row, {**lookups, "outside_writes": ["/var/x"]}), "other")
+        listing = {**lookups, "ancestor_lookups": ["/home"], "other_reads": ["/home"]}
+        self.assertEqual(report.observed_class(row, listing), "other")
 
     def test_cancelled_runs_are_not_nondeterminism(self):
         cancelled = report.mismatch_class(("p", "b", "t"), set(), (("signal", 2),), (("exit", 0),))

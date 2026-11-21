@@ -357,7 +357,10 @@ attempt for the same binary and test. A real failure costs one extra run.
 - Observer (ptrace with a seccomp prefilter on path, network and process
   calls): the run is clean when no traced call was denied and every path
   argument, including `stat` and `access`, resolves inside the allowed set
-  or to a system path that does not exist.
+  or to a system path that does not exist. Path resolution and metadata
+  lookups on ancestors of the checkout or `TMPDIR` (including `/`) are
+  allowed and recorded separately. The usual read rules apply to directory
+  listings.
 - Environment: exactly the keyed variables plus `TMPDIR`.
 
 E4 shows the behaviour without the observer: pure tests, temp-file, clock
@@ -396,8 +399,9 @@ stored it:
 1. The process could read only the binary, its libraries, fixed system
    paths and a private empty directory (Landlock), could create no socket
    and start no program (seccomp).
-2. No access was denied and no path outside that set was probed (observer),
-   so the test did not take a branch that depends on the sandbox.
+2. No access was denied and the observer saw only the path probes allowed
+   by the sandbox profile, so the test did not take a branch that depends
+   on the sandbox.
 3. It saw only environment variables whose values are in K.
 4. It was the first attempt and exited 0.
 

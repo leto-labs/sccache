@@ -51,6 +51,12 @@ terminfo database, can change the verdict. Evidence in a record is bounded.
 Paths prefixed with `./` are relative to the reported worktree. Classification
 continues after the evidence limit is reached.
 
+Metadata lookups on ancestors of the worktree or `TMPDIR`, including `/`,
+are recorded in `ancestor_lookups`. Opening an ancestor with `O_PATH` or
+`O_DIRECTORY` counts as a lookup. The observer resolves the descriptor
+when a test calls `getdents` or `getdents64` and applies the usual read rules
+to the directory entries. An unresolved listing makes the run impure.
+
 Devbox permits tracing child processes at Yama scope 1. If attachment or filter
 setup fails, the test runs unfiltered and the record says `unavailable`. Unprivileged
 Linux seccomp requires `no_new_privs`, and programs can detect ptrace or timing

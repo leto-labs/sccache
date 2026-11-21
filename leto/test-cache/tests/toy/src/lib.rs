@@ -13,6 +13,33 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_lookups() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(std::fs::canonicalize(".").unwrap(), cwd);
+        let parent = cwd.parent().unwrap();
+        assert_eq!(std::fs::canonicalize(parent).unwrap(), parent);
+        assert!(std::fs::metadata("/").unwrap().is_dir());
+        assert!(
+            std::fs::metadata(std::env::temp_dir().parent().unwrap())
+                .unwrap()
+                .is_dir()
+        );
+        drop(std::fs::read_dir("..").unwrap());
+    }
+
+    #[test]
+    fn ancestor_listing() {
+        assert!(std::fs::read_dir("..").unwrap().next().unwrap().is_ok());
+    }
+
+    #[test]
+    fn outside_read() {
+        let temp = std::env::temp_dir();
+        let outside = temp.parent().unwrap().join("outside.txt");
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside\n");
+    }
+
+    #[test]
     fn files() {
         assert!(!std::path::Path::new("absent.txt").exists());
         assert_eq!(std::fs::read_to_string("fixture.txt").unwrap(), "fixture\n");

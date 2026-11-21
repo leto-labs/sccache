@@ -10,8 +10,7 @@ use serde_json::{Value, json};
 
 use crate::process;
 
-pub const PROFILE: &str =
-    "linux-x86_64-observer-v1:binary,closure,ld-cache,proc,cgroup,null,urandom,tmp";
+pub const PROFILE: &str = "linux-x86_64-observer-v2:binary,closure,ld-cache,proc,cgroup,null,urandom,tmp,ancestor-lookups";
 const AT_CWD: i32 = c::AT_FDCWD;
 
 #[derive(Clone, Copy)]
@@ -19,9 +18,12 @@ enum Decode {
     Open,
     OpenAt,
     OpenAt2,
+    Metadata,
+    MetadataAt,
+    MetadataFd,
     Read,
-    ReadAt,
     ReadFd,
+    ListFd,
     Write,
     WriteAt,
     WriteFd,
@@ -47,22 +49,22 @@ const SYSCALLS: &[(c::c_long, Decode)] = &[
     (c::SYS_creat, Write),
     (c::SYS_openat, OpenAt),
     (c::SYS_openat2, OpenAt2),
-    (c::SYS_stat, Read),
-    (c::SYS_lstat, Read),
-    (c::SYS_fstat, ReadFd),
-    (c::SYS_newfstatat, ReadAt),
-    (c::SYS_statx, ReadAt),
+    (c::SYS_stat, Metadata),
+    (c::SYS_lstat, Metadata),
+    (c::SYS_fstat, MetadataFd),
+    (c::SYS_newfstatat, MetadataAt),
+    (c::SYS_statx, MetadataAt),
     (c::SYS_statfs, Read),
     (c::SYS_fstatfs, ReadFd),
-    (c::SYS_access, Read),
-    (c::SYS_faccessat, ReadAt),
-    (c::SYS_faccessat2, ReadAt),
-    (c::SYS_readlink, Read),
-    (c::SYS_readlinkat, ReadAt),
-    (c::SYS_getdents, ReadFd),
-    (c::SYS_getdents64, ReadFd),
-    (c::SYS_chdir, Read),
-    (c::SYS_fchdir, ReadFd),
+    (c::SYS_access, Metadata),
+    (c::SYS_faccessat, MetadataAt),
+    (c::SYS_faccessat2, MetadataAt),
+    (c::SYS_readlink, Metadata),
+    (c::SYS_readlinkat, MetadataAt),
+    (c::SYS_getdents, ListFd),
+    (c::SYS_getdents64, ListFd),
+    (c::SYS_chdir, Metadata),
+    (c::SYS_fchdir, MetadataFd),
     (c::SYS_getxattr, Read),
     (c::SYS_lgetxattr, Read),
     (c::SYS_fgetxattr, ReadFd),
@@ -243,6 +245,12 @@ impl Rules {
             }
         }
     }
+
+    fn is_ancestor(&self, path: &Path) -> bool {
+        path == Path::new("/")
+            || (path != self.checkout && self.checkout.starts_with(path))
+            || (path != self.temp && self.temp.starts_with(path))
+    }
 }
 
 #[derive(Default)]
@@ -253,6 +261,7 @@ struct Trace {
     outside_writes: BTreeSet<String>,
     absent_probes: BTreeSet<String>,
     loader_probes: BTreeSet<String>,
+    ancestor_lookups: BTreeSet<String>,
     sockets: BTreeSet<(i32, Option<bool>)>,
     executables: BTreeSet<String>,
     files: bool,
@@ -286,12 +295,24 @@ impl Trace {
                     .map(|tail| PathBuf::from(format!("/proc/{}", access.pid)).join(tail))
             });
         let resolved = resolve(proc_path.as_deref().unwrap_or(&path));
+        if access.kind == Lookup && !absent && rules.is_ancestor(&resolved) {
+            insert(
+                &mut self.ancestor_lookups,
+                &resolved.to_string_lossy(),
+                &mut self.budget,
+                &mut self.truncated,
+            );
+            return;
+        }
         let display = path
             .strip_prefix(&rules.checkout)
             .ok()
             .map(|p| Path::new(".").join(p));
         let text = display.as_deref().unwrap_or(&path).to_string_lossy();
-        if access.loader && (absent || resolved.is_dir()) {
+        if access.loader
+            && matches!(access.kind, Lookup | ReadContent)
+            && (absent || resolved.is_dir())
+        {
             let paths = if absent {
                 &mut self.absent_probes
             } else {
@@ -314,7 +335,7 @@ impl Trace {
         ]
         .iter()
         .any(|base| resolved.starts_with(base));
-        if access.write {
+        if access.kind == Mutate {
             if in_checkout || !resolved.starts_with(&rules.temp) {
                 self.reason.get_or_insert("write outside TMPDIR");
                 insert(
@@ -411,6 +432,7 @@ impl Trace {
             "checkout_reads": self.checkout_reads, "system_reads": self.system_reads,
             "other_reads": self.other_reads, "outside_writes": self.outside_writes,
             "absent_probes": self.absent_probes, "loader_probes": self.loader_probes, "sockets": sockets,
+            "ancestor_lookups": self.ancestor_lookups,
             "executables": self.executables, "truncated": self.truncated,
         })
     }
@@ -443,10 +465,20 @@ fn resolve(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PathAccess {
+    Lookup,
+    ReadContent,
+    ListDirectory,
+    Mutate,
+}
+
+use PathAccess::*;
+
 struct Access {
     pid: c::pid_t,
     path: PathBuf,
-    write: bool,
+    kind: PathAccess,
     loader: bool,
 }
 
@@ -517,9 +549,18 @@ fn argument_path(pid: c::pid_t, dir: i32, address: u64) -> io::Result<Option<Pat
     }))
 }
 
-fn is_write(flags: u64) -> bool {
-    flags & ((c::O_ACCMODE | c::O_CREAT | c::O_TRUNC) as u64) != 0
+fn open_access(flags: u64) -> PathAccess {
+    if flags & c::O_PATH as u64 != 0 {
+        Lookup
+    } else if flags & ((c::O_ACCMODE | c::O_CREAT | c::O_TRUNC) as u64) != 0
         || flags & c::O_TMPFILE as u64 == c::O_TMPFILE as u64
+    {
+        Mutate
+    } else if flags & c::O_DIRECTORY as u64 != 0 {
+        Lookup
+    } else {
+        ReadContent
+    }
 }
 
 fn address(pid: c::pid_t, trace: &mut Trace, ptr: u64, len: u64) -> io::Result<()> {
@@ -555,44 +596,66 @@ fn decode(
 ) -> io::Result<Vec<Access>> {
     let [a, b, d, e, f, g] = arg;
     let mut paths = Vec::new();
-    let mut add = |dir, ptr, write| -> io::Result<()> {
+    let mut add = |dir, ptr, kind| -> io::Result<()> {
         if let Some(path) = argument_path(pid, dir, ptr)? {
             paths.push(Access {
                 pid,
                 path,
-                write,
+                kind,
                 loader,
             });
         }
         Ok(())
     };
     match kind {
-        Open => add(AT_CWD, a, is_write(b))?,
-        OpenAt => add(a as i32, b, is_write(d))?,
+        Open => add(AT_CWD, a, open_access(b))?,
+        OpenAt => add(a as i32, b, open_access(d))?,
         OpenAt2 => {
             let mut flags = [0; 8];
             if read_memory(pid, d, &mut flags)? != flags.len() {
                 return Err(io::Error::other("incomplete open_how"));
             }
-            add(a as i32, b, is_write(u64::from_ne_bytes(flags)))?;
+            add(a as i32, b, open_access(u64::from_ne_bytes(flags)))?;
         }
-        Read => add(AT_CWD, a, false)?,
-        ReadAt => add(a as i32, b, false)?,
-        ReadFd if a > 2 => add(a as i32, 0, false)?,
-        ReadFd => {}
-        Write => add(AT_CWD, a, true)?,
-        WriteAt => add(a as i32, b, true)?,
-        WriteFd => add(a as i32, 0, true)?,
+        Metadata => add(AT_CWD, a, Lookup)?,
+        MetadataAt => add(a as i32, b, Lookup)?,
+        MetadataFd if a > 2 => add(a as i32, 0, Lookup)?,
+        Read => add(AT_CWD, a, ReadContent)?,
+        ReadFd if a > 2 => add(a as i32, 0, ReadContent)?,
+        MetadataFd | ReadFd => {}
+        ListFd => {
+            // Resolve the live descriptor so dup, inheritance and fd reuse
+            // do not depend on which open call originally supplied it.
+            add(a as i32, 0, ListDirectory)?;
+            if paths.is_empty() {
+                trace
+                    .reason
+                    .get_or_insert("could not resolve directory listing");
+            }
+        }
+        Write => add(AT_CWD, a, Mutate)?,
+        WriteAt => add(a as i32, b, Mutate)?,
+        WriteFd => add(a as i32, 0, Mutate)?,
         Rename | Link => {
-            add(AT_CWD, a, matches!(kind, Rename))?;
-            add(AT_CWD, b, true)?;
+            let source = if matches!(kind, Rename) {
+                Mutate
+            } else {
+                ReadContent
+            };
+            add(AT_CWD, a, source)?;
+            add(AT_CWD, b, Mutate)?;
         }
         RenameAt | LinkAt => {
-            add(a as i32, b, matches!(kind, RenameAt))?;
-            add(d as i32, e, true)?;
+            let source = if matches!(kind, RenameAt) {
+                Mutate
+            } else {
+                ReadContent
+            };
+            add(a as i32, b, source)?;
+            add(d as i32, e, Mutate)?;
         }
-        Symlink => add(AT_CWD, b, true)?,
-        SymlinkAt => add(b as i32, d, true)?,
+        Symlink => add(AT_CWD, b, Mutate)?,
+        SymlinkAt => add(b as i32, d, Mutate)?,
         Socket => trace.socket(a as i32, None),
         Address => address(pid, trace, b, d)?,
         SendTo => address(pid, trace, f, g)?,
@@ -755,7 +818,7 @@ mod tests {
         let read = |p: &str| Access {
             pid: 0,
             path: p.into(),
-            write: false,
+            kind: ReadContent,
             loader: false,
         };
         trace.record_path(read("/etc/leto-missing"), -i64::from(c::ENOENT), &rules);
@@ -767,7 +830,7 @@ mod tests {
             Access {
                 pid: 0,
                 path: "/outside".into(),
-                write: true,
+                kind: Mutate,
                 loader: false,
             },
             0,

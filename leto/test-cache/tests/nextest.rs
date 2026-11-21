@@ -314,6 +314,11 @@ fn unavailable_observer_runs_the_test_without_observation() {
 fn nextest_classifies_tests_and_preserves_timeout_and_listing() {
     let scratch = Scratch::create();
     let root = &scratch.0;
+    let outside = Scratch::create();
+    let temp = outside.0.join("tmp");
+    let outside_file = outside.0.join("outside.txt");
+    fs::create_dir(&temp).unwrap();
+    fs::write(&outside_file, "outside\n").unwrap();
     let version = cargo(root).args(["nextest", "--version"]).output().unwrap();
     if !version.status.success() {
         eprintln!("skipped nextest integration: cargo-nextest is unavailable");
@@ -327,7 +332,7 @@ fn nextest_classifies_tests_and_preserves_timeout_and_listing() {
                 .env("LETO_TEST_CACHE_DIR", root.join("logs"))
                 .env("LETO_TEST_CACHE_OBSERVE", "1");
         }
-        command.args(args).output().unwrap()
+        command.env("TMPDIR", &temp).args(args).output().unwrap()
     };
     let list = ["nextest", "list", "--message-format", "json", "--offline"];
     let plain_list = run(false, &list);
@@ -357,7 +362,7 @@ fn nextest_classifies_tests_and_preserves_timeout_and_listing() {
         "tests::timeout",
         "SIGTERM",
         "tests::killed",
-        "5 passed",
+        "8 passed",
     ] {
         assert!(
             plain_text.contains(snippet) && shadow_text.contains(snippet),
@@ -369,7 +374,7 @@ fn nextest_classifies_tests_and_preserves_timeout_and_listing() {
     let records = records(root);
     assert_eq!(
         records.len(),
-        7,
+        10,
         "{shadow_text}\n{records:#?}\n{:?}",
         fs::read_dir(root.join("logs/errors")).map(|entries| entries
             .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
@@ -377,6 +382,9 @@ fn nextest_classifies_tests_and_preserves_timeout_and_listing() {
     );
     for (test, class) in [
         ("pure", "pure"),
+        ("ancestor_lookups", "pure"),
+        ("ancestor_listing", "other"),
+        ("outside_read", "other"),
         ("files", "files"),
         ("network", "network"),
         ("exec", "exec"),
@@ -389,7 +397,26 @@ fn nextest_classifies_tests_and_preserves_timeout_and_listing() {
             .find(|row| row["test"] == format!("tests::{test}"))
             .unwrap();
         assert_eq!(record["observer"]["class"], class, "{record}");
+        let contains_path = |field: &str, path: &Path| {
+            let canonical = path.canonicalize().unwrap();
+            assert!(
+                record["observer"][field]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry.as_str() == canonical.to_str()),
+                "{field} missing {} in {record}",
+                canonical.display()
+            );
+        };
         match test {
+            "ancestor_lookups" => {
+                for path in [Path::new("/"), root.parent().unwrap(), &outside.0] {
+                    contains_path("ancestor_lookups", path);
+                }
+            }
+            "ancestor_listing" => contains_path("other_reads", root.parent().unwrap()),
+            "outside_read" => contains_path("other_reads", &outside_file),
             "files" => {
                 assert!(
                     record["observer"]["checkout_reads"]

@@ -196,10 +196,10 @@ def ancestors(path):
 
 
 def observed_class(row, observed):
-    """The runner's class, except that looking up the checkout's ancestor
-    directories (canonicalize, current_dir) does not make a test impure."""
+    """Approximate ancestor lookups for records from before the runner tracked them."""
     purity = observed.get("class")
-    if (purity == "other" and (observed.get("reason") or "").startswith("read outside")
+    if ("ancestor_lookups" not in observed and purity == "other"
+            and (observed.get("reason") or "").startswith("read outside")
             and not observed.get("outside_writes")):
         allowed = ancestors(row.get("worktree") or "") | {"/tmp"}
         if all(path in allowed for path in observed.get("other_reads", [])):
