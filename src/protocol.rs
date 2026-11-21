@@ -102,6 +102,8 @@ pub enum Response {
     ArtifactNotification(Vec<u8>),
     /// `Ok(false)` requests the usual raw-entry fallback.
     StoragePutByPath(Result<bool, String>),
+    /// `Request::Shutdown` refused: `[server] allow_client_shutdown = false`.
+    ShutdownRefused(String),
 }
 
 /// Possible responses from the server for a `Compile` request.

@@ -326,6 +326,38 @@ exec rustc "$@"
         fixture.assert_compiler_invocations(2);
     }
 
+    // Shared servers set this so that no test, agent or script talking to the
+    // socket can stop them; their service manager still can.
+    #[test]
+    fn test_client_shutdown_can_be_refused() {
+        let fixture = Fixture::new(30, false, 0);
+        let mut server = Process::spawn(
+            fixture
+                .command()
+                .env("SCCACHE_START_SERVER", "1")
+                .env("SCCACHE_NO_DAEMON", "1")
+                .env("SCCACHE_SERVER_ALLOW_CLIENT_SHUTDOWN", "false"),
+        );
+        wait_for(|| {
+            assert!(server.child().try_wait().unwrap().is_none());
+            TcpStream::connect(fixture.addr).is_ok()
+        });
+
+        fixture
+            .command()
+            .arg("--stop-server")
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("allow_client_shutdown = false"));
+        thread::sleep(Duration::from_millis(200));
+        assert!(server.child().try_wait().unwrap().is_none());
+        assert!(TcpStream::connect(fixture.addr).is_ok());
+
+        server.signal(libc::SIGTERM);
+        fixture.wait_for_closed_listener();
+        server.wait().assert().success();
+    }
+
     #[test]
     fn test_second_sigterm_ends_drain() {
         let fixture = Fixture::new(30, false, 0);

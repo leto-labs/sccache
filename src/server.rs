@@ -783,6 +783,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
                     config.rust_cache_linked_max_entry_bytes(),
                 );
         service.background_cache_writes = true;
+        service.allow_client_shutdown = config.server.allow_client_shutdown;
 
         SccacheServer {
             runtime,
@@ -1020,6 +1021,7 @@ where
     compile_queue: Option<Arc<CompileQueue>>,
     pending_cache_writes: Arc<PendingCacheWrites>,
     background_cache_writes: bool,
+    allow_client_shutdown: bool,
     same_user: bool,
 
     /// Distributed sccache client
@@ -1248,6 +1250,16 @@ where
                     me.zero_stats().await;
                     Ok(Message::WithoutBody(Response::ZeroStats))
                 }
+                Request::Shutdown if !me.allow_client_shutdown => {
+                    warn!(
+                        "refusing a client shutdown request: [server] allow_client_shutdown = false"
+                    );
+                    Ok(Message::WithoutBody(Response::ShutdownRefused(
+                        "this sccache server does not accept shutdown requests from clients \
+                         ([server] allow_client_shutdown = false); stop its service instead"
+                            .to_owned(),
+                    )))
+                }
                 Request::Shutdown => {
                     debug!("handle_client: shutdown");
                     let mut tx = me.tx.clone();
@@ -1406,6 +1418,7 @@ where
             compile_queue: client.compile_queue(),
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
+            allow_client_shutdown: true,
             same_user: false,
             dist_client: Arc::new(dist_client),
             storage,
@@ -1455,6 +1468,7 @@ where
             compile_queue: None,
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
+            allow_client_shutdown: true,
             same_user: false,
             dist_client: Arc::new(dist_client),
             storage,
@@ -1489,6 +1503,7 @@ where
             compile_queue: None,
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
+            allow_client_shutdown: true,
             same_user: false,
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
                 Box::new(DistClientConfig {

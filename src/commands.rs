@@ -432,10 +432,10 @@ pub fn request_shutdown(mut conn: ServerConnection) -> Result<ServerInfo> {
     let response = conn
         .request(Request::Shutdown)
         .context("Failed to send data to or receive data from server")?;
-    if let Response::ShuttingDown(stats) = response {
-        Ok(*stats)
-    } else {
-        bail!("Unexpected server response!")
+    match response {
+        Response::ShuttingDown(stats) => Ok(*stats),
+        Response::ShutdownRefused(reason) => bail!("{reason}"),
+        _ => bail!("Unexpected server response!"),
     }
 }
 

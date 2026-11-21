@@ -903,6 +903,9 @@ pub struct ServerConfig {
     pub autostart: bool,
     pub connect_wait_secs: u64,
     pub put_raw_max_in_flight_bytes: u64,
+    /// When false, `--stop-server` and other shutdown requests over the socket
+    /// are refused; only a signal (SIGTERM from systemd) stops the daemon.
+    pub allow_client_shutdown: bool,
 }
 
 impl Default for ServerConfig {
@@ -912,6 +915,7 @@ impl Default for ServerConfig {
             autostart: true,
             connect_wait_secs: 30,
             put_raw_max_in_flight_bytes: 1024 * 1024 * 1024,
+            allow_client_shutdown: true,
         }
     }
 }
@@ -922,6 +926,7 @@ struct ServerEnvConfig {
     autostart: Option<bool>,
     connect_wait_secs: Option<u64>,
     put_raw_max_in_flight_bytes: Option<u64>,
+    allow_client_shutdown: Option<bool>,
 }
 
 // TODO: fields only pub for tests
@@ -1511,6 +1516,7 @@ fn config_from_env() -> Result<EnvConfig> {
                 "SCCACHE_SERVER_PUT_RAW_MAX_IN_FLIGHT_BYTES",
             )
             .transpose()?,
+            allow_client_shutdown: bool_from_env_var("SCCACHE_SERVER_ALLOW_CLIENT_SHUTDOWN")?,
         },
         miss_explain: env::var_os("SCCACHE_MISS_EXPLAIN").map(PathBuf::from),
         rust_incremental,
@@ -1712,6 +1718,9 @@ impl Config {
             put_raw_max_in_flight_bytes: env_server
                 .put_raw_max_in_flight_bytes
                 .unwrap_or(file_server.put_raw_max_in_flight_bytes),
+            allow_client_shutdown: env_server
+                .allow_client_shutdown
+                .unwrap_or(file_server.allow_client_shutdown),
         };
         let miss_explain = match env_miss_explain {
             Some(path) if path.as_os_str().is_empty() => None,
@@ -2778,7 +2787,7 @@ fn test_managed_server_config() {
     let env_log = cwd.join("override.jsonl");
     let path = |path: &Path| toml::Value::String(path.to_str().unwrap().to_owned());
     let file = format!(
-        "miss_explain = {}\n[server]\nshutdown_drain_secs = 300\nautostart = false\nconnect_wait_secs = 45\nput_raw_max_in_flight_bytes = 8192",
+        "miss_explain = {}\n[server]\nshutdown_drain_secs = 300\nautostart = false\nconnect_wait_secs = 45\nput_raw_max_in_flight_bytes = 8192\nallow_client_shutdown = false",
         path(&log)
     );
     let resolve = |vars: &[(&str, Option<&str>)], file: &str| {
@@ -2798,12 +2807,14 @@ fn test_managed_server_config() {
     assert!(defaults.server.autostart);
     assert_eq!(defaults.server.connect_wait_secs, 30);
     assert_eq!(defaults.server.put_raw_max_in_flight_bytes, 1 << 30);
+    assert!(defaults.server.allow_client_shutdown);
     assert_eq!(defaults.miss_explain, None);
 
     let configured = resolve(&unset, &file).unwrap();
     assert_eq!(configured.server.shutdown_drain_secs, 300);
     assert!(!configured.server.autostart);
     assert_eq!(configured.server.connect_wait_secs, 45);
+    assert!(!configured.server.allow_client_shutdown);
     assert_eq!(configured.server.put_raw_max_in_flight_bytes, 8192);
     assert_eq!(configured.miss_explain, Some(log));
 
