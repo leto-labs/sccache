@@ -1,28 +1,34 @@
 #!/usr/bin/env bash
 # Soak of the linked-output stages on one project and host: two clones of the
 # repo's HEAD, a private sccache server with rust_cache_linked = "all", clone A
-# fills the cache with `cargo test --workspace --no-run`, then
-# leto/linked-soak.sh restores clone B's harnesses from the cache, rebuilds them
-# with the cache bypassed and compares the binaries.
+# fills the cache, then leto/linked-soak.sh restores and rebuilds the same
+# targets in clone B and compares their outputs.
 #
-# Usage: leto/linked-soak-host.sh REPO WORKDIR PORT SCCACHE_BIN [--run] [--reflink]
+# Usage: leto/linked-soak-host.sh REPO WORKDIR PORT SCCACHE_BIN [OPTIONS]
+#   --targets tests|all  compare test harnesses (default) or also bins, examples
+#                        and build scripts. --all is shorthand for --targets all.
 #   --run      also run the restored test harnesses (needs the project's test env)
+#   --run-bins "BIN [ARGS]"  run a restored bin with --all (repeatable)
 #   --reflink  SCCACHE_DISK_REFLINK=true (btrfs hosts)
-#   --remap    SCCACHE_BASEDIRS_REMAP_PATHS=1: cached outputs carry no checkout
-#              paths, so restored and rebuilt binaries must be byte-identical
+#   --remap    SCCACHE_BASEDIRS_REMAP_PATHS=1: require raw byte equality
 # The shared server is never used: the run has its own port, config and cache.
 set -euo pipefail
 repo=$(readlink -f "${1:?repo}"); work=${2:?workdir}; port=${3:?port}; bin=$(readlink -f "${4:?sccache binary}")
 shift 4
-soak_args=() reflink=false remap=
-for a in "$@"; do
-  case "$a" in
+soak_args=() targets=tests reflink=false remap=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --targets) targets=${2:?--targets needs tests or all}; shift ;;
+    --all) targets=all ;;
     --run) soak_args+=(--run) ;;
+    --run-bins) soak_args+=(--run-bins "${2:?--run-bins needs a command}"); shift ;;
     --reflink) reflink=true ;;
     --remap) remap=1 ;;
-    *) echo "unknown option $a" >&2; exit 2 ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
   esac
+  shift
 done
+case "$targets" in tests | all) ;; *) echo "unknown target mode $targets" >&2; exit 2 ;; esac
 case "$port" in 4226 | 4227) echo "port $port is reserved" >&2; exit 2 ;; esac
 if ss -Hltn "sport = :$port" | grep -q .; then echo "port $port is in use" >&2; exit 2; fi
 here=$(dirname "$(readlink -f "$0")")
@@ -30,6 +36,7 @@ command -v cargo >/dev/null || PATH="$HOME/.cargo/bin:$PATH"
 
 mkdir -p "$work"
 work=$(readlink -f "$work")
+[[ "$targets" != all ]] || soak_args+=(--warm-checkout "$work/a")
 commit=$(git -C "$repo" rev-parse HEAD)
 for c in a b; do
   [[ -e "$work/$c/.git" ]] || git clone -q --shared --no-checkout "$repo" "$work/$c"
@@ -54,14 +61,24 @@ trap '"$bin" --stop-server >/dev/null 2>&1 || true' EXIT
 echo "soak: commit $commit, server $("$bin" --version) on port $port"
 
 t0=$(date +%s)
-(cd "$work/a" && SCCACHE_BASEDIRS="$work/a" cargo test --workspace --no-run -q) >"$work/a.log" 2>&1 \
-  || { echo "soak: clone A build failed, see $work/a.log" >&2; exit 1; }
+if ! (
+  cd "$work/a" || exit
+  export SCCACHE_BASEDIRS="$work/a"
+  if [[ "$targets" == all ]]; then
+    cargo build --workspace --bins --examples --message-format=json || exit
+  fi
+  cargo test --workspace --no-run --message-format=json
+) >"$work/a.log" 2>&1; then
+  echo "soak: clone A build failed, see $work/a.log" >&2
+  exit 1
+fi
 echo "soak: clone A filled the cache in $(( $(date +%s) - t0 )) s"
 "$bin" --show-stats --stats-format=json >"$work/stats-a.json"
 "$bin" --zero-stats >/dev/null
 
 soak_rc=0
-SCCACHE_BASEDIRS="$work/b" "$here/linked-soak.sh" "$work/b" "${soak_args[@]}" 2>"$work/b-soak.err" | tee "$work/b-soak.txt" || soak_rc=$?
+SCCACHE_BASEDIRS="$work/b" "$here/linked-soak.sh" "$work/b" --targets "$targets" \
+  "${soak_args[@]}" 2>"$work/b-soak.err" | tee "$work/b-soak.txt" || soak_rc=$?
 "$bin" --show-stats --stats-format=json >"$work/stats-b.json"
 python3 -I - "$work" <<'PY'
 import json, sys
