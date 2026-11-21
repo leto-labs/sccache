@@ -127,9 +127,25 @@ pub fn init_cargo(path: &Path, cargo_name: &str) -> PathBuf {
     cargo_path
 }
 
+/// Tests start and stop sccache servers on the port in their environment.
+/// Outside `leto/test-sandboxed.sh` that is the shared server on the default
+/// port, which a test run once stopped. Only the sandbox sets this variable,
+/// to a private port in its own network namespace.
+pub fn assert_private_test_server() {
+    match std::env::var("LETO_TEST_SERVER_PORT") {
+        Ok(port) if !port.is_empty() && port != "4226" => {}
+        _ => panic!(
+            "refusing to start or stop sccache servers outside leto/test-sandboxed.sh \
+             (LETO_TEST_SERVER_PORT unset or 4226); run the tests through it"
+        ),
+    }
+}
+
 // Prune any environment variables that could adversely affect test execution.
 pub fn prune_command(mut cmd: Command) -> Command {
     use sccache::util::OsStrExt;
+
+    assert_private_test_server();
 
     for (var, _) in env::vars_os() {
         if var.starts_with("SCCACHE_") {

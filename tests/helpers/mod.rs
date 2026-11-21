@@ -15,8 +15,24 @@ use std::sync::LazyLock;
 pub static CRATE_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| Path::new(file!()).parent().unwrap().join("../test-crate"));
 pub static CARGO: LazyLock<OsString> = LazyLock::new(|| std::env::var_os("CARGO").unwrap());
-pub static SCCACHE_BIN: LazyLock<&Path> =
-    LazyLock::new(|| Path::new(env!("CARGO_BIN_EXE_sccache")));
+pub static SCCACHE_BIN: LazyLock<&Path> = LazyLock::new(|| {
+    assert_private_test_server();
+    Path::new(env!("CARGO_BIN_EXE_sccache"))
+});
+
+/// Tests start and stop sccache servers on the port in their environment.
+/// Outside `leto/test-sandboxed.sh` that is the shared server on the default
+/// port, which a test run once stopped. Only the sandbox sets this variable,
+/// to a private port in its own network namespace.
+pub fn assert_private_test_server() {
+    match std::env::var("LETO_TEST_SERVER_PORT") {
+        Ok(port) if !port.is_empty() && port != "4226" => {}
+        _ => panic!(
+            "refusing to start or stop sccache servers outside leto/test-sandboxed.sh \
+             (LETO_TEST_SERVER_PORT unset or 4226); run the tests through it"
+        ),
+    }
+}
 
 /// Ensures the logger is only initialized once. Panics if initialization fails.
 static LOGGER: LazyLock<Result<(), Infallible>> = LazyLock::new(|| {
