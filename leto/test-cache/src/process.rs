@@ -11,6 +11,10 @@ use crate::observer::{self, Rules};
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 static CHILD: AtomicI32 = AtomicI32::new(0);
+const LAUNCH_FAILED: i32 = -1;
+const RETRY_UNFILTERED: i32 = -2;
+const FILTER_INSTALLED: u8 = 1;
+const FILTER_UNAVAILABLE: u8 = 2;
 
 extern "C" fn relay(signal: libc::c_int) {
     let pid = CHILD.load(Ordering::Relaxed);
@@ -149,15 +153,23 @@ pub fn finish(status: i32) -> ! {
     std::process::exit(128 + sig);
 }
 
+fn run_plain(
+    signals: &Signals,
+    command: &mut Option<Command>,
+    evidence: &str,
+) -> io::Result<(i32, Value)> {
+    let pid = signals.fork(true)?;
+    if pid == 0 {
+        exec(command.take().unwrap());
+    }
+    command.take();
+    Ok((wait(pid, 0)?.1, json!(evidence)))
+}
+
 pub fn run(command: &mut Option<Command>, rules: Option<Rules>) -> io::Result<(i32, Value)> {
     let signals = Signals::new()?;
     let Some(rules) = rules else {
-        let pid = signals.fork(true)?;
-        if pid == 0 {
-            exec(command.take().unwrap());
-        }
-        command.take();
-        return Ok((wait(pid, 0)?.1, json!("unsampled")));
+        return run_plain(&signals, command, "unsampled");
     };
 
     let (send, receive) = UnixStream::pair()?;
@@ -178,9 +190,12 @@ pub fn run(command: &mut Option<Command>, rules: Option<Rules>) -> io::Result<(i
         return Err(error);
     }
     let status = i32::from_ne_bytes(raw);
-    if status == -1 {
+    if matches!(status, LAUNCH_FAILED | RETRY_UNFILTERED) {
         *command = saved;
         let _ = wait(monitor, 0);
+        if status == RETRY_UNFILTERED {
+            return run_plain(&signals, command, "unavailable");
+        }
         return Err(io::Error::other("observer could not launch test"));
     }
     let mut response = String::new();
@@ -202,13 +217,21 @@ fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream
             drop(report);
             drop(start);
             let mut requested = [0];
-            let installed = child.read_exact(&mut requested).is_ok()
-                && requested[0] != 0
-                && observer::install().is_ok();
+            let mode = if child.read_exact(&mut requested).is_err() || requested[0] == 0 {
+                0
+            } else if observer::install().is_ok() {
+                FILTER_INSTALLED
+            } else {
+                FILTER_UNAVAILABLE
+            };
             // SAFETY: write uses a live fd and one initialized byte. It
             // avoids sendto, which the new filter would stop before the
             // monitor has consumed this acknowledgment.
-            unsafe { libc::write(child.as_raw_fd(), [u8::from(installed)].as_ptr().cast(), 1) };
+            unsafe { libc::write(child.as_raw_fd(), [mode].as_ptr().cast(), 1) };
+            if mode == FILTER_UNAVAILABLE {
+                // SAFETY: the launcher can exit directly. The test has not started.
+                unsafe { libc::_exit(0) };
+            }
             drop(child);
             exec(command);
         }
@@ -222,18 +245,30 @@ fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream
         }
         let attached = observer::attach(pid).is_ok();
         let _ = start.write_all(&[u8::from(attached)]);
-        let mut installed = [0];
-        let filtered = start.read_exact(&mut installed).is_ok() && installed[0] != 0;
+        let mut mode = [0];
+        let _ = start.read_exact(&mut mode);
         drop(start);
         if attached {
-            observer::collect(pid, rules, filtered, |status, evidence| {
-                notify(report, status, evidence)
-            });
+            observer::collect(
+                pid,
+                rules,
+                mode[0] == FILTER_INSTALLED,
+                |status, evidence| {
+                    // A failed seccomp installation can leave no_new_privs set.
+                    // Re-launch from the unfiltered runner before any test code runs.
+                    let status = if mode[0] == FILTER_UNAVAILABLE && libc::WIFEXITED(status) {
+                        RETRY_UNFILTERED
+                    } else {
+                        status
+                    };
+                    notify(report, status, evidence);
+                },
+            );
         } else if let Ok((_, status)) = wait(pid, 0) {
             notify(report, status, json!("unavailable"));
         }
     } else {
-        notify(report, -1, json!("unavailable"));
+        notify(report, LAUNCH_FAILED, json!("unavailable"));
     }
     // SAFETY: no Rust cleanup in the forked monitor is required.
     unsafe { libc::_exit(0) }

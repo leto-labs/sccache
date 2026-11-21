@@ -231,7 +231,7 @@ fn direct_exec_and_shadow_preserve_output_exit_and_signals() {
 }
 
 #[test]
-fn unavailable_ptrace_runs_the_test_without_observation() {
+fn unavailable_observer_runs_the_test_without_observation() {
     let scratch = Scratch::create();
     let root = &scratch.0;
     let build = cargo(root)
@@ -246,47 +246,68 @@ fn unavailable_ptrace_runs_the_test_without_observation() {
         .args(args)
         .output()
         .unwrap();
-    let mut shadow = Command::new(RUNNER);
-    configure(&mut shadow, root, "tests::pure");
-    shadow.arg(&binary).args(args);
-    // SAFETY: the pre_exec hook uses only initialized stack data and libc.
-    // It limits ptrace only in the subprocess of this invocation.
-    unsafe {
-        shadow.pre_exec(|| {
-            let statement = |code, k| libc::sock_filter {
-                code,
-                jt: 0,
-                jf: 0,
-                k,
-            };
-            let mut code = [
-                statement(0x20, 0),
-                libc::sock_filter {
-                    code: 0x15,
-                    jt: 0,
-                    jf: 1,
-                    k: libc::SYS_ptrace as u32,
-                },
-                statement(0x06, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
-                statement(0x06, libc::SECCOMP_RET_ALLOW),
-            ];
-            let program = libc::sock_fprog {
-                len: code.len() as u16,
-                filter: code.as_mut_ptr(),
-            };
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1
-                || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) == -1
-            {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    for (syscall, option) in [
+        (libc::SYS_ptrace, None),
+        (libc::SYS_prctl, Some(libc::PR_SET_SECCOMP)),
+    ] {
+        let statement = |code, k| libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        };
+        let equals = |k, jf| libc::sock_filter {
+            code: 0x15,
+            jt: 0,
+            jf,
+            k,
+        };
+        let mut code = vec![statement(0x20, 0)];
+        if let Some(option) = option {
+            code.extend([
+                equals(syscall as u32, 3),
+                statement(0x20, 16),
+                equals(option as u32, 1),
+            ]);
+        } else {
+            code.push(equals(syscall as u32, 1));
+        }
+        code.extend([
+            statement(0x06, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+            statement(0x06, libc::SECCOMP_RET_ALLOW),
+        ]);
+        let mut shadow = Command::new(RUNNER);
+        configure(&mut shadow, root, "tests::pure");
+        shadow.arg(&binary).args(args);
+        // SAFETY: the hook passes initialized filter data to libc. It runs
+        // only in the command subprocess before exec.
+        unsafe {
+            shadow.pre_exec(move || {
+                let filter = code.as_ptr().cast_mut();
+                let program = libc::sock_fprog {
+                    len: code.len() as u16,
+                    filter,
+                };
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1
+                    || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let shadow = shadow.output().unwrap();
+        assert_eq!(plain.status, shadow.status);
+        assert_eq!(plain.stdout, shadow.stdout);
+        assert_eq!(plain.stderr, shadow.stderr);
     }
-    let shadow = shadow.output().unwrap();
-    assert_eq!(plain.status, shadow.status);
-    assert_eq!(plain.stdout, shadow.stdout);
-    assert_eq!(plain.stderr, shadow.stderr);
-    assert_eq!(records(root)[0]["observer"], "unavailable");
+    let records = records(root);
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| record["observer"] == "unavailable")
+    );
 }
 
 #[test]
