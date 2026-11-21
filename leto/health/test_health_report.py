@@ -209,6 +209,16 @@ class HealthReportTest(unittest.TestCase):
         self.assertEqual(proc.stdout, b"")
         self.assertIn("102.0%", out.read_text())
 
+    def test_cache_over_cap_on_du_alone_is_not_reported_as_tracked(self):
+        # Without daemon stats (a timeout at high load), du is the only size, and
+        # du counts reflink-shared entries at file length.
+        warnings = []
+        cache = REPORT["cache_report"]({"cache_dir": str(self.root / "cache"), "cache_cap_bytes": 1000}, {}, warnings)
+        self.assertEqual(cache["fill_basis"], "allocated_bytes")
+        self.assertGreater(cache["fill_pct"], 101)
+        self.assertFalse(any("tracked size" in warning for warning in warnings), warnings)
+        self.assertTrue(any("of cap on disk" in warning for warning in warnings), warnings)
+
     def test_automatic_fast_scan_extrapolates_by_project(self):
         for index in range(101):
             project = "recent" if index else "old"

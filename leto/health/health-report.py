@@ -168,7 +168,8 @@ def server_report(args, now, warnings):
     info = {}
     try:
         raw = (args.stats_json.read_bytes() if args.stats_json else
-               command([args.binary, "--show-stats", "--stats-format=json"], env=env))
+               # A busy daemon (host load in the hundreds) can take 20 s to answer.
+               command([args.binary, "--show-stats", "--stats-format=json"], env=env, timeout=45))
         info = json.loads(raw)
         if not isinstance(info, dict) or not isinstance(info.get("stats"), dict):
             raise ValueError("expected an sccache JSON stats object")
@@ -271,7 +272,9 @@ def cache_report(config, info, warnings):
             cache["fill_basis"] = basis
             cache["fill_pct"] = round(100 * used / cap, 2)
             # LRU eviction keeps a full cache at its cap, so only overshoot is news.
-            if 100 * used > 101 * cap:
+            # du counts reflink-shared and weighted entries at file length, so it
+            # says nothing about eviction; only the daemon's own size does.
+            if basis == "server_size_bytes" and 100 * used > 101 * cap:
                 warnings.append(f"Cache tracked size exceeds cap ({cache['fill_pct']:.2f}%)")
             break
     # Reflink weights estimate compressed size, so on btrfs compare the real extents.
