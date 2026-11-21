@@ -1652,7 +1652,25 @@ where
         let exe = compile.exe;
         let cmd = compile.args;
         let cwd: PathBuf = compile.cwd.into();
-        let env_vars = compile.env_vars;
+        let mut env_vars = compile.env_vars;
+        let client_view = env_vars
+            .iter()
+            .position(|(name, _)| name == crate::util::FS_VIEW_ENV)
+            .map(|index| env_vars.remove(index).1);
+        if let Some(view) = client_view
+            && Some(&view) != crate::util::filesystem_view().as_ref()
+        {
+            // Sources, outputs and the compiler resolve differently here; let
+            // the client compile in its own view.
+            debug!("client filesystem view {view:?} differs from the daemon's; not compiling");
+            self.stats
+                .lock()
+                .await
+                .record_not_cacheable("client in another mount namespace or root", None);
+            return Ok(Message::WithoutBody(Response::Compile(
+                CompileResponse::UnhandledCompile,
+            )));
+        }
         let me = self.clone();
 
         let info = self
@@ -3673,6 +3691,38 @@ mod tests {
             other => panic!("body must end with CompileFinished, got {other:?}"),
         };
         (body, finished)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_in_another_filesystem_view_compiles_locally() {
+        let (_f, runtime, service, mut compile) = rustc_miss_fixture();
+        compile
+            .env_vars
+            .push((crate::util::FS_VIEW_ENV.into(), "1:2/3:4".into()));
+        match runtime.block_on(service.handle_compile(compile)).unwrap() {
+            Message::WithoutBody(Response::Compile(CompileResponse::UnhandledCompile)) => {}
+            other => panic!("unexpected response: {:?}", other.into_inner()),
+        }
+        let stats = runtime.block_on(service.stats.lock()).clone();
+        assert_eq!(
+            stats
+                .not_cached
+                .get("client in another mount namespace or root"),
+            Some(&1)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn client_in_the_same_filesystem_view_is_compiled_by_the_daemon() {
+        let (_f, runtime, service, mut compile) = rustc_miss_fixture();
+        let view = crate::util::filesystem_view().unwrap();
+        compile
+            .env_vars
+            .push((crate::util::FS_VIEW_ENV.into(), view));
+        let (_, finished) = compile_body(&runtime, &service, compile);
+        assert_eq!(finished.retcode, Some(0));
     }
 
     #[test]

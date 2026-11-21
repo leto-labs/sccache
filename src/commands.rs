@@ -452,6 +452,11 @@ where
     X: AsRef<OsStr>,
     Y: AsRef<Path>,
 {
+    let mut env_vars = env_vars;
+    // Older daemons pass this through to the compiler, where nothing reads it.
+    if let Some(view) = crate::util::filesystem_view() {
+        env_vars.push((crate::util::FS_VIEW_ENV.into(), view));
+    }
     let req = Request::Compile(Compile {
         exe: exe.as_ref().to_owned().into(),
         cwd: cwd.as_ref().to_owned().into(),

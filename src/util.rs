@@ -1774,6 +1774,35 @@ pub fn wait_for_inflight_spawns() {
     );
 }
 
+/// Compile-request env entry carrying the client's filesystem view. A client
+/// in another mount namespace or chroot (a bind mount over a source file, say)
+/// sees different sources than the daemon, which would hash and compile its
+/// own view without any error.
+pub const FS_VIEW_ENV: &str = "SCCACHE_INTERNAL_FS_VIEW";
+
+/// Identity of this process's mount namespace and root directory.
+#[cfg(target_os = "linux")]
+pub fn filesystem_view() -> Option<OsString> {
+    use std::os::unix::fs::MetadataExt;
+    let namespace = std::fs::metadata("/proc/self/ns/mnt").ok()?;
+    let root = std::fs::metadata("/proc/self/root").ok()?;
+    Some(
+        format!(
+            "{}:{}/{}:{}",
+            namespace.dev(),
+            namespace.ino(),
+            root.dev(),
+            root.ino()
+        )
+        .into(),
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn filesystem_view() -> Option<OsString> {
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

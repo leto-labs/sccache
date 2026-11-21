@@ -217,3 +217,56 @@ fn renamed_binary_refuses_to_run_itself_as_the_compiler() -> Result<()> {
     }
     Ok(())
 }
+
+// A client in its own mount namespace (here with another file bind-mounted
+// over the source) must not have the daemon compile the daemon's view of the
+// same path: the build succeeded with the wrong source and no error.
+#[test]
+#[serial]
+#[cfg(target_os = "linux")]
+fn client_in_another_mount_namespace_compiles_its_own_view() -> Result<()> {
+    let bwrap = |args: &[&str]| {
+        Command::new("bwrap")
+            .args(["--dev-bind", "/", "/"])
+            .args(args)
+            .status()
+            .is_ok_and(|status| status.success())
+    };
+    if !bwrap(&["--", "true"]) {
+        eprintln!("skipping: bwrap cannot create a mount namespace here");
+        return Ok(());
+    }
+    let test = helpers::SccacheTest::new(None)?;
+    let dir = test.tempdir.path();
+    fs::write(
+        dir.join("main.rs"),
+        "fn main() { println!(\"daemon view\"); }\n",
+    )?;
+    fs::write(
+        dir.join("overlay.rs"),
+        "fn main() { println!(\"client view\"); }\n",
+    )?;
+    let main = dir.join("main.rs");
+    let overlay = dir.join("overlay.rs");
+    let out = dir.join("probe");
+    let built = Command::new("bwrap")
+        .args(["--dev-bind", "/", "/", "--bind"])
+        .args([&overlay, &main])
+        .arg("--chdir")
+        .arg(dir)
+        .arg("--")
+        .arg(SCCACHE_BIN.as_os_str())
+        .args(["rustc", "--crate-name", "probe", "main.rs", "-o"])
+        .arg(&out)
+        .output()?;
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let ran = Command::new(&out).output()?;
+    assert_eq!(String::from_utf8_lossy(&ran.stdout).trim(), "client view");
+    test.show_stats()?
+        .stdout(predicate::str::contains("another mount namespace"));
+    Ok(())
+}
