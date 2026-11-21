@@ -129,6 +129,7 @@ fn spawn_server_process(startup_timeout: Option<Duration>) -> Result<ServerStart
         tokio::net::UnixListener::bind(&socket_path)?
     };
 
+    let spawning = crate::util::spawn_guard();
     let _child = process::Command::new(&exe_path)
         .current_dir(workdir)
         .env("SCCACHE_START_SERVER", "1")
@@ -139,6 +140,7 @@ fn spawn_server_process(startup_timeout: Option<Duration>) -> Result<ServerStart
         // accidentally influence daemon behaviour in the future.
         .env_remove("SCCACHE_CLIENT_SIDE")
         .spawn()?;
+    drop(spawning);
 
     let startup = async move {
         let (socket, _) = listener.accept().await?;

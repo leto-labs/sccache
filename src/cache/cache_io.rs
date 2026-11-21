@@ -339,13 +339,15 @@ impl CacheRead {
                     Ok(tmp) => tmp,
                     Err(err) => {
                         if !optional || Self::object_index(&self.zip, &key).is_some() {
-                            self.extract_object_to_new_file(&key, &path)
-                                .with_context(|| {
+                            let mode = self.extract_object_to_new_file(&key, &path).with_context(
+                                || {
                                     format!(
                                         "Failed to restore {} after tempfile error: {err}",
                                         path.display()
                                     )
-                                })?;
+                                },
+                            )?;
+                            settle_executable(mode);
                         }
                         continue;
                     }
@@ -355,7 +357,10 @@ impl CacheRead {
                         if let Some(mode) = mode {
                             set_file_mode(tmp.as_file(), mode)?;
                         }
-                        tmp.persist(&path)?;
+                        // `persist` hands back the file; dropping it here closes
+                        // the last descriptor this process opened for writing.
+                        drop(tmp.persist(&path)?);
+                        settle_executable(mode);
                     }
                     Err(_) if optional => continue,
                     Err(e) => return Err(e),
@@ -366,7 +371,7 @@ impl CacheRead {
         .await?
     }
 
-    fn extract_object_to_new_file(&mut self, key: &str, path: &Path) -> Result<()> {
+    fn extract_object_to_new_file(&mut self, key: &str, path: &Path) -> Result<Option<u32>> {
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -374,10 +379,21 @@ impl CacheRead {
         }
         // A concurrent writer may have recreated the name after unlink.
         let mut file = fs::File::create_new(path)?;
-        if let Some(mode) = self.get_object(key, &mut file)? {
+        let mode = self.get_object(key, &mut file)?;
+        if let Some(mode) = mode {
             set_file_mode(file.file(), mode)?;
         }
-        Ok(())
+        Ok(mode)
+    }
+}
+
+/// Cargo may execute a restored build script or test as soon as the wrapper
+/// returns. A child spawned by another thread while the file was open for
+/// writing still holds that descriptor until its own exec, and executing the
+/// file fails with ETXTBSY until then.
+fn settle_executable(mode: Option<u32>) {
+    if mode.is_none_or(|mode| mode & 0o111 != 0) {
+        crate::util::wait_for_inflight_spawns();
     }
 }
 
@@ -1248,6 +1264,79 @@ mod tests {
         entry.get_object("output", &mut output).unwrap();
         assert_eq!(output, b"original output");
         assert!(entry.get_object("optional", &mut Vec::new()).is_err());
+    }
+
+    // Cargo executes a restored build script as soon as the wrapper returns,
+    // while other threads keep spawning compilers. Each spawner child sleeps
+    // between fork and exec to hold its copies of our descriptors for longer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restored_executables_run_immediately_despite_concurrent_spawns() {
+        use std::os::unix::process::CommandExt;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut tool = fs::File::open("/bin/true").unwrap();
+        let mut entry = CacheWrite::new();
+        entry.put_object("tool", &mut tool, Some(0o755)).unwrap();
+        let entry = entry.finish().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .build()
+            .unwrap();
+        let done = Arc::new(AtomicBool::new(false));
+        let spawners: Vec<_> = (0..4)
+            .map(|_| {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        let mut command = std::process::Command::new("/bin/true");
+                        // SAFETY: nanosleep is async-signal-safe and its
+                        // argument is a stack value that outlives the call.
+                        unsafe {
+                            command.pre_exec(|| {
+                                let pause = libc::timespec {
+                                    tv_sec: 0,
+                                    tv_nsec: 2_000_000,
+                                };
+                                libc::nanosleep(&pause, std::ptr::null_mut());
+                                Ok(())
+                            });
+                        }
+                        let child = {
+                            let _spawning = crate::util::spawn_guard();
+                            command.spawn()
+                        };
+                        child.unwrap().wait().unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        let mut busy = 0;
+        for i in 0..300 {
+            let path = dir.path().join(format!("tool-{i}"));
+            let reader = CacheRead::from(Cursor::new(entry.clone())).unwrap();
+            let objects = vec![FileObjectSource {
+                key: "tool".to_owned(),
+                path: path.clone(),
+                optional: false,
+            }];
+            runtime
+                .block_on(reader.extract_objects(objects, runtime.handle()))
+                .unwrap();
+            match std::process::Command::new(&path).status() {
+                Ok(status) => assert!(status.success()),
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => busy += 1,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+        for spawner in spawners {
+            spawner.join().unwrap();
+        }
+        assert_eq!(busy, 0, "restored executables were busy when executed");
     }
 
     #[test]

@@ -321,10 +321,11 @@ impl RunCommand for AsyncCommand {
         // tokens of its own.
         let token = self.jobserver.acquire().await?;
         let mut inner = tokio::process::Command::from(inner);
-        let child = inner
-            .kill_on_drop(true)
-            .spawn()
-            .with_context(|| format!("failed to spawn {:?}", inner))?;
+        let child = {
+            let _spawning = crate::util::spawn_guard();
+            inner.kill_on_drop(true).spawn()
+        }
+        .with_context(|| format!("failed to spawn {:?}", inner))?;
 
         Ok(Child {
             inner: child,

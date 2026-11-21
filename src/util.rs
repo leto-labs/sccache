@@ -1747,6 +1747,33 @@ pub fn resolve_compiler_avoiding_wrapper(
     executable.to_path_buf()
 }
 
+/// Held for reading while a child process is spawned.
+///
+/// A child forked by one thread inherits every descriptor the process has
+/// open, including a restored executable that another thread is still
+/// writing. `O_CLOEXEC` only drops it at the child's `exec`, and until then
+/// the kernel refuses to execute that file (`ETXTBSY`). Cargo runs build
+/// scripts as soon as the wrapper exits, so it can hit that window.
+static SPAWN_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Hold the returned guard across `spawn()`. `std` returns from `spawn()` only
+/// after the child has exec'd or failed, so its inherited descriptors are gone.
+pub fn spawn_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+    SPAWN_LOCK
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Wait until no spawn that started before this call is still between fork and
+/// exec. Call it after closing a file that someone may execute next.
+pub fn wait_for_inflight_spawns() {
+    drop(
+        SPAWN_LOCK
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
