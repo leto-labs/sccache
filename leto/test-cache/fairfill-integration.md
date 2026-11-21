@@ -33,3 +33,11 @@ diff --git a/scripts/cargo.sh b/scripts/cargo.sh
  # FAIRFILL_BUILD_SLOTS (default 6, 0 disables) heavy cargo commands run at once.
  # Two more "urgent" slots exist for FAIRFILL_BUILD_URGENT=1: the parent's merge
 ```
+
+## Bumping the runner
+
+FairFill pins the runner path in two files, and both must change together:
+- `scripts/cargo.sh` (`leto_test_runner=...`);
+- `scripts/test_cargo_wrapper.py`, whose `TestCacheRunnerTests` build a fake home with the same versioned path.
+
+Send both changes in one message. The 4c75a082 bump (2026-11-22) failed 2 of those tests until the second file was updated.
