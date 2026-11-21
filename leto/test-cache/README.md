@@ -23,7 +23,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/target/release/leto-test-runn
 |---|---|
 | `LETO_TEST_CACHE=off` | Direct exec for all invocations. |
 | `LETO_TEST_CACHE_DIR` | Host store. Defaults to `~/.cache/leto-test-results/v0`. |
-| `LETO_TEST_CACHE_OBSERVE` | Positive sampling interval in UTC days per key. Defaults to 3. Set 1 to observe every invocation. |
+| `LETO_TEST_CACHE_OBSERVE` | Positive sampling interval in UTC days per key. Defaults to 5. Set 1 to observe every invocation. |
 | `LETO_TEST_CACHE_PROJECT` | Stable report name for a project across worktrees. Defaults to the worktree's directory name. |
 | `LETO_TEST_CACHE_WORKSPACE` | Absolute worktree root when nextest omits `NEXTEST_WORKSPACE_ROOT`. The current directory is the final fallback. |
 | `LETO_TEST_CACHE_ENV` | Comma-separated additional keyed names and prefix patterns ending in `*`. |

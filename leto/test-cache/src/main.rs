@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-const DEFAULT_SAMPLE: u64 = 3;
+const DEFAULT_SAMPLE: u64 = 5;
 
 fn main() {
     let mut cli = env::args_os().skip(1);
@@ -211,9 +211,12 @@ mod tests {
         let k = blake3::hash(b"sample");
         assert!(sample(k, Duration::ZERO, 1));
         let days = (0..14)
-            .filter(|day| sample(k, Duration::from_secs(day * 86_400), 3))
+            .filter(|day| sample(k, Duration::from_secs(day * 86_400), DEFAULT_SAMPLE))
             .collect::<Vec<_>>();
-        assert!(days.len() >= 4);
-        assert!(days.windows(2).all(|window| window[1] - window[0] == 3));
+        assert!(days.len() >= (14 / DEFAULT_SAMPLE) as usize);
+        assert!(
+            days.windows(2)
+                .all(|window| window[1] - window[0] == DEFAULT_SAMPLE)
+        );
     }
 }
