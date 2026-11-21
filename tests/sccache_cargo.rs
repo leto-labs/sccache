@@ -691,6 +691,12 @@ fn test_rust_cargo_disk_reflink_other_checkout(client_side: bool) -> Result<()> 
     let cache_dir = root.join("cache");
     let weighted = cache_dir_uses_btrfs_zstd(&cache_dir)?;
     let [a, b] = ["a", "b"].map(|name| root.join(name));
+    if weighted && !client_side {
+        // The store-side clone keeps the compiler output's extent compression.
+        let target = a.join("target");
+        fs::create_dir_all(&target)?;
+        assert!(cache_dir_uses_btrfs_zstd(&target)?);
+    }
     let config = root.join("sccache.toml");
     let log = root.join("server.log");
     fs::write(&config, "[cache.disk]\nreflink = true\n")?;

@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 
 use crate::errors::*;
 
+#[cfg(target_os = "linux")]
+use super::cache_io::FileExtentMap;
 use super::lazy_disk_cache::LazyDiskCache;
 use super::storage::put_packed_objects;
 use super::utils::normalize_key;
@@ -154,8 +156,6 @@ fn try_store_reflink(
     stdout: &[u8],
     stderr: &[u8],
 ) -> Result<bool> {
-    use std::io::Seek;
-
     let (mut entry, uses_weights) = {
         let mut lru = lru.lock().unwrap();
         let lru = lru.get_or_init()?;
@@ -164,7 +164,7 @@ fn try_store_reflink(
     let file = entry.as_file_mut();
     let written = CacheWrite::try_reflink_objects(file, objects, stdout, stderr);
     let weight = if matches!(written, Ok(true)) && uses_weights && !objects.is_empty() {
-        file.rewind().and_then(|()| estimate_weight(file)).ok()
+        estimate_reflink_weight(file).ok()
     } else {
         None
     };
@@ -178,24 +178,80 @@ fn try_store_reflink(
     written
 }
 
-fn estimate_weight(mut data: impl Read) -> io::Result<u64> {
-    const EXTENT: usize = 128 * 1024;
-    const SECTOR: usize = 4096;
+fn estimate_weight(data: impl Read) -> io::Result<u64> {
+    WeightEstimator::new()?.estimate(data)
+}
 
-    let mut zstd = zstd::bulk::Compressor::new(1)?;
-    let mut compressed = Vec::with_capacity(zstd::zstd_safe::compress_bound(EXTENT));
-    let mut chunk = Vec::with_capacity(EXTENT);
-    let mut weight = 0;
-    // Chunk the ZIP from offset zero so its headers and raw data share the same
-    // boundaries as they do in the file being compressed by btrfs.
-    while data.by_ref().take(EXTENT as u64).read_to_end(&mut chunk)? > 0 {
-        let len = zstd.compress_to_buffer(&chunk, &mut compressed)?;
-        weight += len
-            .next_multiple_of(SECTOR)
-            .min(chunk.len().next_multiple_of(SECTOR));
-        chunk.clear();
+const BTRFS_EXTENT: usize = 128 * 1024;
+const BTRFS_SECTOR: usize = 4096;
+
+struct WeightEstimator {
+    zstd: zstd::bulk::Compressor<'static>,
+    compressed: Vec<u8>,
+    chunk: Vec<u8>,
+}
+
+impl WeightEstimator {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            zstd: zstd::bulk::Compressor::new(1)?,
+            compressed: Vec::with_capacity(zstd::zstd_safe::compress_bound(BTRFS_EXTENT)),
+            chunk: Vec::with_capacity(BTRFS_EXTENT),
+        })
     }
-    Ok(weight as u64)
+
+    fn estimate(&mut self, mut data: impl Read) -> io::Result<u64> {
+        let mut weight = 0;
+        while data
+            .by_ref()
+            .take(BTRFS_EXTENT as u64)
+            .read_to_end(&mut self.chunk)?
+            > 0
+        {
+            let len = self
+                .zstd
+                .compress_to_buffer(&self.chunk, &mut self.compressed)?;
+            weight += len
+                .next_multiple_of(BTRFS_SECTOR)
+                .min(self.chunk.len().next_multiple_of(BTRFS_SECTOR)) as u64;
+            self.chunk.clear();
+        }
+        Ok(weight)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn estimate_reflink_weight(mut file: &std::fs::File) -> io::Result<u64> {
+    use std::io::{Seek, SeekFrom};
+
+    let length = file.metadata()?.len();
+    let mut estimator = WeightEstimator::new()?;
+    let mut weight = 0;
+    let mut offset = 0;
+    while offset < length {
+        // Clones already have extent mappings. Charge pending ZIP writes at
+        // full size too, without waiting for writeback.
+        let map = FileExtentMap::read(file, offset, length - offset, 0)?;
+        let previous_offset = offset;
+        for extent in map.extents() {
+            let start = extent.logical.max(offset);
+            let end = extent.logical + extent.length;
+            if end <= start || start >= length {
+                continue;
+            }
+            weight += if extent.is_encoded() {
+                file.seek(SeekFrom::Start(start))?;
+                estimator.estimate(file.take(end.min(length) - start))?
+            } else {
+                end - start
+            };
+            offset = end;
+        }
+        if offset == previous_offset {
+            break;
+        }
+    }
+    Ok(weight)
 }
 
 #[cfg(target_os = "linux")]
@@ -505,6 +561,68 @@ mod tests {
             rw_mode,
             vec![],
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cache_entry_weight_accounts_for_uncompressed_clones() {
+        use crate::cache::FileObjectSource;
+        use crate::lru_disk_cache::test_btrfs_zstd;
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("cache");
+        std::fs::create_dir(&root).unwrap();
+        if !test_btrfs_zstd(&root) {
+            return;
+        }
+
+        let raw_path = dir.path().join("raw");
+        let mut raw = std::fs::File::create(&raw_path).unwrap();
+        // Preallocation keeps the compiler output uncompressed even on a compress-force mount.
+        // SAFETY: The file descriptor is open for writing and the length fits off_t.
+        let result = unsafe { libc::fallocate(raw.as_raw_fd(), 0, 0, BTRFS_EXTENT as libc::off_t) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        raw.write_all(&vec![1; BTRFS_EXTENT]).unwrap();
+        raw.sync_all().unwrap();
+
+        let compressed_dir = dir.path().join("zstd");
+        std::fs::create_dir(&compressed_dir).unwrap();
+        assert!(test_btrfs_zstd(&compressed_dir));
+        let compressed_path = compressed_dir.join("compressed");
+        let mut compressed = std::fs::File::create(&compressed_path).unwrap();
+        compressed.write_all(&vec![2; BTRFS_EXTENT]).unwrap();
+        compressed.sync_all().unwrap();
+
+        let objects =
+            CacheWrite::open_objects([raw_path, compressed_path].map(|path| FileObjectSource {
+                key: path.file_name().unwrap().to_str().unwrap().to_owned(),
+                path,
+                optional: false,
+            }))
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let disk = disk_cache(&root, &runtime, CacheMode::ReadWrite).with_reflink(true);
+        assert!(disk.write_raw_objects());
+
+        runtime.block_on(async {
+            disk.put_objects(KEY, objects, vec![], vec![], runtime.handle())
+                .await
+                .unwrap();
+            let weight = disk.current_size().await.unwrap().unwrap();
+            assert!(
+                ((BTRFS_EXTENT + BTRFS_SECTOR) as u64..(BTRFS_EXTENT + 8 * BTRFS_SECTOR) as u64)
+                    .contains(&weight),
+                "mixed entry weight {weight}"
+            );
+            drop(disk);
+
+            let reopened = disk_cache(&root, &runtime, CacheMode::ReadWrite).with_reflink(true);
+            assert!(reopened.get_raw(KEY).await.unwrap().is_some());
+            assert_eq!(reopened.current_size().await.unwrap(), Some(weight));
+        });
     }
 
     #[test]

@@ -25,6 +25,79 @@ use zip::{CompressionMethod, System, ZipArchive, ZipWriter};
 
 const RAW_ALIGNMENT: u16 = 4096;
 
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct Fiemap {
+    start: u64,
+    length: u64,
+    flags: u32,
+    mapped_extents: u32,
+    extent_count: u32,
+    reserved: u32,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct FileExtent {
+    pub(super) logical: u64,
+    physical: u64,
+    pub(super) length: u64,
+    reserved64: [u64; 2],
+    pub(super) flags: u32,
+    reserved: [u32; 3],
+}
+
+#[cfg(target_os = "linux")]
+impl FileExtent {
+    pub(super) fn is_encoded(&self) -> bool {
+        const FIEMAP_EXTENT_ENCODED: u32 = 0x8;
+        self.flags & FIEMAP_EXTENT_ENCODED != 0
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+pub(super) struct FileExtentMap {
+    header: Fiemap,
+    extents: [FileExtent; 256],
+}
+
+#[cfg(target_os = "linux")]
+impl FileExtentMap {
+    pub(super) fn read(file: &File, start: u64, length: u64, flags: u32) -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+
+        let mut request = Self {
+            header: Fiemap {
+                start,
+                length,
+                flags,
+                mapped_extents: 0,
+                extent_count: 256,
+                reserved: 0,
+            },
+            extents: [FileExtent::default(); 256],
+        };
+        // SAFETY: The request has the Linux FIEMAP layout and room for extent_count results.
+        let result = unsafe {
+            libc::ioctl(
+                file.as_raw_fd(),
+                libc::_IOWR::<Fiemap>(u32::from(b'f'), 11),
+                &raw mut request,
+            )
+        };
+        if result == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(request)
+    }
+
+    pub(super) fn extents(&self) -> &[FileExtent] {
+        &self.extents[..self.header.mapped_extents as usize]
+    }
+}
+
 /// Cache object sourced by a file.
 #[derive(Clone)]
 pub struct FileObjectSource {
@@ -1056,59 +1129,11 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn assert_shared_extents(file: &File, length: u64) {
-        use std::os::fd::AsRawFd;
-
-        #[repr(C)]
-        struct Fiemap {
-            start: u64,
-            length: u64,
-            flags: u32,
-            mapped_extents: u32,
-            extent_count: u32,
-            reserved: u32,
-        }
-
-        #[repr(C)]
-        #[derive(Clone, Copy, Default)]
-        struct Extent {
-            logical: u64,
-            physical: u64,
-            length: u64,
-            reserved64: [u64; 2],
-            flags: u32,
-            reserved: [u32; 3],
-        }
-
-        #[repr(C)]
-        struct FiemapRequest {
-            header: Fiemap,
-            extents: [Extent; 256],
-        }
-
         const FIEMAP_FLAG_SYNC: u32 = 1;
         const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
-        let mut request = FiemapRequest {
-            header: Fiemap {
-                start: 0,
-                length,
-                flags: FIEMAP_FLAG_SYNC,
-                mapped_extents: 0,
-                extent_count: 256,
-                reserved: 0,
-            },
-            extents: [Extent::default(); 256],
-        };
-        // SAFETY: The request has the Linux FIEMAP layout and room for extent_count results.
-        let result = unsafe {
-            libc::ioctl(
-                file.as_raw_fd(),
-                libc::_IOWR::<Fiemap>(u32::from(b'f'), 11),
-                &raw mut request,
-            )
-        };
-        assert_eq!(result, 0, "FIEMAP: {}", io::Error::last_os_error());
+        let map = FileExtentMap::read(file, 0, length, FIEMAP_FLAG_SYNC).unwrap();
         let mut end = 0;
-        for extent in &request.extents[..request.header.mapped_extents as usize] {
+        for extent in map.extents() {
             assert_eq!(extent.logical, end);
             assert_ne!(
                 extent.flags & FIEMAP_EXTENT_SHARED,
