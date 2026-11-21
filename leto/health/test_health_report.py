@@ -220,6 +220,8 @@ class HealthReportTest(unittest.TestCase):
         cache = REPORT["cache_report"]({"cache_dir": str(self.root / "cache"), "cache_cap_bytes": 1000}, {}, warnings)
         self.assertEqual(cache["fill_basis"], "allocated_bytes")
         self.assertGreater(cache["fill_pct"], 101)
+        self.assertGreaterEqual(cache["written_last_hour"]["entries"], 1)
+        self.assertGreater(cache["written_last_hour"]["bytes"], 0)
         self.assertFalse(any("tracked size" in warning for warning in warnings), warnings)
         self.assertTrue(any("of cap on disk" in warning for warning in warnings), warnings)
 
@@ -336,7 +338,7 @@ class FleetTest(unittest.TestCase):
             self.assertEqual((directory / "latest.md").readlink(), Path("second.md"))
             self.assertEqual(json.loads((directory / "latest.json").read_text()), fleet)
             text = (directory / "latest.md").read_text()
-            self.assertIn("| worker-01 | — | 7 | dependency (5) | — | — | — | 0 | 1.23 s |", text)
+            self.assertIn("| worker-01 | — | 7 | dependency (5) | — | — | — | — | 0 | 1.23 s |", text)
             self.assertIn("worker-02** · unavailable", text)
             self.assertTrue((directory / "first.md").exists())
 

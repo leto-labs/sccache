@@ -158,8 +158,9 @@ def server_report(args, now, warnings):
             rss = re.search(r"^VmRSS:\s+(\d+)\s+kB$", status, re.MULTILINE)
             if rss:
                 server["rss_bytes"] = int(rss[1]) * 1024
-            # Bytes the daemon sent to storage, net of truncated dirty pages: the
-            # cache's share of SSD wear. Reflink stores clone and write almost nothing.
+            # Bytes sent to storage by the daemon and by the compilers it ran and
+            # reaped (the kernel folds reaped children into the parent), net of
+            # truncated dirty pages. Cache entries alone are in cache.written_last_hour.
             io = dict(line.split(": ", 1) for line in
                       (args.proc_root / str(pid) / "io").read_text().splitlines() if ": " in line)
             written = int(io["write_bytes"]) - int(io.get("cancelled_write_bytes", 0))
@@ -173,7 +174,7 @@ def server_report(args, now, warnings):
     if (server["rss_bytes"] or 0) > 8 * GIB:
         warnings.append("Server RSS exceeds 8 GiB")
     if (server["disk_write_gib_per_hour"] or 0) > 100:
-        warnings.append(f"Server writes {server['disk_write_gib_per_hour']} GiB/h to disk")
+        warnings.append(f"Server and its compiles write {server['disk_write_gib_per_hour']} GiB/h to disk")
 
     info = {}
     try:
@@ -226,6 +227,28 @@ def du(args, *, timeout=60, input=None):
     return process.stdout
 
 
+def recent_entry_bytes(path, window=3600):
+    """Bytes of cache files born in the last `window` seconds.
+
+    Birth time, not mtime: a hit refreshes mtime. On btrfs with reflink these
+    are logical sizes; cloned extents cost no new writes.
+    """
+    since = int(time.time()) - window
+    found = subprocess.run([*LOW_PRIORITY, "find", str(path), "-type", "f", "-newermt", f"@{since}",
+                            "-not", "-path", "*/explain/*", "-print0"],
+                           capture_output=True, timeout=60).stdout.split(b"\0")
+    found = [name for name in found if name]
+    count = total = 0
+    for start in range(0, len(found), 1000):
+        stats = subprocess.run(["stat", "-c", "%W %s", "--", *found[start:start + 1000]],
+                               capture_output=True, timeout=60).stdout.decode().split()
+        for born, size in zip(stats[::2], stats[1::2]):
+            if int(born) >= since:
+                count += 1
+                total += int(size)
+    return {"entries": count, "bytes": total}
+
+
 def count_entries(path):
     # Disk entries use <key[0]>/<key[1]>/<key> (src/cache/disk.rs).
     deadline = time.monotonic() + 2
@@ -275,6 +298,11 @@ def cache_report(config, info, warnings):
     except (OSError, ValueError, subprocess.SubprocessError):
         pass  # compsize is optional, including on hosts without passwordless sudo.
     cache["entry_count"] = count_entries(path)
+    try:
+        cache["written_last_hour"] = recent_entry_bytes(path)
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        cache["written_last_hour"] = None
+        warnings.append(f"Cannot measure recent cache writes: {error}")
 
     for basis in ("server_size_bytes", "allocated_bytes", "apparent_bytes"):
         used = cache[basis]
@@ -684,7 +712,7 @@ def markdown(report):
     sections = [f"# Build health · {report['host']}",
                 f"{report['generated_at']} · {report['runtime_seconds']} s",
                 "## Server",
-                table(["Unit / PID", "Version", "Binary SHA-256", "Uptime", "RSS", "Disk writes"], [[
+                table(["Unit / PID", "Version", "Binary SHA-256", "Uptime", "RSS", "Disk writes incl. compiles"], [[
                     f"{server['unit_state']} / {display(server['main_pid'])}", server["version"], server["sha256"],
                     display(server["uptime_seconds"], " s"), gib(server["rss_bytes"]),
                     f"{gib(server['disk_write_bytes'])} ({display(server['disk_write_gib_per_hour'], ' GiB/h')})"]])
@@ -699,10 +727,13 @@ def markdown(report):
                     f"{display(stats.get('rust_incremental_not_stored'))} / "
                     f"{display(stats.get('rust_linked_entry_too_large'))}", summarize(stats.get("miss_explain", {}))]]),
                 "## Cache",
-                table(["Directory", "Cap", "Apparent", "Allocated", "btrfs extents", "Entries", "Fill", "On disk", "Reflink"], [[
+                table(["Directory", "Cap", "Apparent", "Allocated", "btrfs extents", "Entries", "Fill", "On disk",
+                       "Entries written in last hour", "Reflink"], [[
                     cache["dir"], gib(cache["cap_bytes"]), gib(cache["apparent_bytes"]), gib(cache["allocated_bytes"]),
                     gib((cache["btrfs_extent_bytes"] or {}).get("disk_usage")), cache["entry_count"],
-                    display(cache["fill_pct"], "%"), display(cache["disk_pct"], "%"), config["reflink"]]]) + "\n" + table(
+                    display(cache["fill_pct"], "%"), display(cache["disk_pct"], "%"),
+                    (f"{gib(cache['written_last_hour']['bytes'])} ({cache['written_last_hour']['entries']})"
+                     if cache.get("written_last_hour") else "—"), config["reflink"]]]) + "\n" + table(
                     ["Linked stage", "Linked entry cap", "Shutdown drain", "Autostart", "Connect wait"], [[
                         config["rust_cache_linked"], gib(config["rust_cache_linked_max_entry_bytes"]),
                         display(config["shutdown_drain_secs"], " s"), config["autostart"],
