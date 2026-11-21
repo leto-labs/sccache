@@ -1,0 +1,11 @@
+{
+  "result": "deferred",
+  "last_warmed_commit": "@WARMED@",
+  "finished_at": "2026-10-10T11:59:00+00:00",
+  "duration_seconds": 11.25,
+  "paused_seconds": 2.5,
+  "disk": {
+    "checkout": {"apparent_bytes": 10240, "allocated_bytes": 4096},
+    "target": {"apparent_bytes": 8192, "allocated_bytes": 4096}
+  }
+}

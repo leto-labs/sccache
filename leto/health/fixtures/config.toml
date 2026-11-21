@@ -1,0 +1,13 @@
+miss_explain = "@LOG@"
+rust_cache_linked = "tests"
+rust_cache_linked_max_entry_bytes = 1234567
+
+[cache.disk]
+dir = "@CACHE@"
+size = "512M"
+reflink = true
+
+[server]
+shutdown_drain_secs = 300
+autostart = false
+connect_wait_secs = 45

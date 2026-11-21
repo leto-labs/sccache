@@ -1,0 +1,20 @@
+{
+  "stats": {
+    "compile_requests": 200,
+    "requests_executed": 170,
+    "cache_hits": {"counts": {"Rust": 90, "C/C++": 10}, "adv_counts": {"rustc": 90}},
+    "cache_misses": {"counts": {"Rust": 30, "C/C++": 20}, "adv_counts": {"rustc": 30}},
+    "not_cached": {"crate-type": 19, "incremental session": 14, "z": 1, "i": 2, "h": 3, "g": 4,
+                   "f": 5, "e": 6, "d": 7, "c": 8, "b": 9, "a": 10},
+    "cache_errors": {"counts": {"Rust": 3}, "adv_counts": {}},
+    "cache_write_errors": 2,
+    "cache_read_errors": 1,
+    "rust_incremental_not_stored": 4,
+    "rust_linked_entry_too_large": 5,
+    "miss_explain": {"new": 9, "own-input": 8, "dependency": 7, "unchanged": 6}
+  },
+  "cache_size": 970,
+  "max_cache_size": 1000,
+  "version": "test-daemon",
+  "effective_cache_mode": "Server"
+}

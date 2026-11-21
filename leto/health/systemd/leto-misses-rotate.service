@@ -1,0 +1,7 @@
+[Unit]
+Description=Rotate the sccache Rust miss explanation log
+
+[Service]
+Type=oneshot
+UMask=0022
+ExecStart=%h/.local/bin/leto-health-report --rotate
