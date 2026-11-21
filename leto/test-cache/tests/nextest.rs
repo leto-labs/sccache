@@ -441,3 +441,97 @@ fn nextest_classifies_tests_and_preserves_timeout_and_listing() {
         }
     }
 }
+
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in fs::read_dir(dir).into_iter().flatten() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
+}
+
+// AWS_* and ALCHEMY_* hold credentials on the hosts; keyed env values may only
+// reach the store as part of the key hash.
+#[test]
+fn keyed_env_values_never_reach_records_errors_or_reports() {
+    let scratch = Scratch::create();
+    let root = &scratch.0;
+    let build = cargo(root)
+        .args(["test", "--no-run", "--offline"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", details(&build));
+    let binary = harness(root);
+    let canaries = ["AKIAcanary7f3e9d2b", "alchemy-canary-51c0ffee"];
+    let run = |test: &str, secret: &str, observe: &str| {
+        let mut shadow = Command::new(RUNNER);
+        configure(&mut shadow, root, test);
+        shadow
+            .env("LETO_TEST_CACHE_OBSERVE", observe)
+            .env("LETO_TEST_CACHE_ENV", "AWS_*,ALCHEMY_*")
+            .env("AWS_SECRET_ACCESS_KEY", secret)
+            .env("ALCHEMY_API_KEY", canaries[1])
+            .arg(&binary)
+            .args(["--exact", test, "--nocapture"])
+            .output()
+            .unwrap()
+    };
+    for test in ["tests::pure", "tests::files", "tests::exec"] {
+        run(test, canaries[0], "1");
+    }
+    run("tests::pure", "AKIAsecond-value-0000", "1");
+    // An invalid setting takes the error path, which logs the error text.
+    run("tests::pure", canaries[0], "not-a-number");
+
+    let records = records(root);
+    let pure: Vec<_> = records
+        .iter()
+        .filter(|record| record["test"] == "tests::pure")
+        .collect();
+    assert_eq!(pure.len(), 2, "{records:?}");
+    assert_ne!(
+        pure[0]["key"], pure[1]["key"],
+        "keyed values must change the key"
+    );
+    assert!(
+        root.join("logs/errors").is_dir(),
+        "the error path was not exercised"
+    );
+
+    let report = Command::new("python3")
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("report.py"))
+        .arg("--store")
+        .arg(root.join("logs"))
+        .arg("--output")
+        .arg(root.join("report"))
+        .output()
+        .unwrap();
+    assert!(report.status.success(), "{}", details(&report));
+
+    let mut checked = 0;
+    for path in files_under(&root.join("logs"))
+        .into_iter()
+        .chain(files_under(&root.join("report")))
+    {
+        let content = fs::read(&path).unwrap();
+        for canary in canaries.iter().chain(&["AKIAsecond-value-0000"]) {
+            assert!(
+                !content
+                    .windows(canary.len())
+                    .any(|w| w == canary.as_bytes()),
+                "{canary} leaked into {}",
+                path.display()
+            );
+        }
+        checked += 1;
+    }
+    assert!(
+        checked >= 4,
+        "only {checked} store and report files checked"
+    );
+}

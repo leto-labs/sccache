@@ -27,7 +27,7 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$runner" cargo nextest run
 | `LETO_TEST_CACHE_OBSERVE` | Positive sampling interval in UTC days per key. Defaults to 5. Set 1 to observe every invocation. |
 | `LETO_TEST_CACHE_PROJECT` | Stable report name for a project across worktrees. Defaults to the worktree's directory name. |
 | `LETO_TEST_CACHE_WORKSPACE` | Absolute worktree root when nextest omits `NEXTEST_WORKSPACE_ROOT`. The current directory is the final fallback. |
-| `LETO_TEST_CACHE_ENV` | Comma-separated additional keyed names and prefix patterns ending in `*`. |
+| `LETO_TEST_CACHE_ENV` | Comma-separated additional keyed names and prefix patterns ending in `*`. Values enter only the key hash; records, error logs, the digest memo and reports never contain them (`keyed_env_values_never_reach_records_errors_or_reports`). Paths a test opens or probes are recorded as paths, so a secret embedded in a file path the test touches would appear. |
 | `SCCACHE_BASEDIRS` | Colon-separated absolute roots for key normalisation in addition to the worktree. The longest matching path prefix wins. |
 
 The key includes the binary and resolved shared-library closure, exact argument
