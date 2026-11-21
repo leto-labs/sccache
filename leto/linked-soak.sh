@@ -25,59 +25,124 @@ OUTPUT = "Build-script output"
 
 def cargo_messages(command, checkout, env):
     command = ["cargo", *command, "--message-format=json"]
-    with subprocess.Popen(command, cwd=checkout, env=env, stdout=subprocess.PIPE, text=True) as cargo:
-        for line in cargo.stdout:
-            message = json.loads(line)
-            if message["reason"] == "compiler-message":
-                rendered = message["message"].get("rendered")
+    messages = []
+    # Let Cargo finish writing before interpreting any of its messages.
+    with tempfile.TemporaryFile() as output:
+        cargo = subprocess.run(command, cwd=checkout, env=env, stdout=output)
+        output.seek(0)
+        for line in output:
+            try:
+                message = json.loads(line)
+            except ValueError:
+                print(line.decode("utf-8", errors="replace"), file=sys.stderr, end="")
+                continue
+            if not isinstance(message, dict):
+                continue
+            reason = message.get("reason")
+            if reason == "compiler-message":
+                diagnostic = message.get("message")
+                rendered = diagnostic.get("rendered") if isinstance(diagnostic, dict) else None
                 if rendered:
                     print(rendered, file=sys.stderr, end="")
-            yield message
-        if cargo.wait():
-            raise subprocess.CalledProcessError(cargo.returncode, command)
+            elif reason in ("compiler-artifact", "build-script-executed"):
+                messages.append(message)
+    cargo.check_returncode()
+    return messages
+
+
+def executable_path(path, target):
+    if path.is_file() and os.access(path, os.X_OK):
+        resolved = path.resolve()
+        if resolved.is_relative_to(target):
+            return resolved.relative_to(target)
+    return None
+
+
+def reported_build_script(message, target):
+    if message.get("executable"):
+        executable = executable_path(Path(message["executable"]), target)
+        if executable is not None:
+            return executable
+    for filename in message.get("filenames", ()):
+        path = Path(filename)
+        if path.name.startswith("build-script-"):
+            executable = executable_path(path, target)
+            if executable is not None:
+                return executable
+    return None
+
+
+def nearby_build_script(out_dir, target):
+    execution_dir = (target / out_dir).parent
+    for name in ("build-script-build", "build-script-build.exe"):
+        executable = executable_path(execution_dir / name, target)
+        if executable is not None:
+            return executable
+
+    # Cargo can use different hashes for compiling and running the same build script.
+    package = execution_dir.name.rpartition("-")[0]
+    candidates = set()
+    for directory in execution_dir.parent.glob(f"{package}-*"):
+        if directory.name.rpartition("-")[0] == package:
+            for path in directory.glob("build-script-*"):
+                executable = executable_path(path, target)
+                if executable is not None:
+                    candidates.add(executable)
+    return candidates.pop() if len(candidates) == 1 else None
+
+
+def build_script_executables(compiled_scripts, script_runs, target):
+    scripts = {}
+    for package in compiled_scripts.keys() | script_runs.keys():
+        executables = {reported_build_script(message, target) for message in compiled_scripts.get(package, ())}
+        if not executables or None in executables:
+            fallback = {nearby_build_script(out_dir, target) for out_dir in script_runs.get(package, ())}
+            if fallback:
+                executables.discard(None)
+                executables.update(fallback)
+            else:
+                executables.add(None)
+        scripts[package] = executables
+    return scripts
 
 
 def collect(checkout, target, env, all_targets):
     artifacts = {TESTS: set()}
-    out_dirs = set()
+    compiled_scripts = {}
+    script_runs = {}
     bins = {}
     commands = [["test", "--workspace", "--no-run"]]
     if all_targets:
         commands.insert(0, ["build", "--workspace", "--bins", "--examples"])
         artifacts.update({category: set() for category in (BINS, EXAMPLES, OTHER, SCRIPTS, OUTPUT)})
-    for command in commands:
-        for message in cargo_messages(command, checkout, env):
-            if all_targets and message["reason"] == "build-script-executed":
+    messages = [message for command in commands for message in cargo_messages(command, checkout, env)]
+    for message in messages:
+        if message["reason"] == "build-script-executed":
+            if all_targets:
                 out_dir = Path(message["out_dir"]).resolve().relative_to(target)
-                out_dirs.add(out_dir)
+                script_runs.setdefault(message["package_id"], set()).add(out_dir)
                 artifacts[OUTPUT].add(out_dir.with_name("output"))
-            if message["reason"] != "compiler-artifact":
-                continue
-            harness = message["profile"]["test"]
-            if not all_targets and not harness:
-                continue
-            kind = message["target"]["kind"]
-            if all_targets and "custom-build" in kind:
-                # Cargo reports build scripts in filenames, with a null executable.
-                paths = [Path(filename) for filename in message["filenames"]]
-                scripts = {
-                    path.resolve().relative_to(target)
-                    for path in paths
-                    if path.name in ("build-script-build", "build-script-build.exe")
-                }
-                if not scripts:
-                    raise ValueError(f"Cargo reported no executable for build script {message['package_id']}")
-                artifacts[SCRIPTS].update(scripts)
-            elif message["executable"]:
-                path = Path(message["executable"]).resolve().relative_to(target)
-                category = TESTS if harness or "test" in kind else OTHER
-                if category == OTHER and "bin" in kind:
-                    category = BINS
-                    bins.setdefault(message["target"]["name"], set()).add((message["package_id"], path))
-                if category == OTHER and "example" in kind:
-                    category = EXAMPLES
-                artifacts[category].add(path)
-    return artifacts, out_dirs, bins
+            continue
+        harness = message["profile"]["test"]
+        if not all_targets and not harness:
+            continue
+        kind = message["target"]["kind"]
+        if all_targets and "custom-build" in kind:
+            compiled_scripts.setdefault(message["package_id"], []).append(message)
+        elif message["executable"]:
+            path = Path(message["executable"]).resolve().relative_to(target)
+            category = TESTS if harness or "test" in kind else OTHER
+            if category == OTHER and "bin" in kind:
+                category = BINS
+                bins.setdefault(message["target"]["name"], set()).add((message["package_id"], path))
+            if category == OTHER and "example" in kind:
+                category = EXAMPLES
+            artifacts[category].add(path)
+    scripts = build_script_executables(compiled_scripts, script_runs, target)
+    if all_targets:
+        artifacts[SCRIPTS].update(path for paths in scripts.values() for path in paths if path is not None)
+    out_dirs = {out_dir for dirs in script_runs.values() for out_dir in dirs}
+    return artifacts, out_dirs, bins, scripts
 
 
 def stripped(objcopy, executable, output):
@@ -161,20 +226,39 @@ def compare_tree(before, after, out_dir, normalize):
     )
 
 
-def compare_category(category, restored, rebuilt, saved, target, compare, form, remapped, *, tree=False):
+def missing_from(has_before, has_after):
+    if not has_before and not has_after:
+        return "both builds"
+    return "the rebuilt build" if has_before else "the restored build"
+
+
+def unresolved_scripts(restored, rebuilt):
+    for package in sorted(restored.keys() | rebuilt.keys()):
+        before, after = restored.get(package, set()), rebuilt.get(package, set())
+        # An executable found in only one pass already produces a missing row.
+        missing_before = None in before and not (after - before - {None})
+        missing_after = None in after and not (before - after - {None})
+        if missing_before or missing_after:
+            yield package, missing_from(not missing_before, not missing_after)
+
+
+def compare_category(category, restored, rebuilt, saved, target, compare, form, remapped, *,
+                     tree=False, unresolved=()):
     counters = dict.fromkeys(("identical", "differs", "missing"), 0)
     normalized = counters.copy()
     present = Path.is_dir if tree else Path.is_file
+    missing = "missing executable" if category == SCRIPTS else "missing"
+    for package, absent in unresolved:
+        print(f"{package}\t{missing} from {absent}")
+        counters["missing"] += 1
+        normalized["missing"] += 1
     for artifact in sorted(restored | rebuilt):
         before, after = saved / artifact, target / artifact
         has_before = artifact in restored and present(before)
         has_after = artifact in rebuilt and present(after)
         if not (has_before and has_after):
             raw = normal = "missing"
-            absent = "both builds" if not has_before and not has_after else (
-                "the restored build" if not has_before else "the rebuilt build"
-            )
-            print(f"{artifact}\tmissing from {absent}")
+            print(f"{artifact}\t{missing} from {missing_from(has_before, has_after)}")
         else:
             raw, normal = compare(before, after)
             print(f"{artifact}\t{raw}\t{form.lower()}: {normal}")
@@ -260,8 +344,8 @@ def main():
         scratch = Path(tmp)
         saved = scratch / "restored"
         print("Building against the configured sccache server", flush=True)
-        restored, restored_out, bins = collect(checkout, target, env, all_targets)
-        if not any(restored.values()) and not restored_out:
+        restored, restored_out, bins, restored_scripts = collect(checkout, target, env, all_targets)
+        if not any(restored.values()) and not restored_out and not restored_scripts:
             if all_targets:
                 raise ValueError("Cargo produced no linked artifacts or build-script outputs")
             raise ValueError("Cargo produced no test harnesses")
@@ -279,11 +363,14 @@ def main():
             ).returncode != 0
         # Preserve the target's pathname for both Cargo and the linked cache key.
         old_target = scratch / "old-target"
-        target.rename(old_target)
-        shutil.rmtree(old_target)
+        if target.exists():
+            target.rename(old_target)
+            shutil.rmtree(old_target)
 
         print("Rebuilding without reading or writing the cache", flush=True)
-        rebuilt, rebuilt_out, _ = collect(checkout, target, env | {"SCCACHE_NO_CACHE": "1"}, all_targets)
+        rebuilt, rebuilt_out, _, rebuilt_scripts = collect(
+            checkout, target, env | {"SCCACHE_NO_CACHE": "1"}, all_targets,
+        )
         compare_binary = partial(compare_executable, objcopy=objcopy, scratch=scratch)
         compare_text = partial(compare_data, normalize=normalize)
         differs = False
@@ -293,6 +380,7 @@ def main():
             compare, form = (compare_text, "Normalized") if category == OUTPUT else (compare_binary, "Stripped")
             differs |= compare_category(
                 category if all_targets else "", paths, rebuilt[category], saved, target, compare, form, remapped,
+                unresolved=unresolved_scripts(restored_scripts, rebuilt_scripts) if category == SCRIPTS else (),
             )
         if all_targets:
             differs |= compare_category(
