@@ -1,0 +1,8 @@
+[profile.shadow]
+test-threads = 4
+slow-timeout = { period = "5s", terminate-after = 1 }
+junit = { path = "shadow.xml" }
+
+[[profile.shadow.overrides]]
+filter = "test(=tests::timeout)"
+slow-timeout = { period = "1s", terminate-after = 1, grace-period = "200ms" }
