@@ -65,6 +65,44 @@ def validate_checkout(checkout):
         raise PrewarmError(f"expected a dedicated clone at {checkout}")
 
 
+def ensure_compression(state, value, log):
+    """Give the pre-warm tree a btrfs compression property.
+
+    sccache clones pre-warm outputs into reflink cache entries, and a clone keeps
+    the source extents' compression, so an uncompressed tree inflates the cache.
+    New directories inherit the property; existing ones are set once here.
+    """
+    if not value:
+        return
+    try:
+        if os.getxattr(state, "btrfs.compression") == value.encode():
+            return
+    except OSError:
+        pass
+    try:
+        os.setxattr(state, "btrfs.compression", value.encode())
+    except OSError as error:
+        # Not btrfs, or a value the kernel rejects: nothing to inherit.
+        log_event(log, f"compression property not set on {state}: {error.strerror}")
+        return
+    count = 0
+    for root, dirs, _files in os.walk(state):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
+        for name in dirs:
+            path = os.path.join(root, name)
+            try:
+                if os.getxattr(path, "btrfs.compression") == value.encode():
+                    continue
+            except OSError:
+                pass
+            try:
+                os.setxattr(path, "btrfs.compression", value.encode())
+                count += 1
+            except OSError:
+                pass
+    log_event(log, f"set compression={value} on {state} and {count} existing directories")
+
+
 def prepare_checkout(repo, checkout, ref, log):
     if not checkout.exists():
         git(checkout.parent, "clone", "--shared", "--no-checkout", "--no-tags", "--single-branch",
@@ -465,6 +503,7 @@ def run(project, clean):
             validate_checkout(checkout)
             config = read_config(configdir / "leto-prewarm" / f"{project}.conf")
             settings = {**os.environ, "SCCACHE_CLIENT_SIDE": "1", **config}
+            ensure_compression(state, settings.get("PREWARM_COMPRESSION", "zstd:1"), log)
             if clean:
                 if checkout.exists():
                     clean_checkout(checkout, cargo_env(checkout, settings))

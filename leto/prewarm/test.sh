@@ -393,3 +393,30 @@ status_is unchanged "$tip"
 grep -q '"compsize": "fixture compressed bytes"' "$state/status.json" || fail "missing stats in JSON"
 grep -q '"compsize": "fixture compressed bytes"' "$log" || fail "missing stats in log"
 printf 'ok - btrfs disk report falls back to noninteractive compsize and records its output\n'
+
+# PREWARM_TEST_BTRFS_DIR points this at a btrfs folder; elsewhere it checks the no-op.
+probe=$(mktemp -d -p "${PREWARM_TEST_BTRFS_DIR:-$tmp}")
+mkdir -p -- "$probe/state/checkout/target/debug/deps"
+python3 -I - "$runner" "$probe/state" <<'PY' || fail "compression property"
+import importlib.util, io, os, subprocess, sys
+spec = importlib.util.spec_from_file_location("prewarm", sys.argv[1])
+prewarm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(prewarm)
+state = sys.argv[2]
+log = io.StringIO()
+prewarm.ensure_compression(state, "zstd:1", log)
+fstype = subprocess.run(["/usr/bin/stat", "-f", "-c", "%T", state], capture_output=True, text=True).stdout.strip()
+dirs = [root for root, _, _ in os.walk(state)]
+if fstype == "btrfs":
+    assert all(os.getxattr(d, "btrfs.compression") == b"zstd:1" for d in dirs), dirs
+    assert f"and {len(dirs) - 1} existing directories" in log.getvalue(), log.getvalue()
+    log = io.StringIO()
+    prewarm.ensure_compression(state, "zstd:1", log)
+    assert log.getvalue() == "", log.getvalue()
+    print("btrfs")
+else:
+    assert "compression property not set" in log.getvalue(), log.getvalue()
+    print(fstype)
+PY
+rm -rf -- "$probe"
+printf 'ok - pre-warm folder gets a btrfs compression property, inherited by new outputs\n'
