@@ -628,6 +628,100 @@ fn build_smoke(fixture: &Fixture, checkout: &Path) -> Command {
     cmd
 }
 
+#[test]
+#[serial]
+fn test_client_side_plain_first_harness_store_shares_btrfs_extents() -> Result<()> {
+    use super::helpers::SCCACHE_BIN;
+
+    let dir = tempfile::tempdir()?;
+    let cache = dir.path().join("cache");
+    fs::create_dir(&cache)?;
+    if !super::cache_dir_uses_btrfs_zstd(&cache)? {
+        eprintln!("skipping client-side reflink store: requires 4 KiB btrfs");
+        return Ok(());
+    }
+    let Some(linker) = Linker::probe("rust-lld")? else {
+        return Ok(());
+    };
+
+    let socket = format!("\\x00sccache-linked-store-{}", std::process::id());
+    let server = || {
+        let mut cmd = Command::new(SCCACHE_BIN.as_os_str());
+        cmd.env("SCCACHE_SERVER_UDS", &socket);
+        cmd
+    };
+    struct StopServer(Command);
+    impl Drop for StopServer {
+        fn drop(&mut self) {
+            let _ = self.0.arg("--stop-server").output();
+        }
+    }
+    server()
+        .arg("--start-server")
+        .env("SCCACHE_DIR", &cache)
+        .env("SCCACHE_DISK_REFLINK", "true")
+        .env("SCCACHE_RUST_CACHE_LINKED", "tests")
+        .env("SCCACHE_RUST_INCREMENTAL", "cache")
+        .env("SCCACHE_RUST_INCREMENTAL_FIRST_BUILD", "plain")
+        .env("SCCACHE_MISS_EXPLAIN", "")
+        .env("SCCACHE_SERVER_PUT_RAW_MAX_IN_FLIGHT_BYTES", "0")
+        .assert()
+        .try_success()?;
+    let _stop = StopServer(server());
+
+    let checkout = dir.path().join("checkout");
+    write_smoke_package(&checkout)?;
+    let mut flags = vec![format!("-Clinker={}", linker.driver)];
+    flags.extend(linker.fuse_ld.map(str::to_owned));
+    let mut cargo = Command::new(CARGO.as_os_str());
+    cargo
+        .current_dir(&checkout)
+        .args(["test", "--offline", "--bin", "smoke", "--no-run"])
+        .env_remove("RUSTFLAGS")
+        .env_remove("SCCACHE_LOG")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .env("CARGO_TARGET_DIR", checkout.join("target"))
+        .env("CARGO_ENCODED_RUSTFLAGS", flags.join("\x1f"))
+        .env("CARGO_INCREMENTAL", "1")
+        .env("RUSTC_WRAPPER", SCCACHE_BIN.as_os_str())
+        .env("SCCACHE_SERVER_UDS", &socket)
+        .env("SCCACHE_CLIENT_SIDE", "1")
+        .env("SCCACHE_RUST_CACHE_LINKED", "tests")
+        .env("SCCACHE_RUST_INCREMENTAL", "cache");
+    let executable = &test_artifacts(&mut cargo)?["smoke"];
+    assert!(incremental_crate_dirs(&checkout, "smoke")?.is_empty());
+
+    let stats = server()
+        .args(["--show-stats", "--stats-format=json"])
+        .output()?;
+    stats.clone().assert().try_success()?;
+    let stats: Value = serde_json::from_slice(&stats.stdout)?;
+    assert_eq!(stats["stats"]["cache_writes"], 1, "{stats}");
+    assert_eq!(stats["stats"]["cache_write_errors"], 0, "{stats}");
+    let entry = walkdir::WalkDir::new(&cache)
+        .min_depth(3)
+        .max_depth(3)
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .find(|entry| entry.file_type().is_file())
+        .context("missing harness cache entry")?;
+    let mut archive = zip::ZipArchive::new(fs::File::open(entry.path())?)?;
+    assert!(archive.index_for_name("raw/.sccache-link-inputs").is_some());
+    let member = format!("raw/{}", executable.file_name().unwrap().to_string_lossy());
+    let offset = archive
+        .by_name(&member)?
+        .data_start()
+        .context("missing harness member offset")?;
+    assert_eq!(
+        super::shared_extent_at(&fs::File::open(executable)?, 0)?,
+        super::shared_extent_at(&fs::File::open(entry.path())?, offset)?,
+        "the test harness and its cache entry must share a physical extent"
+    );
+    eprintln!("verified FIEMAP_EXTENT_SHARED on the test harness and its cache entry");
+    Ok(())
+}
+
 #[test_case(false ; "compressed")]
 #[test_case(true ; "reflink")]
 #[serial]

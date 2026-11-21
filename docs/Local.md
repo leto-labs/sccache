@@ -31,11 +31,15 @@ time plus 30 seconds.
 ```ini
 [Service]
 Environment=SCCACHE_START_SERVER=1 SCCACHE_NO_DAEMON=1
+Environment=MALLOC_ARENA_MAX=8
 ExecStart=%h/.cargo/bin/sccache
 KillSignal=SIGTERM
 KillMode=mixed
 TimeoutStopSec=330s
 ```
+
+On glibc systems, set `MALLOC_ARENA_MAX=8` for the daemon to limit memory
+retained in malloc arenas after bursts of cache writes.
 
 Swap the sccache binary before adding these keys to the shared configuration.
 Clients are short-lived, usually one process per compile. Give existing
@@ -49,9 +53,11 @@ Set `reflink = true` under `[cache.disk]` or set `SCCACHE_DISK_REFLINK=true` bef
 
 With reflinks enabled, new entries store objects as aligned, uncompressed ZIP members. A hit can share the aligned part of the object with the cache when both files are on a filesystem that supports reflinks, such as btrfs. Any remaining bytes are copied. If cloning fails, sccache copies the object. Existing compressed entries remain usable. Client-side compilation uses the daemon's raw entry setting and writes compressed entries when connected to an older daemon.
 
-When the daemon compiles an object on a miss, it also tries to clone the aligned part of each output into the new cache entry. If cloning fails, it packs and copies the raw entry. With client-side compilation, the client packs the entry and sends its bytes to the daemon.
+On a miss, the daemon tries to clone the aligned part of each output into the new cache entry. In client-side mode, a same-user client connected over a Linux Unix socket (`SCCACHE_SERVER_UDS`) can send output paths to a daemon that advertises path stores. If cloning fails or the connection lacks path store support, the client packs the entry and sends its bytes.
 
-The disk cache limit uses each entry's expected on-disk size. On btrfs with 4 KiB sectors and a `zstd` compression property such as `zstd:1` on the cache directory, sccache estimates the size of raw entries in the background using zstd level 1 on 128 KiB chunks. When an entry is written by cloning compiler outputs, sccache charges uncompressed extents at their full size and estimates only compressed extents. Cloning preserves the source extents' compression. Sccache saves the estimate in the entry's `user.sccache.weight` extended attribute and reuses it until the entry is replaced or evicted. Other filesystems, existing entries without an estimate, and entries whose extended attributes cannot be read or written count at file length. Set the compression property before starting sccache. The estimate can differ from actual btrfs allocation.
+The daemon caps concurrent raw IPC stores at 1 GiB by default. Set `put_raw_max_in_flight_bytes` under `[server]` or set `SCCACHE_SERVER_PUT_RAW_MAX_IN_FLIGHT_BYTES` before starting the daemon. The daemon waits for space before reading a raw store. A store larger than the budget is skipped, and the compile succeeds. The budget rounds down to a multiple of 4 KiB. Set it to `0` to disable raw IPC stores.
+
+The disk cache limit uses each entry's expected on-disk size. On btrfs with 4 KiB sectors and a `zstd` compression property such as `zstd:1` on the cache directory, sccache reads the file's extent map. It charges uncompressed extents at their full size and estimates compressed extents with zstd level 1 on 128 KiB chunks. Cloning preserves the source extents' compression. Entries written in full are synced before weighing. For raw IPC stores the daemon acknowledges the write once staged and finishes weighing and publishing the entry in the background. Sccache saves the estimate in the entry's `user.sccache.weight` extended attribute and reuses it until the entry is replaced or evicted. Other filesystems, existing entries without an estimate, and entries whose extended attributes cannot be read or written count at file length. Set the compression property before starting sccache. The estimate can differ from actual btrfs allocation.
 
 Linked Rust entries use the same accounting. Their [per-entry size cap](Rust.md#linked-outputs) applies to uncompressed compiler outputs before the entry is written.
 

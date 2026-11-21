@@ -38,4 +38,6 @@ pub use crate::compiler::compiler::*;
 pub use crate::compiler::preprocessor_cache::PreprocessorCacheEntry;
 pub(crate) use crate::compiler::rust::NO_CRATE_TYPE_PASSED;
 pub use crate::compiler::rust::is_rmeta_artifact_notification;
+#[cfg(target_os = "linux")]
+pub(crate) use crate::compiler::rust::linked::MEMBER as RUST_LINK_MANIFEST_MEMBER;
 pub(crate) use crate::compiler::rust::{local_incremental_command, plain_first_build_arguments};

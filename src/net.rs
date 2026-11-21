@@ -95,6 +95,10 @@ pub trait Acceptor {
 
     fn accept(&self) -> impl Future<Output = tokio::io::Result<Self::Socket>> + Send;
     fn local_addr(&self) -> tokio::io::Result<Option<SocketAddr>>;
+
+    fn is_same_user(&self, _socket: &Self::Socket) -> bool {
+        false
+    }
 }
 
 impl Acceptor for tokio::net::TcpListener {
@@ -184,6 +188,13 @@ mod unix_imp {
             tokio::net::UnixListener::accept(self).and_then(|(s, _)| futures::future::ok(s))
         }
 
+        #[cfg(target_os = "linux")]
+        fn is_same_user(&self, socket: &Self::Socket) -> bool {
+            // SAFETY: geteuid takes no arguments.
+            let uid = unsafe { libc::geteuid() };
+            peer_uid_matches(socket.peer_cred().ok().map(|cred| cred.uid()), uid)
+        }
+
         #[inline]
         fn local_addr(&self) -> tokio::io::Result<Option<SocketAddr>> {
             let addr = tokio::net::UnixListener::local_addr(self)?;
@@ -197,6 +208,23 @@ mod unix_imp {
             //     return Ok(SocketAddr::UnixAbstract(p.to_vec()));
             // }
             Ok(None)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn peer_uid_matches(peer: Option<u32>, uid: u32) -> bool {
+        peer == Some(uid)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    mod test {
+        use super::*;
+
+        #[test]
+        fn rejects_missing_and_mismatched_peer_credentials() {
+            assert!(peer_uid_matches(Some(1000), 1000));
+            assert!(!peer_uid_matches(Some(1001), 1000));
+            assert!(!peer_uid_matches(None, 1000));
         }
     }
 

@@ -12,6 +12,8 @@
 
 use super::utils::{get_file_mode, set_file_mode};
 use crate::errors::*;
+#[cfg(target_os = "linux")]
+use anyhow::ensure;
 use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -167,13 +169,6 @@ impl std::fmt::Display for DecompressionFailure {
 impl std::error::Error for DecompressionFailure {}
 
 impl CacheRead {
-    pub(super) fn has_raw_objects(&self) -> bool {
-        self.zip
-            .file_names()
-            .flatten()
-            .any(|name| name.starts_with("raw/"))
-    }
-
     /// Create a cache entry from `reader`.
     pub fn from<R>(reader: R) -> Result<CacheRead>
     where
@@ -488,12 +483,52 @@ impl OpenCacheObject {
     pub(crate) fn size(&self) -> io::Result<u64> {
         Ok(self.file.metadata()?.len())
     }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn store_object(&self) -> io::Result<crate::protocol::StoreObject> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = self.file.metadata()?;
+        Ok(crate::protocol::StoreObject {
+            key: self.key.clone(),
+            path: self.file.path().as_os_str().to_owned(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn reopen_for_clone(source: crate::protocol::StoreObject) -> Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        let path = PathBuf::from(source.path);
+        ensure!(path.is_absolute(), "relative cache output path");
+        let mut options = std::fs::OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let file = fs::File::from_parts(options.open(&path)?, path);
+        let metadata = file.metadata()?;
+        // The held client fd permits a safe fallback if the path was replaced.
+        // In-place writes can still race cloning, just as for daemon compiles.
+        ensure!(
+            metadata.is_file()
+                && metadata.dev() == source.device
+                && metadata.ino() == source.inode
+                && metadata.len() == source.size,
+            "cache output changed before it could be cloned"
+        );
+        Ok(Self {
+            key: source.key,
+            file,
+        })
+    }
 }
 
 /// Data to be stored in the compiler cache.
 pub struct CacheWrite {
     zip: ZipWriter<Cursor<Vec<u8>>>,
-    has_raw_objects: bool,
 }
 
 impl CacheWrite {
@@ -501,7 +536,6 @@ impl CacheWrite {
     pub fn new() -> CacheWrite {
         CacheWrite {
             zip: ZipWriter::new(Cursor::new(vec![])),
-            has_raw_objects: false,
         }
     }
 
@@ -604,7 +638,6 @@ impl CacheWrite {
     ) -> Result<()> {
         Self::start_raw_object(&mut self.zip, name, mode, large)?;
         io::copy(from, &mut self.zip)?;
-        self.has_raw_objects = true;
         Ok(())
     }
 
@@ -621,10 +654,6 @@ impl CacheWrite {
                 .large_file(large),
         )
         .context("Failed to start cache entry object")
-    }
-
-    pub(super) fn has_raw_objects(&self) -> bool {
-        self.has_raw_objects
     }
 
     fn object_options(mode: Option<u32>) -> SimpleFileOptions {
@@ -686,7 +715,12 @@ impl CacheWrite {
             Self::start_raw_object(&mut zip, key, mode, len >= zip::ZIP64_BYTES_THR)?;
 
             let offset = output.stream_position()?;
-            let head = len - len % alignment;
+            // The manifest may live on a different filesystem than the compiler output.
+            let head = if key == crate::compiler::RUST_LINK_MANIFEST_MEMBER {
+                0
+            } else {
+                len - len % alignment
+            };
             if head > 0 {
                 if let Err(error) = clone_range(file.file(), 0, output, offset, head) {
                     debug!("Disk cache store reflink failed, copying objects: {error}");
@@ -705,9 +739,14 @@ impl CacheWrite {
                 }
             }
 
-            let tail = &mut buf[..(len - head) as usize];
-            file.file().read_exact_at(tail, head)?;
-            zip.write_all(tail)?;
+            let mut copied = head;
+            while copied < len {
+                let size = (len - copied).min(buf.len() as u64) as usize;
+                let chunk = &mut buf[..size];
+                file.file().read_exact_at(chunk, copied)?;
+                zip.write_all(chunk)?;
+                copied += size as u64;
+            }
         }
         Self::put_bytes_into(&mut zip, "stdout", stdout)?;
         Self::put_bytes_into(&mut zip, "stderr", stderr)?;
@@ -1143,6 +1182,36 @@ mod tests {
             end += extent.length;
         }
         assert!(end >= length, "shared only {end} of {length} bytes");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cache_store_path_must_match_the_open_regular_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("output");
+        fs::write(&path, b"original").unwrap();
+        let objects = CacheWrite::open_objects([FileObjectSource {
+            key: "output".into(),
+            path: path.clone(),
+            optional: false,
+        }])
+        .unwrap();
+        let source = objects[0].store_object().unwrap();
+        assert!(OpenCacheObject::reopen_for_clone(source.clone()).is_ok());
+        let mut relative = source.clone();
+        relative.path = "output".into();
+        assert!(OpenCacheObject::reopen_for_clone(relative).is_err());
+
+        let original = dir.path().join("original");
+        fs::rename(&path, &original).unwrap();
+        symlink(&original, &path).unwrap();
+        assert!(OpenCacheObject::reopen_for_clone(source.clone()).is_err());
+
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, b"replaced").unwrap();
+        assert!(OpenCacheObject::reopen_for_clone(source).is_err());
     }
 
     #[test_case::test_case(false ; "compressed")]

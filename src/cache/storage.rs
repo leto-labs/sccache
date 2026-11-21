@@ -78,6 +78,8 @@ pub trait CacheStorage: Send + Sync {
     /// finished.
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration>;
 
+    /// A backend may signal `staged` after consuming the outputs, before
+    /// finishing a write in the background.
     async fn put_objects(
         &self,
         key: &str,
@@ -85,12 +87,27 @@ pub trait CacheStorage: Send + Sync {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
         pool: &tokio::runtime::Handle,
+        _staged: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Duration> {
         put_packed_objects(self, key, objects, stdout, stderr, pool).await
     }
 
     fn write_raw_objects(&self) -> bool {
         false
+    }
+
+    fn supports_put_by_path(&self) -> bool {
+        false
+    }
+
+    async fn put_by_path(
+        &self,
+        _key: &str,
+        _objects: Vec<crate::protocol::StoreObject>,
+        _stdout: Vec<u8>,
+        _stderr: Vec<u8>,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Get raw serialized cache entry bytes by `key` (for multi-level backfill).
@@ -105,6 +122,15 @@ pub trait CacheStorage: Send + Sync {
     /// This is used by multi-level caches to backfill faster levels.
     async fn put_raw(&self, _key: &str, _data: Bytes) -> Result<Duration> {
         Err(anyhow!("put_raw not implemented for this storage backend"))
+    }
+
+    async fn put_raw_from_client(
+        &self,
+        key: &str,
+        data: Bytes,
+        _staged: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Duration> {
+        self.put_raw(key, data).await
     }
 
     /// Check the cache capability.

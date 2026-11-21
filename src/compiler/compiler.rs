@@ -999,9 +999,12 @@ where
                 let stderr = compiler_result.stderr.clone();
                 let write_key = key.clone();
                 let out_pretty = out_pretty.clone();
+                let (staged, written) = tokio::sync::oneshot::channel();
                 let future = async move {
+                    // An IPC store may still need to open the manifest by path.
+                    let _link_manifest = link_manifest;
                     let duration = storage
-                        .put_objects(&write_key, outputs?, stdout, stderr, &pool)
+                        .put_objects(&write_key, outputs?, stdout, stderr, &pool, Some(staged))
                         .await?;
                     if let Some((explainer, manifest)) = explanation {
                         match pool
@@ -1020,6 +1023,7 @@ where
                     })
                 };
                 let future = CacheWriteFuture {
+                    staged: written,
                     key,
                     future: Box::pin(future),
                 };
@@ -1470,6 +1474,7 @@ pub enum CacheStoreVeto {
 
 pub struct CacheWriteFuture {
     pub(crate) key: String,
+    pub(crate) staged: tokio::sync::oneshot::Receiver<()>,
     pub(crate) future: Pin<Box<dyn Future<Output = Result<CacheWriteInfo>> + Send>>,
 }
 

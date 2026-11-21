@@ -67,6 +67,8 @@ shutdown_drain_secs = 10
 autostart = true
 # Seconds a compile waits for a managed server when autostart is false.
 connect_wait_secs = 30
+# Maximum total bytes in raw client-side store requests in flight.
+put_raw_max_in_flight_bytes = 1073741824
 
 [dist]
 # where to find the scheduler
@@ -238,6 +240,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_SHUTDOWN_DRAIN_SECS` overrides `server.shutdown_drain_secs`. The server closes its listener and waits up to this many seconds for established connections and cache writes. It logs the remaining connection count at info level every 10 seconds. The default is 10 seconds. Set `0` to skip the wait. The server reads this setting at startup.
 * `SCCACHE_SERVER_AUTOSTART` overrides `server.autostart`. Set `0` (or `false` / `off`) to disable automatic server startup. The default is enabled. An explicit `--start-server` still starts a server.
 * `SCCACHE_SERVER_CONNECT_WAIT_SECS` overrides `server.connect_wait_secs`. With autostart disabled, compile clients retry for up to this many seconds, then warn and run the compiler locally. The default is 30 seconds. Set `0` for a single connection attempt.
+* `SCCACHE_SERVER_PUT_RAW_MAX_IN_FLIGHT_BYTES` overrides `server.put_raw_max_in_flight_bytes`. The daemon reads this setting at startup. See [raw IPC stores](Local.md#reflink-cache-hits).
 * `SCCACHE_CONF` configuration file path
 * `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths, or a value that is not valid UTF-8, will cause an error and prevent the server from start. The variable is also read from the environment of each compile, where it takes precedence over both for that compile: an empty value turns base directories off, and a relative path or a value that is not valid UTF-8 is ignored with a warning.
 * `SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS` comma-separated names of variables that a Rust crate reads with `env!` or `option_env!` whose values are hashed without stripping `SCCACHE_BASEDIRS`, e.g. `CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH`. Read from the environment of each compile; empty or not valid UTF-8 means none. Names are case-insensitive on Windows. See [Rust caveats](Rust.md)

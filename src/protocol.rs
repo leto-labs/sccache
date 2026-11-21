@@ -9,6 +9,10 @@ use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::ffi::OsString;
 
+// Bincode's fixed-width, little-endian discriminant for StoragePutRaw.
+// The server checks this before reading the body.
+pub(crate) const STORAGE_PUT_RAW_TAG: [u8; 4] = 8_u32.to_le_bytes();
+
 /// A client request.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Request {
@@ -39,6 +43,22 @@ pub enum Request {
     StoragePutPreprocessorEntry { key: String, entry_bytes: Vec<u8> },
     /// Merge per-invocation stats into the daemon's running totals.
     RecordStats(Box<ServerStats>),
+    /// Store a compilation by cloning its outputs from local files.
+    StoragePutByPath {
+        key: String,
+        objects: Vec<StoreObject>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct StoreObject {
+    pub key: String,
+    pub path: OsString,
+    pub device: u64,
+    pub inode: u64,
+    pub size: u64,
 }
 
 /// A server response.
@@ -80,6 +100,8 @@ pub enum Response {
     ///
     /// Currently only `.rmeta` notifications are sent (for Cargo pipelining).
     ArtifactNotification(Vec<u8>),
+    /// `Ok(false)` requests the usual raw-entry fallback.
+    StoragePutByPath(Result<bool, String>),
 }
 
 /// Possible responses from the server for a `Compile` request.
@@ -144,6 +166,8 @@ pub struct StorageHandshakeInfo {
     pub rust_cache_linked_max_entry_bytes: u64,
     #[serde(skip, default = "legacy_rust_hash_cargo_env")]
     pub rust_hash_cargo_env: RustHashCargoEnv,
+    #[serde(skip)]
+    pub put_by_path: bool,
 }
 
 fn legacy_rust_hash_cargo_env() -> RustHashCargoEnv {
@@ -186,13 +210,20 @@ pub(crate) fn encode_response(response: &Response) -> bincode::Result<Vec<u8>> {
             let custom_limit = info.rust_cache_linked_max_entry_bytes
                 != default_rust_cache_linked_max_entry_bytes();
             let semantic_env = info.rust_hash_cargo_env != legacy_rust_hash_cargo_env();
-            if info.rust_cache_linked != RustCacheLinked::Off || custom_limit || semantic_env {
+            if info.rust_cache_linked != RustCacheLinked::Off
+                || custom_limit
+                || semantic_env
+                || info.put_by_path
+            {
                 bincode::serialize_into(&mut frame, &info.rust_cache_linked)?;
-                if custom_limit || semantic_env {
+                if custom_limit || semantic_env || info.put_by_path {
                     bincode::serialize_into(&mut frame, &info.rust_cache_linked_max_entry_bytes)?;
                 }
-                if semantic_env {
+                if semantic_env || info.put_by_path {
                     bincode::serialize_into(&mut frame, &info.rust_hash_cargo_env)?;
+                }
+                if info.put_by_path {
+                    bincode::serialize_into(&mut frame, &info.put_by_path)?;
                 }
             }
         }
@@ -234,8 +265,11 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                                         let (limit, remaining) = decode_frame(remaining)?;
                                         info.rust_cache_linked_max_entry_bytes = limit;
                                         if !remaining.is_empty() {
-                                            info.rust_hash_cargo_env =
-                                                bincode::deserialize(remaining)?;
+                                            let (hash_env, remaining) = decode_frame(remaining)?;
+                                            info.rust_hash_cargo_env = hash_env;
+                                            if !remaining.is_empty() {
+                                                info.put_by_path = bincode::deserialize(remaining)?;
+                                            }
                                         }
                                     }
                                 }
@@ -449,6 +483,7 @@ mod tests {
         assert_eq!(info.rust_cache_linked, RustCacheLinked::Off);
         assert_eq!(info.rust_cache_linked_max_entry_bytes, 256 * 1024 * 1024);
         assert_eq!(info.rust_hash_cargo_env, RustHashCargoEnv::All);
+        assert!(!info.put_by_path);
 
         let mode = CacheNoBypass;
         let mut mode_only = old_frame.clone();
@@ -479,7 +514,7 @@ mod tests {
         info.rust_cache_linked_max_entry_bytes = 1024;
         let limited_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
         info.rust_hash_cargo_env = RustHashCargoEnv::Semantic;
-        let semantic_frame = encode_response(&Response::StorageHandshake(info)).unwrap();
+        let semantic_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
         assert!(limited_frame.starts_with(&incremental_frame));
         assert!(semantic_frame.starts_with(&limited_frame));
         let Response::StorageHandshake(semantic) = decode_response(&semantic_frame).unwrap() else {
@@ -487,6 +522,32 @@ mod tests {
         };
         assert_eq!(semantic.rust_hash_cargo_env, RustHashCargoEnv::Semantic);
         assert_eq!(semantic.rust_cache_linked_max_entry_bytes, 1024);
+        assert!(!semantic.put_by_path);
+
+        info.put_by_path = true;
+        let path_frame = encode_response(&Response::StorageHandshake(info.clone())).unwrap();
+        assert!(path_frame.starts_with(&semantic_frame));
+        // The previous decoder used bincode::deserialize for the last field.
+        assert_eq!(
+            bincode::deserialize::<RustHashCargoEnv>(&path_frame[limited_frame.len()..]).unwrap(),
+            RustHashCargoEnv::Semantic
+        );
+        let Response::StorageHandshake(path_store) = decode_response(&path_frame).unwrap() else {
+            panic!("expected storage handshake");
+        };
+        assert!(path_store.put_by_path);
+        assert!(path_store.write_raw_objects);
+
+        info.rust_cache_linked = RustCacheLinked::Off;
+        info.rust_cache_linked_max_entry_bytes = default_rust_cache_linked_max_entry_bytes();
+        info.rust_hash_cargo_env = RustHashCargoEnv::All;
+        let frame = encode_response(&Response::StorageHandshake(info)).unwrap();
+        let Response::StorageHandshake(path_store) = decode_response(&frame).unwrap() else {
+            panic!("expected storage handshake");
+        };
+        assert!(path_store.put_by_path);
+        assert_eq!(path_store.rust_cache_linked, RustCacheLinked::Off);
+        assert_eq!(path_store.rust_hash_cargo_env, RustHashCargoEnv::All);
         let Response::StorageHandshake(limited) = decode_response(&limited_frame).unwrap() else {
             panic!("expected storage handshake");
         };
@@ -577,5 +638,43 @@ mod tests {
             assert_eq!(info.incremental_prune_days, prune_days);
             assert_eq!(info.cache_mode, CacheMode::ReadOnly);
         }
+    }
+
+    #[test]
+    fn storage_put_by_path_round_trips() {
+        #[cfg(unix)]
+        let path = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(b"/work/obj-\xff".to_vec())
+        };
+        #[cfg(not(unix))]
+        let path = "C:\\work\\obj".into();
+        let objects = vec![StoreObject {
+            key: "object".into(),
+            path,
+            device: 13,
+            inode: 37,
+            size: 8192,
+        }];
+        let frame = encode_request(&Request::StoragePutByPath {
+            key: "01".into(),
+            objects: objects.clone(),
+            stdout: b"out".to_vec(),
+            stderr: b"err".to_vec(),
+        })
+        .unwrap();
+        let Request::StoragePutByPath {
+            key,
+            objects: decoded,
+            stdout,
+            stderr,
+        } = decode_request(&frame).unwrap()
+        else {
+            panic!("expected path store");
+        };
+        assert_eq!(key, "01");
+        assert_eq!(decoded, objects);
+        assert_eq!(stdout, b"out");
+        assert_eq!(stderr, b"err");
     }
 }

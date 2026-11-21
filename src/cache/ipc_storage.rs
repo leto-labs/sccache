@@ -12,8 +12,8 @@
 
 use crate::cache::CacheMode;
 use crate::cache::GetPathResult;
-use crate::cache::cache_io::{Cache, CacheRead, CacheWrite};
-use crate::cache::storage::{CacheStorage, PreprocessorCacheStorage};
+use crate::cache::cache_io::{Cache, CacheRead, CacheWrite, OpenCacheObject};
+use crate::cache::storage::{CacheStorage, PreprocessorCacheStorage, put_packed_objects};
 use crate::client::ServerConnection;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::config::{
@@ -25,7 +25,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::io::Cursor;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// `Storage` implementation that forwards all cache operations to the sccache
 /// daemon over the existing IPC connection.  Used by CLI processes in
@@ -123,6 +123,41 @@ impl CacheStorage for IpcStorage {
         self.put_raw(key, entry.finish()?.into()).await
     }
 
+    async fn put_objects(
+        &self,
+        key: &str,
+        objects: Vec<OpenCacheObject>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        pool: &tokio::runtime::Handle,
+        _staged: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<Duration> {
+        #[cfg(target_os = "linux")]
+        if self.handshake.put_by_path && !objects.is_empty() {
+            // Missing optional members were already skipped when opening the outputs.
+            if let Ok(sources) = objects.iter().map(OpenCacheObject::store_object).collect() {
+                let start = Instant::now();
+                match self
+                    .rpc(Request::StoragePutByPath {
+                        key: key.to_owned(),
+                        objects: sources,
+                        stdout: stdout.clone(),
+                        stderr: stderr.clone(),
+                    })
+                    .await?
+                {
+                    Response::StoragePutByPath(Ok(true)) => return Ok(start.elapsed()),
+                    Response::StoragePutByPath(Ok(false)) => (),
+                    Response::StoragePutByPath(Err(error)) => {
+                        bail!("IpcStorage::put_by_path: {error}")
+                    }
+                    other => bail!("IpcStorage::put_by_path: unexpected response: {other:?}"),
+                }
+            }
+        }
+        put_packed_objects(self, key, objects, stdout, stderr, pool).await
+    }
+
     fn write_raw_objects(&self) -> bool {
         self.handshake.write_raw_objects
     }
@@ -140,6 +175,7 @@ impl CacheStorage for IpcStorage {
     }
 
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
+        let start = Instant::now();
         let resp = self
             .rpc(Request::StoragePutRaw {
                 key: key.to_owned(),
@@ -147,7 +183,7 @@ impl CacheStorage for IpcStorage {
             })
             .await?;
         match resp {
-            Response::StoragePutRaw(Ok(())) => Ok(Duration::ZERO),
+            Response::StoragePutRaw(Ok(())) => Ok(start.elapsed()),
             Response::StoragePutRaw(Err(e)) => bail!("IpcStorage::put_raw: daemon error: {e}"),
             other => bail!("IpcStorage::put_raw: unexpected response: {other:?}"),
         }
@@ -243,9 +279,10 @@ mod tests {
     use std::io::Read;
     use std::net::{TcpListener, TcpStream};
 
-    #[test_case::test_case(false; "legacy handshake")]
-    #[test_case::test_case(true; "raw handshake")]
-    fn ipc_packs_objects_in_daemon_format(raw: bool) {
+    #[test_case::test_case(false, false; "legacy handshake")]
+    #[test_case::test_case(true, false; "raw handshake")]
+    #[cfg_attr(target_os = "linux", test_case::test_case(true, true; "clone failure"))]
+    fn ipc_packs_objects_in_daemon_format(raw: bool, put_by_path: bool) {
         fn read_request(mut stream: &TcpStream) -> Request {
             let mut length = [0; 4];
             stream.read_exact(&mut length).unwrap();
@@ -274,12 +311,22 @@ mod tests {
                 miss_explain: false,
                 incremental_prune_days: 7,
                 write_raw_objects: true,
+                put_by_path,
             }))
             .unwrap();
             if !raw {
                 frame.pop();
             }
             write_length_prefixed_bytes(&stream, &frame).unwrap();
+            if put_by_path {
+                let Request::StoragePutByPath { objects, .. } = read_request(&stream) else {
+                    panic!("expected path store");
+                };
+                assert_eq!(objects[0].key, "object");
+                assert_eq!(objects[0].size, b"compiler output".len() as u64);
+                let response = encode_response(&Response::StoragePutByPath(Ok(false))).unwrap();
+                write_length_prefixed_bytes(&stream, &response).unwrap();
+            }
             let Request::StoragePutRaw { data, .. } = read_request(&stream) else {
                 panic!("expected a cache put");
             };
@@ -319,6 +366,7 @@ mod tests {
                     vec![],
                     vec![],
                     runtime.handle(),
+                    None,
                 )
                 .await
                 .unwrap();

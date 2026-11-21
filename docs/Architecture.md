@@ -107,7 +107,7 @@ as a shared gateway to the storage backend (and as a place to aggregate stats).
 
 On startup the CLI performs a one-shot `StorageHandshake` to fetch the cache
 metadata (cache mode, max size, basedirs, preprocessor-cache config, and
-whether to write aligned raw objects). It then
+support for aligned raw objects and stores by path). It then
 runs the same pipeline locally — including direct mode — and forwards each
 individual cache operation to the daemon over IPC. On the client side this is
 implemented by `IpcStorage`, which implements `CacheStorage` and
@@ -147,7 +147,7 @@ in both modes.
           else cache miss
               D-->>C: miss
               C->>C: run compiler
-              C->>D: StoragePutRaw (key, bytes)
+              C->>D: StoragePutByPath or StoragePutRaw
               D->>S: store
           end
       end
@@ -159,6 +159,8 @@ in both modes.
 backend exposes a local path; for backends that don't (S3, Redis, …) the CLI
 falls back to fetching the raw bytes with `StorageGetRaw`. Direct-mode entries
 are exchanged with `StorageGetPreprocessorEntry` / `StoragePutPreprocessorEntry`.
+For a [same-user Unix socket with a reflink disk cache](Local.md#reflink-cache-hits),
+`StoragePutByPath` lets the daemon clone outputs into the cache entry.
 Because each CLI process accumulates its own statistics, it flushes them to the
 daemon with `RecordStats` before exiting.
 

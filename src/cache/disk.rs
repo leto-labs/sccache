@@ -21,7 +21,9 @@ use crate::lru_disk_cache::{Error as LruError, LruDiskCache, ReadSeek, Result as
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::ffi::OsStr;
-use std::io::{self, BufWriter, Read, Write};
+#[cfg(target_os = "linux")]
+use std::io::Read;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,7 +33,6 @@ use crate::errors::*;
 #[cfg(target_os = "linux")]
 use super::cache_io::FileExtentMap;
 use super::lazy_disk_cache::LazyDiskCache;
-use super::storage::put_packed_objects;
 use super::utils::normalize_key;
 use crate::config::PreprocessorCacheModeConfig;
 
@@ -98,7 +99,7 @@ impl DiskCache {
         &self,
         key: &str,
         data: Bytes,
-        has_raw_objects: Option<bool>,
+        staged: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Duration> {
         if self.rw_mode == CacheMode::ReadOnly {
             return Err(anyhow!("Cannot write to a read-only cache"));
@@ -109,7 +110,7 @@ impl DiskCache {
         self.pool
             .spawn_blocking(move || {
                 let start = Instant::now();
-                store_bytes(&lru, key, data, has_raw_objects)?;
+                store_bytes(&lru, key, data, staged)?;
                 Ok(start.elapsed())
             })
             .await?
@@ -120,25 +121,32 @@ fn store_bytes(
     lru: &Mutex<LazyDiskCache>,
     key: PathBuf,
     data: Bytes,
-    has_raw_objects: Option<bool>,
+    staged: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    let uses_weights =
-        has_raw_objects != Some(false) && lru.lock().unwrap().get_or_init()?.uses_weights();
-    let weight = if uses_weights
-        && has_raw_objects.unwrap_or_else(|| {
-            CacheRead::from(io::Cursor::new(data.clone()))
-                .is_ok_and(|entry| entry.has_raw_objects())
-        }) {
-        estimate_weight(data.as_ref()).ok()
+    let (mut entry, uses_weights) = {
+        let mut lru = lru.lock().unwrap();
+        let lru = lru.get_or_init()?;
+        let uses_weights = lru.uses_weights();
+        // Only the written extents can tell us whether the entry fits.
+        let reservation = if uses_weights { 0 } else { data.len() as u64 };
+        (lru.prepare_add(key, reservation)?, uses_weights)
+    };
+    let written = entry.as_file_mut().write_all(&data);
+    drop(data);
+    #[cfg(target_os = "linux")]
+    let weight = if written.is_ok() && uses_weights {
+        if let Some(staged) = staged {
+            let _ = staged.send(());
+        }
+        estimate_written_weight(entry.as_file_mut()).ok()
     } else {
         None
     };
-    let mut entry = lru
-        .lock()
-        .unwrap()
-        .get_or_init()?
-        .prepare_add(key, weight.unwrap_or(data.len() as u64))?;
-    let written = entry.as_file_mut().write_all(&data);
+    #[cfg(not(target_os = "linux"))]
+    let weight = {
+        let _ = (staged, uses_weights);
+        None
+    };
     let mut lru = lru.lock().unwrap();
     let lru = lru.get().unwrap();
     if let Err(error) = written {
@@ -178,19 +186,24 @@ fn try_store_reflink(
     written
 }
 
+#[cfg(all(test, target_os = "linux"))]
 fn estimate_weight(data: impl Read) -> io::Result<u64> {
     WeightEstimator::new()?.estimate(data)
 }
 
+#[cfg(target_os = "linux")]
 const BTRFS_EXTENT: usize = 128 * 1024;
+#[cfg(target_os = "linux")]
 const BTRFS_SECTOR: usize = 4096;
 
+#[cfg(target_os = "linux")]
 struct WeightEstimator {
     zstd: zstd::bulk::Compressor<'static>,
     compressed: Vec<u8>,
     chunk: Vec<u8>,
 }
 
+#[cfg(target_os = "linux")]
 impl WeightEstimator {
     fn new() -> io::Result<Self> {
         Ok(Self {
@@ -221,6 +234,12 @@ impl WeightEstimator {
 }
 
 #[cfg(target_os = "linux")]
+fn estimate_written_weight(file: &std::fs::File) -> io::Result<u64> {
+    file.sync_data()?;
+    estimate_reflink_weight(file)
+}
+
+#[cfg(target_os = "linux")]
 fn estimate_reflink_weight(mut file: &std::fs::File) -> io::Result<u64> {
     use std::io::{Seek, SeekFrom};
 
@@ -235,13 +254,13 @@ fn estimate_reflink_weight(mut file: &std::fs::File) -> io::Result<u64> {
         let previous_offset = offset;
         for extent in map.extents() {
             let start = extent.logical.max(offset);
-            let end = extent.logical + extent.length;
+            let end = (extent.logical + extent.length).min(length);
             if end <= start || start >= length {
                 continue;
             }
             weight += if extent.is_encoded() {
                 file.seek(SeekFrom::Start(start))?;
-                estimator.estimate(file.take(end.min(length) - start))?
+                estimator.estimate(file.take(end - start))?
             } else {
                 end - start
             };
@@ -391,9 +410,8 @@ impl CacheStorage for DiskCache {
 
     async fn put(&self, key: &str, entry: CacheWrite) -> Result<Duration> {
         trace!("DiskCache::put({})", key);
-        let has_raw_objects = entry.has_raw_objects();
         let data = entry.finish()?;
-        self.store(key, data.into(), Some(has_raw_objects)).await
+        self.store(key, data.into(), None).await
     }
 
     async fn put_objects(
@@ -402,41 +420,83 @@ impl CacheStorage for DiskCache {
         objects: Vec<OpenCacheObject>,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
-        pool: &tokio::runtime::Handle,
+        _pool: &tokio::runtime::Handle,
+        staged: Option<tokio::sync::oneshot::Sender<()>>,
     ) -> Result<Duration> {
-        #[cfg(target_os = "linux")]
-        if self.reflink {
-            if self.rw_mode == CacheMode::ReadOnly {
-                bail!("Cannot write to a read-only cache");
-            }
-            let start = Instant::now();
-            let lru = self.lru.clone();
-            let key = make_key_path(key);
-            return self
-                .pool
-                .spawn_blocking(move || {
-                    if !try_store_reflink(&lru, &key, &objects, &stdout, &stderr)? {
-                        let mut entry = CacheWrite::pack_objects(objects, true)?;
-                        let has_raw_objects = entry.has_raw_objects();
-                        entry.put_stdout(&stdout)?;
-                        entry.put_stderr(&stderr)?;
-                        store_bytes(&lru, key, entry.finish()?.into(), Some(has_raw_objects))?;
-                    }
-                    Ok(start.elapsed())
-                })
-                .await?;
+        if self.rw_mode == CacheMode::ReadOnly {
+            bail!("Cannot write to a read-only cache");
         }
-        put_packed_objects(self, key, objects, stdout, stderr, pool).await
+        let lru = self.lru.clone();
+        let key = make_key_path(key);
+        let reflink = self.reflink;
+        self.pool
+            .spawn_blocking(move || {
+                let start = Instant::now();
+                #[cfg(target_os = "linux")]
+                if reflink && try_store_reflink(&lru, &key, &objects, &stdout, &stderr)? {
+                    return Ok(start.elapsed());
+                }
+                let mut entry = CacheWrite::pack_objects(objects, reflink)?;
+                entry.put_stdout(&stdout)?;
+                entry.put_stderr(&stderr)?;
+                store_bytes(&lru, key, entry.finish()?.into(), staged)?;
+                Ok(start.elapsed())
+            })
+            .await?
     }
 
     fn write_raw_objects(&self) -> bool {
         self.reflink
     }
 
+    fn supports_put_by_path(&self) -> bool {
+        self.reflink && self.rw_mode == CacheMode::ReadWrite
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn put_by_path(
+        &self,
+        key: &str,
+        objects: Vec<crate::protocol::StoreObject>,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    ) -> Result<bool> {
+        if !self.supports_put_by_path() {
+            return Ok(false);
+        }
+        let lru = self.lru.clone();
+        let key = make_key_path(key);
+        self.pool
+            .spawn_blocking(move || {
+                let objects = objects
+                    .into_iter()
+                    .map(OpenCacheObject::reopen_for_clone)
+                    .collect::<Result<Vec<_>>>();
+                match objects
+                    .and_then(|objects| try_store_reflink(&lru, &key, &objects, &stdout, &stderr))
+                {
+                    Ok(stored) => Ok(stored),
+                    Err(error) => {
+                        debug!("Disk cache path store failed: {error:#}");
+                        Ok(false)
+                    }
+                }
+            })
+            .await?
+    }
+
     async fn put_raw(&self, key: &str, data: Bytes) -> Result<Duration> {
         trace!("DiskCache::put_raw({}, {} bytes)", key, data.len());
-        self.store(key, data, (!self.reflink).then_some(false))
-            .await
+        self.store(key, data, None).await
+    }
+
+    async fn put_raw_from_client(
+        &self,
+        key: &str,
+        data: Bytes,
+        staged: tokio::sync::oneshot::Sender<()>,
+    ) -> Result<Duration> {
+        self.store(key, data, Some(staged)).await
     }
 
     async fn check(&self) -> Result<CacheMode> {
@@ -530,6 +590,7 @@ mod tests {
         assert!(!disk.write_raw_objects());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn raw_weight_estimate_counts_incompressible_extents_at_full_length() {
         use rand::{RngCore, SeedableRng};
@@ -542,6 +603,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn raw_weight_estimate_rounds_zero_extents_to_one_sector_each() {
         assert_eq!(
@@ -608,7 +670,7 @@ mod tests {
         assert!(disk.write_raw_objects());
 
         runtime.block_on(async {
-            disk.put_objects(KEY, objects, vec![], vec![], runtime.handle())
+            disk.put_objects(KEY, objects, vec![], vec![], runtime.handle(), None)
                 .await
                 .unwrap();
             let weight = disk.current_size().await.unwrap().unwrap();
@@ -623,6 +685,50 @@ mod tests {
             assert!(reopened.get_raw(KEY).await.unwrap().is_some());
             assert_eq!(reopened.current_size().await.unwrap(), Some(weight));
         });
+        eprintln!("verified mixed btrfs clone weights");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn raw_cache_entry_weight_uses_written_btrfs_extents() {
+        use crate::lru_disk_cache::test_btrfs_zstd;
+        use rand::{RngCore, SeedableRng};
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        if !test_btrfs_zstd(dir.path()) {
+            return;
+        }
+        let mut preallocated = tempfile::tempfile_in(dir.path()).unwrap();
+        // SAFETY: The descriptor is valid and the length fits off_t.
+        let result =
+            unsafe { libc::fallocate(preallocated.as_raw_fd(), 0, 0, BTRFS_EXTENT as libc::off_t) };
+        assert_eq!(result, 0, "{}", io::Error::last_os_error());
+        let compressible = vec![1; BTRFS_EXTENT];
+        preallocated.write_all(&compressible).unwrap();
+        assert!(estimate_weight(compressible.as_slice()).unwrap() < BTRFS_EXTENT as u64);
+        assert_eq!(
+            estimate_written_weight(&preallocated).unwrap(),
+            BTRFS_EXTENT as u64
+        );
+
+        let mut bytes = vec![1; 8 * BTRFS_EXTENT];
+        rand::rngs::StdRng::seed_from_u64(7).fill_bytes(&mut bytes[4 * BTRFS_EXTENT..]);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let disk = disk_cache(dir.path(), &runtime, CacheMode::ReadWrite).with_reflink(true);
+        runtime.block_on(async {
+            disk.put_raw(KEY, Bytes::from(bytes)).await.unwrap();
+            let file = std::fs::File::open(dir.path().join(make_key_path(KEY))).unwrap();
+            let weight = estimate_reflink_weight(&file).unwrap();
+            assert!(
+                (4 * BTRFS_EXTENT..8 * BTRFS_EXTENT).contains(&(weight as usize)),
+                "mixed written-entry weight {weight}"
+            );
+            assert_eq!(disk.current_size().await.unwrap(), Some(weight));
+        });
+        eprintln!("verified written btrfs weights for encoded and unencoded extents");
     }
 
     #[test]
@@ -676,6 +782,7 @@ mod tests {
                 vec![],
                 vec![],
                 runtime.handle(),
+                None,
             )
             .await
             .unwrap();

@@ -111,7 +111,6 @@ tokio = { version = "1", features = [
   "macros",
   "signal",
 ] }
-tokio-serde = "0.9"
 tokio-util = { version = "0.7.18", features = ["codec", "io", "rt"] }
 toml = "0.9"
 tower-service = "0.3"

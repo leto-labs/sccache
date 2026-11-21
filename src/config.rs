@@ -902,6 +902,7 @@ pub struct ServerConfig {
     pub shutdown_drain_secs: u64,
     pub autostart: bool,
     pub connect_wait_secs: u64,
+    pub put_raw_max_in_flight_bytes: u64,
 }
 
 impl Default for ServerConfig {
@@ -910,6 +911,7 @@ impl Default for ServerConfig {
             shutdown_drain_secs: 10,
             autostart: true,
             connect_wait_secs: 30,
+            put_raw_max_in_flight_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -919,6 +921,7 @@ struct ServerEnvConfig {
     shutdown_drain_secs: Option<u64>,
     autostart: Option<bool>,
     connect_wait_secs: Option<u64>,
+    put_raw_max_in_flight_bytes: Option<u64>,
 }
 
 // TODO: fields only pub for tests
@@ -1496,6 +1499,10 @@ fn config_from_env() -> Result<EnvConfig> {
             autostart: bool_from_env_var("SCCACHE_SERVER_AUTOSTART")?,
             connect_wait_secs: number_from_env_var("SCCACHE_SERVER_CONNECT_WAIT_SECS")
                 .transpose()?,
+            put_raw_max_in_flight_bytes: number_from_env_var(
+                "SCCACHE_SERVER_PUT_RAW_MAX_IN_FLIGHT_BYTES",
+            )
+            .transpose()?,
         },
         miss_explain: env::var_os("SCCACHE_MISS_EXPLAIN").map(PathBuf::from),
         rust_incremental,
@@ -1689,6 +1696,9 @@ impl Config {
             connect_wait_secs: env_server
                 .connect_wait_secs
                 .unwrap_or(file_server.connect_wait_secs),
+            put_raw_max_in_flight_bytes: env_server
+                .put_raw_max_in_flight_bytes
+                .unwrap_or(file_server.put_raw_max_in_flight_bytes),
         };
         let miss_explain = match env_miss_explain {
             Some(path) if path.as_os_str().is_empty() => None,
@@ -2748,13 +2758,14 @@ fn test_managed_server_config() {
     const DRAIN: &str = "SCCACHE_SHUTDOWN_DRAIN_SECS";
     const AUTOSTART: &str = "SCCACHE_SERVER_AUTOSTART";
     const WAIT: &str = "SCCACHE_SERVER_CONNECT_WAIT_SECS";
+    const RAW_BUDGET: &str = "SCCACHE_SERVER_PUT_RAW_MAX_IN_FLIGHT_BYTES";
     const EXPLAIN: &str = "SCCACHE_MISS_EXPLAIN";
     let cwd = env::current_dir().unwrap();
     let log = cwd.join("misses.jsonl");
     let env_log = cwd.join("override.jsonl");
     let path = |path: &Path| toml::Value::String(path.to_str().unwrap().to_owned());
     let file = format!(
-        "miss_explain = {}\n[server]\nshutdown_drain_secs = 300\nautostart = false\nconnect_wait_secs = 45",
+        "miss_explain = {}\n[server]\nshutdown_drain_secs = 300\nautostart = false\nconnect_wait_secs = 45\nput_raw_max_in_flight_bytes = 8192",
         path(&log)
     );
     let resolve = |vars: &[(&str, Option<&str>)], file: &str| {
@@ -2766,18 +2777,21 @@ fn test_managed_server_config() {
         (DRAIN, None),
         (AUTOSTART, None),
         (WAIT, None),
+        (RAW_BUDGET, None),
         (EXPLAIN, None),
     ];
     let defaults = resolve(&unset, "").unwrap();
     assert_eq!(defaults.server.shutdown_drain_secs, 10);
     assert!(defaults.server.autostart);
     assert_eq!(defaults.server.connect_wait_secs, 30);
+    assert_eq!(defaults.server.put_raw_max_in_flight_bytes, 1 << 30);
     assert_eq!(defaults.miss_explain, None);
 
     let configured = resolve(&unset, &file).unwrap();
     assert_eq!(configured.server.shutdown_drain_secs, 300);
     assert!(!configured.server.autostart);
     assert_eq!(configured.server.connect_wait_secs, 45);
+    assert_eq!(configured.server.put_raw_max_in_flight_bytes, 8192);
     assert_eq!(configured.miss_explain, Some(log));
 
     let overridden = resolve(
@@ -2785,6 +2799,7 @@ fn test_managed_server_config() {
             (DRAIN, Some("0")),
             (AUTOSTART, Some("1")),
             (WAIT, Some("3")),
+            (RAW_BUDGET, Some("4096")),
             (EXPLAIN, env_log.to_str()),
         ],
         &file,
@@ -2793,12 +2808,13 @@ fn test_managed_server_config() {
     assert_eq!(overridden.server.shutdown_drain_secs, 0);
     assert!(overridden.server.autostart);
     assert_eq!(overridden.server.connect_wait_secs, 3);
+    assert_eq!(overridden.server.put_raw_max_in_flight_bytes, 4096);
     assert_eq!(overridden.miss_explain, Some(env_log));
     assert_eq!(
         resolve(&[(EXPLAIN, Some(""))], &file).unwrap().miss_explain,
         None
     );
-    for var in [DRAIN, AUTOSTART, WAIT] {
+    for var in [DRAIN, AUTOSTART, WAIT, RAW_BUDGET] {
         assert!(resolve(&[(var, Some("-1"))], &file).is_err());
     }
     for relative in ["misses.jsonl", "~/misses.jsonl", "%h/misses.jsonl"] {

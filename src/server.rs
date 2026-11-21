@@ -37,13 +37,14 @@ use crate::protocol::{
 use crate::util;
 #[cfg(feature = "dist-client")]
 use anyhow::Context as _;
-use bytes::{Bytes, BytesMut};
+use anyhow::ensure;
+use bytes::Bytes;
 use filetime::FileTime;
 use fs::metadata;
 use fs_err as fs;
 use futures::channel::mpsc;
 use futures::future::FutureExt;
-use futures::{Sink, SinkExt, Stream, StreamExt, TryFutureExt, future};
+use futures::{SinkExt, Stream, StreamExt, TryFutureExt, future};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
@@ -67,14 +68,13 @@ use std::time::Duration;
 #[cfg(feature = "dist-client")]
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tokio::sync::RwLock;
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, oneshot};
 use tokio::{
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite},
     runtime::Runtime,
     time::{self, Sleep, sleep},
 };
-use tokio_serde::Framed;
-use tokio_util::codec::{LengthDelimitedCodec, length_delimited};
+use tokio_util::codec::{FramedWrite, length_delimited};
 use tower_service::Service;
 use unit_prefix::NumberPrefix;
 
@@ -728,6 +728,7 @@ pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = Proces
     shutdown_drain: Duration,
     service: SccacheService<C>,
     wait: WaitUntilZero,
+    raw_store_budget: RawStoreBudget,
 }
 
 impl<C: CommandCreatorSync> SccacheServer<tokio::net::TcpListener, C> {
@@ -788,6 +789,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             timeout: Duration::from_secs(get_idle_timeout()),
             shutdown_drain: Duration::from_secs(config.server.shutdown_drain_secs),
             wait,
+            raw_store_budget: RawStoreBudget::new(config.server.put_raw_max_in_flight_bytes),
         }
     }
 
@@ -853,6 +855,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             timeout,
             shutdown_drain,
             wait,
+            raw_store_budget,
         } = self;
 
         let connections = Arc::new(());
@@ -861,12 +864,14 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             async move {
                 loop {
                     let socket = listener.accept().await?;
+                    let same_user = listener.is_same_user(&socket);
                     trace!("incoming connection");
                     let connection = connections.clone();
                     let service = service.clone();
+                    let raw_store_budget = raw_store_budget.clone();
                     tokio::spawn(async move {
                         let _connection = connection;
-                        if let Err(err) = service.bind(socket).await {
+                        if let Err(err) = service.bind(socket, same_user, raw_store_budget).await {
                             error!("Failed to bind socket: {err}");
                         }
                     });
@@ -964,21 +969,40 @@ impl<C> CompilerCacheEntry<C> {
 }
 #[derive(Default)]
 struct PendingCacheWrites {
-    keys: Mutex<HashMap<String, usize>>,
+    keys: std::sync::Mutex<HashMap<String, usize>>,
     completed: tokio::sync::Notify,
 }
 
 impl PendingCacheWrites {
     async fn wait(&self, key: Option<&str>) {
         loop {
-            let keys = self.keys.lock().await;
-            if key.map_or_else(|| keys.is_empty(), |key| !keys.contains_key(key)) {
-                return;
-            }
-            let completed = self.completed.notified();
-            drop(keys);
+            let completed = {
+                let keys = self.keys.lock().unwrap();
+                if key.map_or_else(|| keys.is_empty(), |key| !keys.contains_key(key)) {
+                    return;
+                }
+                self.completed.notified()
+            };
             completed.await;
         }
+    }
+}
+
+struct PendingCacheWrite {
+    pending: Arc<PendingCacheWrites>,
+    key: String,
+    _active: ActiveInfo,
+}
+
+impl Drop for PendingCacheWrite {
+    fn drop(&mut self) {
+        let mut keys = self.pending.keys.lock().unwrap();
+        let remaining = keys.get_mut(&self.key).expect("cache write registered");
+        *remaining -= 1;
+        if *remaining == 0 {
+            keys.remove(&self.key);
+        }
+        self.pending.completed.notify_waiters();
     }
 }
 
@@ -992,6 +1016,7 @@ where
     stats: Arc<Mutex<ServerStats>>,
     pending_cache_writes: Arc<PendingCacheWrites>,
     background_cache_writes: bool,
+    same_user: bool,
 
     /// Distributed sccache client
     dist_client: Arc<DistClientContainer>,
@@ -1050,7 +1075,108 @@ where
     notification_tx: Option<futures::channel::mpsc::UnboundedSender<Vec<u8>>>,
 }
 
-type SccacheRequest = Message<Request, Body<()>>;
+enum SccacheRequest {
+    Rpc(Request, Option<OwnedSemaphorePermit>),
+    PutRawOverBudget,
+}
+
+#[derive(Clone)]
+struct RawStoreBudget {
+    permits: Arc<Semaphore>,
+    capacity: u32,
+}
+
+struct BudgetedRawEntry {
+    data: Vec<u8>,
+    _permit: Option<Arc<OwnedSemaphorePermit>>,
+}
+
+impl AsRef<[u8]> for BudgetedRawEntry {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl RawStoreBudget {
+    const UNIT: usize = 4096;
+
+    fn new(bytes: u64) -> Self {
+        let max_permits = Semaphore::MAX_PERMITS.min(u32::MAX as usize);
+        let capacity = (bytes / Self::UNIT as u64).min(max_permits as u64) as u32;
+        Self {
+            permits: Arc::new(Semaphore::new(capacity as usize)),
+            capacity,
+        }
+    }
+
+    async fn reserve(&self, bytes: usize) -> Option<OwnedSemaphorePermit> {
+        let permits = u32::try_from(bytes.div_ceil(Self::UNIT)).ok()?;
+        if permits > self.capacity {
+            return None;
+        }
+        self.permits.clone().acquire_many_owned(permits).await.ok()
+    }
+
+    async fn read_request(
+        &self,
+        reader: &mut (impl AsyncRead + Unpin),
+        frame_limit: usize,
+    ) -> Result<Option<SccacheRequest>> {
+        let mut header = [0; 8];
+        let read = reader.read(&mut header).await?;
+        if read == 0 {
+            return Ok(None);
+        }
+        reader.read_exact(&mut header[read..]).await?;
+        let length = u32::from_be_bytes(header[..4].try_into().unwrap()) as usize;
+        ensure!(
+            (4..=frame_limit).contains(&length),
+            "invalid request frame length"
+        );
+        let tag = &header[4..];
+        if tag != protocol::STORAGE_PUT_RAW_TAG {
+            let mut frame = vec![0; length];
+            frame[..4].copy_from_slice(tag);
+            reader.read_exact(&mut frame[4..]).await?;
+            return Ok(Some(SccacheRequest::Rpc(
+                protocol::decode_request(&frame)?,
+                None,
+            )));
+        }
+
+        let remaining = length - 4;
+        let Some(permit) = self.reserve(length).await else {
+            let discarded =
+                tokio::io::copy(&mut reader.take(remaining as u64), &mut tokio::io::sink()).await?;
+            ensure!(discarded == remaining as u64, "truncated raw cache store");
+            return Ok(Some(SccacheRequest::PutRawOverBudget));
+        };
+
+        // Decode the two bincode length prefixes directly. A framed decoder
+        // would hold both the frame and the deserialized Vec during the store.
+        ensure!(remaining >= 16, "invalid raw cache store header");
+        let key_len = reader.read_u64_le().await?;
+        ensure!(
+            key_len <= (remaining - 16) as u64,
+            "invalid raw cache store key length"
+        );
+        let mut key = vec![0; key_len as usize];
+        reader.read_exact(&mut key).await?;
+        let key = String::from_utf8(key)?;
+        let data_len = remaining - 16 - key_len as usize;
+        ensure!(
+            reader.read_u64_le().await? == data_len as u64,
+            "invalid raw cache store data length"
+        );
+        let mut data = vec![0; data_len];
+        reader.read_exact(&mut data).await?;
+        Ok(Some(SccacheRequest::Rpc(
+            Request::StoragePutRaw { key, data },
+            Some(permit),
+        )))
+    }
+}
+
 type SccacheResponse = Message<Response, Pin<Box<dyn Stream<Item = Result<Response>> + Send>>>;
 
 /// Messages sent from all services to the main event loop indicating activity.
@@ -1083,7 +1209,12 @@ where
 
         let me = self.clone();
         Box::pin(async move {
-            match req.into_inner() {
+            let SccacheRequest::Rpc(request, permit) = req else {
+                return Ok(Message::WithoutBody(Response::StoragePutRaw(Err(
+                    "cache entry exceeds the daemon's raw store byte budget".to_owned(),
+                ))));
+            };
+            match request {
                 Request::Compile(compile) => {
                     debug!("handle_client: compile");
                     me.stats.lock().await.compile_requests += 1;
@@ -1139,17 +1270,22 @@ where
                         incremental_prune_days: me.incremental_prune_days,
                         max_size: me.storage.max_size().await.unwrap_or(None),
                         write_raw_objects: me.storage.write_raw_objects(),
+                        put_by_path: me.same_user
+                            && me.effective_cache_mode == CacheMode::ReadWrite
+                            && me.storage.supports_put_by_path(),
                     };
                     Ok(Message::WithoutBody(Response::StorageHandshake(info)))
                 }
                 Request::StorageGetPath { key } => {
                     debug!("handle_client: storage_get_path key={}", key);
+                    me.wait_for_cache_write(&key).await;
                     Ok(Message::WithoutBody(Response::StorageGetPath(
                         me.storage.get_path(&key).await,
                     )))
                 }
                 Request::StorageGetRaw { key } => {
                     debug!("handle_client: storage_get_raw key={}", key);
+                    me.wait_for_cache_write(&key).await;
                     let resp = match me.storage.get_raw(&key).await {
                         Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
                         Err(e) => {
@@ -1162,12 +1298,31 @@ where
                 Request::StoragePutRaw { key, data } => {
                     debug!("handle_client: storage_put_raw key={}", key);
                     let result = me
-                        .storage
-                        .put_raw(&key, data.into())
+                        .store_client_raw(key, data, permit)
                         .await
-                        .map(|_| ())
-                        .map_err(|e| format!("{e:#}"));
+                        .map_err(|error| format!("{error:#}"));
                     Ok(Message::WithoutBody(Response::StoragePutRaw(result)))
+                }
+                Request::StoragePutByPath {
+                    key,
+                    objects,
+                    stdout,
+                    stderr,
+                } => {
+                    let result = if !me.same_user {
+                        Err("path stores require a same-user Unix socket peer".to_owned())
+                    } else if !key.bytes().all(|byte| byte.is_ascii_alphanumeric()) || key.len() < 2
+                    {
+                        Err("invalid cache key".to_owned())
+                    } else if me.effective_cache_mode != CacheMode::ReadWrite {
+                        Err("cannot write to a read-only cache".to_owned())
+                    } else {
+                        me.storage
+                            .put_by_path(&key, objects, stdout, stderr)
+                            .await
+                            .map_err(|e| format!("{e:#}"))
+                    };
+                    Ok(Message::WithoutBody(Response::StoragePutByPath(result)))
                 }
                 Request::StorageGetPreprocessorEntry { key } => {
                     debug!("handle_client: storage_get_preprocessor_entry key={}", key);
@@ -1217,8 +1372,6 @@ where
     }
 }
 
-use futures::TryStreamExt;
-
 impl<C> SccacheService<C>
 where
     C: CommandCreatorSync + Clone + Send + Sync + 'static,
@@ -1236,6 +1389,7 @@ where
             stats: Arc::default(),
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
+            same_user: false,
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode,
@@ -1283,6 +1437,7 @@ where
             stats: Arc::default(),
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
+            same_user: false,
             dist_client: Arc::new(dist_client),
             storage,
             effective_cache_mode: CacheMode::ReadWrite,
@@ -1315,6 +1470,7 @@ where
             stats: Arc::default(),
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
+            same_user: false,
             dist_client: Arc::new(DistClientContainer::new_with_state(DistClientState::Some(
                 Box::new(DistClientConfig {
                     pool: rt.clone(),
@@ -1347,7 +1503,12 @@ where
         }
     }
 
-    async fn bind<T>(self, socket: T) -> Result<()>
+    async fn bind<T>(
+        mut self,
+        socket: T,
+        same_user: bool,
+        raw_store_budget: RawStoreBudget,
+    ) -> Result<()>
     where
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -1365,23 +1526,20 @@ where
         } else {
             0
         };
-        builder.max_frame_length(default_limit.max(linked_limit));
+        let mut frame_limit = default_limit.max(linked_limit);
         if let Ok(max_frame_length_str) = env::var("SCCACHE_MAX_FRAME_LENGTH") {
             if let Ok(max_frame_length) = max_frame_length_str.parse::<usize>() {
-                builder.max_frame_length(max_frame_length);
+                frame_limit = max_frame_length;
             } else {
                 warn!("Content of SCCACHE_MAX_FRAME_LENGTH is not a valid number, using default");
             }
         }
-        let io = builder.new_framed(socket);
-
-        let (sink, mut stream) = SccacheTransport {
-            inner: Framed::new(io.sink_err_into().err_into(), BincodeCodec),
-        }
-        .split();
-        let mut sink = sink.sink_err_into::<Error>();
+        let (mut reader, writer) = tokio::io::split(socket);
+        let codec = builder.max_frame_length(frame_limit).new_codec();
+        let mut sink = FramedWrite::new(writer, codec);
 
         let (reqs_tx, mut reqs_rx) = tokio::sync::mpsc::unbounded_channel();
+        self.same_user = same_user;
 
         let me = Arc::new(self);
 
@@ -1397,17 +1555,16 @@ where
             while let Some(req) = reqs_rx.recv().await {
                 match util::spawn(me.clone().call(req)).await?? {
                     Message::WithoutBody(message) => {
-                        sink.send(Frame::Message { message }).await?;
+                        sink.send(Bytes::from(protocol::encode_response(&message)?))
+                            .await?;
                     }
                     Message::WithBody(message, mut body) => {
-                        sink.send(Frame::Message { message }).await?;
-                        while let Some(chunk) = body.next().await {
-                            sink.send(Frame::Body {
-                                chunk: Some(chunk?),
-                            })
+                        sink.send(Bytes::from(protocol::encode_response(&message)?))
                             .await?;
+                        while let Some(chunk) = body.next().await {
+                            sink.send(Bytes::from(protocol::encode_response(&chunk?)?))
+                                .await?;
                         }
-                        sink.send(Frame::Body { chunk: None }).await?;
                     }
                 }
             }
@@ -1418,8 +1575,11 @@ where
         // Read requests until the client disconnects (stream ends) or the
         // stream errors. A send error means the handler task above has ended,
         // so we stop reading in that case too.
-        while let Some(req) = stream.next().await {
-            reqs_tx.send(req?)?;
+        while let Some(req) = raw_store_budget
+            .read_request(&mut reader, frame_limit)
+            .await?
+        {
+            reqs_tx.send(req)?;
         }
 
         Ok(())
@@ -2038,21 +2198,19 @@ where
     }
 
     async fn start_cache_write(&self, write: CacheWriteFuture, replaces_outputs: bool) {
-        // Other compilers can overwrite an inode that an open handle still refers to.
-        if !self.background_cache_writes || !replaces_outputs {
-            Self::finish_cache_write(&self.stats, write).await;
+        if !self.background_cache_writes {
+            Self::finish_cache_write(&self.stats, write.future).await;
             return;
         }
 
-        let key = write.key.clone();
-        let pending = self.pending_cache_writes.clone();
-        *pending.keys.lock().await.entry(key.clone()).or_default() += 1;
+        let pending = self.track_cache_write(&write.key);
         let stats = self.stats.clone();
-        // Keep the drain open even after this compile's client disconnects.
-        let active = self.info.clone();
-        self.rt.spawn(async move {
-            let _active = active;
-            if std::panic::AssertUnwindSafe(Self::finish_cache_write(&stats, write))
+        let CacheWriteFuture {
+            mut staged, future, ..
+        } = write;
+        let mut task = self.rt.spawn(async move {
+            let _pending = pending;
+            if std::panic::AssertUnwindSafe(Self::finish_cache_write(&stats, future))
                 .catch_unwind()
                 .await
                 .is_err()
@@ -2060,18 +2218,73 @@ where
                 error!("Cache write panicked");
                 stats.lock().await.cache_write_errors += 1;
             }
-            let mut keys = pending.keys.lock().await;
-            let remaining = keys.get_mut(&key).expect("cache write registered");
-            *remaining -= 1;
-            if *remaining == 0 {
-                keys.remove(&key);
-            }
-            pending.completed.notify_waiters();
         });
+        // Other compilers can overwrite an inode that an open handle still
+        // refers to. Wait until their outputs have been read and staged.
+        if !replaces_outputs {
+            tokio::select! {
+                Ok(()) = &mut staged => (),
+                _ = &mut task => (),
+            }
+        }
     }
 
-    async fn finish_cache_write(stats: &Mutex<ServerStats>, write: CacheWriteFuture) {
-        match write.future.await {
+    fn track_cache_write(&self, key: &str) -> PendingCacheWrite {
+        *self
+            .pending_cache_writes
+            .keys
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default() += 1;
+        PendingCacheWrite {
+            pending: self.pending_cache_writes.clone(),
+            key: key.to_owned(),
+            _active: self.info.clone(),
+        }
+    }
+
+    async fn store_client_raw(
+        &self,
+        key: String,
+        data: Vec<u8>,
+        permit: Option<OwnedSemaphorePermit>,
+    ) -> Result<()> {
+        let pending = self.track_cache_write(&key);
+        let storage = self.storage.clone();
+        let permit = permit.map(Arc::new);
+        let data = Bytes::from_owner(BudgetedRawEntry {
+            data,
+            _permit: permit.clone(),
+        });
+        let (staged, mut staging) = oneshot::channel();
+        let mut write = self.rt.spawn(async move {
+            let _pending = pending;
+            let _permit = permit;
+            storage.put_raw_from_client(&key, data, staged).await
+        });
+        tokio::select! {
+            biased;
+            Ok(()) = &mut staging => {
+                // The daemon still owns the staged entry, including during shutdown.
+                self.rt.spawn(async move {
+                    match write.await {
+                        Ok(Ok(_)) => (),
+                        Ok(Err(error)) => warn!("Could not finish staged cache write: {error:#}"),
+                        Err(error) => warn!("Staged cache write task failed: {error}"),
+                    }
+                });
+                Ok(())
+            }
+            result = &mut write => result?.map(|_| ()),
+        }
+    }
+
+    async fn finish_cache_write(
+        stats: &Mutex<ServerStats>,
+        write: impl Future<Output = Result<crate::compiler::CacheWriteInfo>>,
+    ) {
+        match write.await {
             Err(err) => {
                 debug!("Error executing cache write: {err:#}");
                 stats.lock().await.cache_write_errors += 1;
@@ -2770,121 +2983,18 @@ impl ServerInfo {
     }
 }
 
-enum Frame<R, R1> {
-    Body { chunk: Option<R1> },
-    Message { message: R },
-}
-
-struct Body<R> {
-    receiver: mpsc::Receiver<Result<R>>,
-}
-
-impl<R> futures::Stream for Body<R> {
-    type Item = Result<R>;
-    fn poll_next(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        Pin::new(&mut self.receiver).poll_next(cx)
-    }
-}
-
 enum Message<R, B> {
     WithBody(R, B),
     WithoutBody(R),
 }
 
+#[cfg(test)]
 impl<R, B> Message<R, B> {
     fn into_inner(self) -> R {
         match self {
             Message::WithBody(r, _) => r,
             Message::WithoutBody(r) => r,
         }
-    }
-}
-
-struct BincodeCodec;
-impl tokio_serde::Serializer<Response> for BincodeCodec {
-    type Error = Error;
-
-    fn serialize(self: Pin<&mut Self>, item: &Response) -> std::result::Result<Bytes, Self::Error> {
-        Ok(protocol::encode_response(item)?.into())
-    }
-}
-
-impl tokio_serde::Deserializer<Request> for BincodeCodec {
-    type Error = Error;
-
-    fn deserialize(
-        self: Pin<&mut Self>,
-        buf: &BytesMut,
-    ) -> std::result::Result<Request, Self::Error> {
-        Ok(protocol::decode_request(buf)?)
-    }
-}
-
-/// Implementation of `Stream + Sink` that tokio-proto is expecting
-///
-/// This type is composed of a few layers:
-///
-/// * First there's `I`, the I/O object implementing `AsyncRead` and
-///   `AsyncWrite`
-/// * Next that's framed using the `length_delimited` module in tokio-io giving
-///   us a `Sink` and `Stream` of `BytesMut`.
-/// * Next that sink/stream is wrapped in `ReadBincode` which will cause the
-///   `Stream` implementation to switch from `BytesMut` to `Request` by parsing
-///   the bytes  bincode.
-/// * Finally that sink/stream is wrapped in `WriteBincode` which will cause the
-///   `Sink` implementation to switch from `BytesMut` to `Response` meaning that
-///   all `Response` types pushed in will be converted to `BytesMut` and pushed
-///   below.
-struct SccacheTransport<I: AsyncRead + AsyncWrite + Unpin> {
-    inner: Framed<
-        futures::stream::ErrInto<
-            futures::sink::SinkErrInto<
-                tokio_util::codec::Framed<I, LengthDelimitedCodec>,
-                Bytes,
-                Error,
-            >,
-            Error,
-        >,
-        Request,
-        Response,
-        BincodeCodec,
-    >,
-}
-
-impl<I: AsyncRead + AsyncWrite + Unpin> Stream for SccacheTransport<I> {
-    type Item = Result<Message<Request, Body<()>>>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.inner)
-            .poll_next(cx)
-            .map(|r| r.map(|s| s.map(Message::WithoutBody)))
-    }
-}
-
-impl<I: AsyncRead + AsyncWrite + Unpin> Sink<Frame<Response, Response>> for SccacheTransport<I> {
-    type Error = Error;
-
-    fn poll_ready(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        Pin::new(&mut self.inner).poll_ready(cx)
-    }
-
-    fn start_send(mut self: Pin<&mut Self>, item: Frame<Response, Response>) -> Result<()> {
-        match item {
-            Frame::Message { message } => Pin::new(&mut self.inner).start_send(message),
-            Frame::Body { chunk: Some(chunk) } => Pin::new(&mut self.inner).start_send(chunk),
-            Frame::Body { chunk: None } => Ok(()),
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<()>> {
-        Pin::new(&mut self.inner).poll_close(cx)
     }
 }
 
@@ -3003,6 +3113,102 @@ mod tests {
     use super::*;
     use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
     use crate::test::utils::{TestFixture, next_command, next_command_calls};
+    use futures::TryStreamExt;
+
+    #[tokio::test]
+    async fn raw_store_budget_waits_before_reading_the_body() {
+        let budget = RawStoreBudget::new(4096);
+        let hold = budget.reserve(4096).await.unwrap();
+        let request = Request::StoragePutRaw {
+            key: "entry".into(),
+            data: vec![42; 4000],
+        };
+        let mut wire = Vec::new();
+        let frame = protocol::encode_request(&request).unwrap();
+        assert_eq!(&frame[..4], &protocol::STORAGE_PUT_RAW_TAG);
+        util::write_length_prefixed_bytes(&mut wire, &frame).unwrap();
+
+        let mut reader = wire.as_slice();
+        {
+            let pending = budget.read_request(&mut reader, 8192);
+            tokio::pin!(pending);
+            assert!(futures::poll!(&mut pending).is_pending());
+        }
+        assert_eq!(reader, &wire[8..]);
+        drop(hold);
+
+        let Some(SccacheRequest::Rpc(Request::StoragePutRaw { key, data }, Some(permit))) = budget
+            .read_request(&mut wire.as_slice(), 8192)
+            .await
+            .unwrap()
+        else {
+            panic!("expected raw store");
+        };
+        assert_eq!(key, "entry");
+        assert_eq!(data, vec![42; 4000]);
+        assert_eq!(budget.permits.available_permits(), 0);
+        drop(permit);
+        assert_eq!(budget.permits.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn raw_store_over_budget_keeps_the_connection_usable() {
+        let budget = RawStoreBudget::new(4096);
+        let mut wire = Vec::new();
+        for request in [
+            Request::StoragePutRaw {
+                key: "entry".into(),
+                data: vec![0; 4096],
+            },
+            Request::StorageHandshake,
+        ] {
+            util::write_length_prefixed_bytes(
+                &mut wire,
+                &protocol::encode_request(&request).unwrap(),
+            )
+            .unwrap();
+        }
+        let mut reader = wire.as_slice();
+        assert!(matches!(
+            budget.read_request(&mut reader, 8192).await.unwrap(),
+            Some(SccacheRequest::PutRawOverBudget)
+        ));
+        assert!(matches!(
+            budget.read_request(&mut reader, 8192).await.unwrap(),
+            Some(SccacheRequest::Rpc(Request::StorageHandshake, None))
+        ));
+        assert!(
+            budget
+                .read_request(&mut reader, 8192)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn path_store_refuses_connections_without_same_uid() {
+        use crate::test::mock_storage::MockStorage;
+
+        let runtime = util::new_client_runtime().unwrap();
+        let mut service = Arc::new(MockService::mock_with_storage(
+            Arc::new(MockStorage::new(None, false)),
+            runtime.handle().clone(),
+        ));
+        let request = Request::StoragePutByPath {
+            key: "entry".into(),
+            objects: vec![],
+            stdout: vec![],
+            stderr: vec![],
+        };
+        let response = runtime
+            .block_on(service.call(SccacheRequest::Rpc(request, None)))
+            .unwrap()
+            .into_inner();
+        assert!(
+            matches!(response, Response::StoragePutByPath(Err(error)) if error.contains("same-user"))
+        );
+    }
 
     struct StringWriter {
         buffer: String,
@@ -3289,7 +3495,7 @@ mod tests {
             tx,
             info,
         );
-        let request: SccacheRequest = Message::WithoutBody(Request::StorageHandshake);
+        let request: SccacheRequest = SccacheRequest::Rpc(Request::StorageHandshake, None);
         let response = runtime
             .block_on(Arc::new(service).call(request))
             .unwrap()
@@ -3377,6 +3583,7 @@ mod tests {
                 .start_cache_write(
                     CacheWriteFuture {
                         key: "entry".to_owned(),
+                        staged: oneshot::channel().1,
                         future: Box::pin(async {
                             blocked.await?;
                             Ok(CacheWriteInfo {
