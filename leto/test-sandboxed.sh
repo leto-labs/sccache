@@ -11,7 +11,11 @@
 #   leto/test-sandboxed.sh cargo test --locked --test system -- basedirs
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
-tmp=$(mktemp -d "${TMPDIR:-/tmp}/sccache-test.XXXXXX")
+# Next to the repo, not /tmp: tests that need btrfs reflinks probe their temp
+# dir and skip on other filesystems (on the workers /tmp is ext4).
+mkdir -p target/sandbox-tmp
+tmp=$(mktemp -d "$PWD/target/sandbox-tmp/sccache-test.XXXXXX")
+export TMPDIR="$tmp"
 trap 'rm -rf "$tmp"' EXIT
 : >"$tmp/sccache.conf"
 [[ $# -gt 0 ]] || set -- cargo test --locked --lib --bins --tests --no-fail-fast
