@@ -85,3 +85,14 @@ The service reads the same miss log path as the report. If the daemon
 overrides the configured path, supply `--miss-log` in the service command.
 
 Run the fixture suite with `python3 -B -m unittest discover -v -s leto/health`.
+
+## Fast and deep modes
+
+The default run is fast and bounded, for the 2-hourly check:
+- `--show-stats` (15 s limit), `/proc` reads, `df` of the cache filesystem and pre-warm `status.json`;
+- the last 8 MiB of the current miss log (`--miss-log-tail`), so the miss window can start later than `--hours`;
+- no du, compsize, cache walk or incremental-session scan;
+- a host whose memory PSI `some avg10` exceeds 10% (`--max-memory-pressure`) is skipped and reported as "skipped: under pressure";
+- the host script ends itself after 25 s (`--time-limit`), and `collect.sh` gives each host 30 s.
+
+`--deep` (`collect.sh --deep`) adds du, compsize, the entry count, cache entries written in the last hour, the full miss logs and the incremental-session scan. It refuses to run when the 1-minute load exceeds half the CPUs or memory PSI exceeds 2%, runs at nice 19 and idle I/O priority, and stops after 900 s. Run it at most once a day.

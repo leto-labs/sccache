@@ -136,3 +136,5 @@ python3 -m unittest discover -s tests -p test_report.py
 ```
 
 The toy-workspace nextest test reports a skip if cargo-nextest is unavailable.
+
+`report.py` reads only the day files of the report week and the week before, newest first, up to `--max-bytes` (256 MiB by default), and keeps only the fields it aggregates. When the cap cuts older records, the report says so (`input.truncated`).

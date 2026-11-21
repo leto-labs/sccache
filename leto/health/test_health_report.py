@@ -117,7 +117,7 @@ class HealthReportTest(unittest.TestCase):
         return REPORT["make_report"](REPORT["parse_args"]([*self.argv, *extra]), now=NOW)
 
     def test_host_aggregates_and_warnings(self):
-        report = self.report()
+        report = self.report("--deep")
         self.assertEqual(report["schema"], "leto-build-health/1")
         server = report["server"]
         self.assertTrue(server["available"])
@@ -217,13 +217,41 @@ class HealthReportTest(unittest.TestCase):
         # Without daemon stats (a timeout at high load), du is the only size, and
         # du counts reflink-shared entries at file length.
         warnings = []
-        cache = REPORT["cache_report"]({"cache_dir": str(self.root / "cache"), "cache_cap_bytes": 1000}, {}, warnings)
+        cache = REPORT["cache_report"]({"cache_dir": str(self.root / "cache"), "cache_cap_bytes": 1000}, {}, warnings,
+                                       deep=True)
         self.assertEqual(cache["fill_basis"], "allocated_bytes")
         self.assertGreater(cache["fill_pct"], 101)
         self.assertGreaterEqual(cache["written_last_hour"]["entries"], 1)
         self.assertGreater(cache["written_last_hour"]["bytes"], 0)
         self.assertFalse(any("tracked size" in warning for warning in warnings), warnings)
         self.assertTrue(any("of cap on disk" in warning for warning in warnings), warnings)
+
+    def test_default_fast_mode_reads_only_bounded_sources(self):
+        report = self.report("--miss-log-tail", "4096")
+        self.assertEqual(report["mode"], "fast")
+        cache = report["cache"]
+        for key in ("apparent_bytes", "allocated_bytes", "btrfs_extent_bytes", "entry_count", "written_last_hour"):
+            self.assertIsNone(cache[key], key)
+        self.assertEqual(cache["fill_basis"], "server_size_bytes")
+        self.assertGreater(cache["fs_size_bytes"], 0)
+        self.assertEqual(report["incremental"], {"skipped": "fast mode", "projects": {}})
+        log = report["miss_log"]
+        self.assertEqual(list(log), ["current"])
+        self.assertEqual(log["current"]["tail_bytes"], 4096)
+        self.assertLess(log["current"]["line_count"], 4096 // 50)
+        self.assertIn("## Cache", REPORT["markdown"](report))
+
+    def test_host_under_memory_pressure_is_skipped(self):
+        proc = self.root / "proc"
+        (proc / "pressure").mkdir(exist_ok=True)
+        (proc / "pressure" / "memory").write_text(
+            "some avg10=31.50 avg60=20.00 avg300=5.00 total=1\nfull avg10=9.00 avg60=1.00 avg300=0.10 total=1\n")
+        proc = subprocess.run([sys.executable, HERE / "health-report.py", *self.argv],
+                              capture_output=True, check=True, timeout=30)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["mode"], "skipped")
+        self.assertIn("under pressure", report["skipped"])
+        self.assertNotIn("server", report)
 
     def test_automatic_fast_scan_extrapolates_by_project(self):
         for index in range(101):

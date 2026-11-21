@@ -183,15 +183,54 @@ def rebuild_totals(counts):
     }
 
 
-def logs(directory, kind):
+FIELDS = ("time_ns", "key", "binary", "worktree", "run_id", "mtime", "digest", "duration_ns", "setup_ns",
+          "outcome", "project", "binary_id", "test", "attempt", "stress")
+
+
+def slim(row):
+    # Observed path sets dominate the records; aggregation needs only the class.
+    kept = {field: row[field] for field in FIELDS if field in row}
+    observed = row.get("observer")
+    kept["observer"] = {"class": observed.get("class")} if isinstance(observed, dict) else observed
+    return kept
+
+
+def select_logs(directory, kind, first_day, last_day, max_bytes):
+    """Day files in [first_day, last_day], newest first, within max_bytes.
+
+    Returns (path, bytes to read from the end) in chronological order and
+    whether older data was left out.
+    """
+    chosen, budget, truncated = [], max_bytes, False
+    paths = sorted((directory / kind).glob("*.jsonl"), reverse=True)
+    for path in paths:
+        if not first_day <= path.stem <= last_day:
+            continue
+        if budget <= 0:
+            truncated = True
+            break
+        size = path.stat().st_size
+        chosen.append((path, min(size, budget)))
+        truncated = truncated or size > budget
+        budget -= size
+    return chosen[::-1], truncated
+
+
+def logs(selected, kind, stats=None):
     errors = 0
-    for path in sorted((directory / kind).glob("*.jsonl")):
+    for path, length in selected:
         with path.open("rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            if length < size:
+                source.seek(size - length)
+                source.readline()
             for line in source:
                 try:
-                    yield json.loads(line)
+                    yield slim(json.loads(line))
                 except ValueError:
                     errors += 1
+            if stats is not None:
+                stats["bytes_read"] = stats.get("bytes_read", 0) + length
     if errors:
         print(f"Skipped {errors} malformed {kind} records.", file=sys.stderr)
 
@@ -254,6 +293,10 @@ def markdown(week, report):
         lines.append("Provide paired run timings with `--benchmark` to measure wall overhead.")
     lines += ["", f"Observer results · {', '.join(f'{key} {value:,}' for key, value in sorted(report['observer'].items()))}.",
               f"Runner errors in the week · {report['runner_errors']:,}.", ""]
+    source = report.get("input")
+    if source and source["truncated"]:
+        lines[-1:-1] = [f"Input capped at {source['max_bytes'] >> 20} MiB of logs, newest first; "
+                        f"older records were left out.", ""]
     return "\n".join(lines)
 
 
@@ -281,6 +324,8 @@ def main():
     parser.add_argument("--output", type=Path, default=Path.home() / "data/core/test-cache")
     parser.add_argument("--known-flakes", type=Path, help="JSON array of project, binary_id and test objects")
     parser.add_argument("--benchmark", type=Path, help="JSON containing gate_budget_reference_s and runs (mode, wall_s)")
+    parser.add_argument("--max-bytes", type=int, default=256 << 20,
+                        help="read at most this many log bytes, newest first (default 256 MiB)")
     options = parser.parse_args()
     year, week = options.week.split("-W")
     monday = date.fromisocalendar(int(year), int(week), 1)
@@ -289,8 +334,16 @@ def main():
     end = int((monday + timedelta(days=7)).timestamp()) * NS
     known = map(identity, json.loads(options.known_flakes.read_text())) if options.known_flakes else ()
     benchmark = json.loads(options.benchmark.read_text()) if options.benchmark else None
-    report = aggregate(logs(options.store, "runs"), start, end, known, benchmark)
-    report["runner_errors"] = sum(start <= row["time_ns"] < end for row in logs(options.store, "errors"))
+    # The purity history reaches one week back from the report week.
+    first_day = (monday - timedelta(days=7)).date().isoformat()
+    last_day = (monday + timedelta(days=6)).date().isoformat()
+    runs, truncated = select_logs(options.store, "runs", first_day, last_day, options.max_bytes)
+    read = {}
+    report = aggregate(logs(runs, "runs", read), start, end, known, benchmark)
+    errors, _ = select_logs(options.store, "errors", first_day, last_day, 16 << 20)
+    report["runner_errors"] = sum(start <= row["time_ns"] < end for row in logs(errors, "errors"))
+    report["input"] = {"bytes_read": read.get("bytes_read", 0), "max_bytes": options.max_bytes,
+                       "truncated": truncated, "first_file": runs[0][0].name if runs else None}
     report["week"] = options.week
     write_report(options.output, options.week, report)
     print(options.output / f"{options.week}.md")

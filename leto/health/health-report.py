@@ -13,9 +13,11 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
+import sys
 import time
 import tomllib
 
@@ -180,7 +182,8 @@ def server_report(args, now, warnings):
     try:
         raw = (args.stats_json.read_bytes() if args.stats_json else
                # A busy daemon (host load in the hundreds) can take 20 s to answer.
-               command([args.binary, "--show-stats", "--stats-format=json"], env=env, timeout=45))
+               command([args.binary, "--show-stats", "--stats-format=json"], env=env,
+                       timeout=45 if args.deep else 15))
         info = json.loads(raw)
         if not isinstance(info, dict) or not isinstance(info.get("stats"), dict):
             raise ValueError("expected an sccache JSON stats object")
@@ -273,14 +276,25 @@ def count_entries(path):
     return total if path.is_dir() and time.monotonic() < deadline else None
 
 
-def cache_report(config, info, warnings):
+def cache_report(config, info, warnings, deep=False):
     path = Path(config["cache_dir"]).absolute()
     tracked = info.get("cache_size")
     cap = info.get("max_cache_size") or config["cache_cap_bytes"]
     cache = {"dir": str(path), "cap_bytes": cap, "server_size_bytes": tracked,
              "apparent_bytes": None, "allocated_bytes": None,
              "btrfs_extent_bytes": None, "entry_count": None, "fill_pct": None,
-             "fill_basis": None, "disk_pct": None}
+             "fill_basis": None, "disk_pct": None, "fs_size_bytes": None, "fs_free_bytes": None,
+             "written_last_hour": None}
+    try:
+        fs = os.statvfs(path)
+        cache["fs_size_bytes"] = fs.f_blocks * fs.f_frsize
+        cache["fs_free_bytes"] = fs.f_bavail * fs.f_frsize
+    except OSError as error:
+        warnings.append(f"Cannot stat cache filesystem: {error}")
+    if not deep:
+        # Walking a 300 GiB cache (du, compsize, find) took minutes on loaded
+        # hosts; the routine check uses only the daemon's own accounting.
+        return cache_fill(cache, cap, warnings)
     for key, flags in (("allocated_bytes", []), ("apparent_bytes", ["--apparent-size"])):
         try:
             cache[key] = int(du([*flags, "-H", "--", path]).split(b"\t", 1)[0])
@@ -304,6 +318,10 @@ def cache_report(config, info, warnings):
         cache["written_last_hour"] = None
         warnings.append(f"Cannot measure recent cache writes: {error}")
 
+    return cache_fill(cache, cap, warnings)
+
+
+def cache_fill(cache, cap, warnings):
     for basis in ("server_size_bytes", "allocated_bytes", "apparent_bytes"):
         used = cache[basis]
         if type(used) is int and type(cap) is int and cap > 0:
@@ -358,7 +376,7 @@ def component_kind(name, event):
     return name
 
 
-def miss_log_report(path, now, hours, warnings):
+def miss_log_report(path, now, hours, warnings, max_bytes=None):
     try:
         since = now - timedelta(hours=hours)
     except OverflowError:
@@ -370,9 +388,12 @@ def miss_log_report(path, now, hours, warnings):
     externs = defaultdict(Counter)
     files = {}
     seen = set()
-    for filename in (path, path.with_name(path.name + ".1")):
+    # With max_bytes only the tail of the current log is read, so the cost does
+    # not grow with the log; the window may then start later than requested.
+    for filename in (path,) if max_bytes else (path, path.with_name(path.name + ".1")):
         meta = {"path": str(filename), "size_bytes": None, "line_count": None,
-                "oldest_timestamp": None, "newest_timestamp": None, "invalid_lines": 0}
+                "oldest_timestamp": None, "newest_timestamp": None, "invalid_lines": 0,
+                "tail_bytes": None}
         files["current" if filename == path else "previous"] = meta
         try:
             with filename.open("rb") as log:
@@ -382,6 +403,10 @@ def miss_log_report(path, now, hours, warnings):
                     continue
                 seen.add(identity)
                 remaining = meta["size_bytes"] = info.st_size
+                if max_bytes and remaining > max_bytes:
+                    log.seek(remaining - max_bytes)
+                    remaining = max_bytes - len(log.readline(max_bytes))
+                    meta["tail_bytes"] = max_bytes
                 line_count = invalid = 0
                 oldest = newest = None
                 while remaining and (line := log.readline(remaining)):
@@ -669,11 +694,13 @@ def make_report(args, *, now=None):
     warnings = []
     config = load_config(args, warnings)
     server, info = server_report(args, now, warnings)
-    cache = cache_report(config, info, warnings)
-    misses, log = miss_log_report(Path(config["miss_explain"]), now, args.hours, warnings)
+    cache = cache_report(config, info, warnings, deep=args.deep)
+    misses, log = miss_log_report(Path(config["miss_explain"]), now, args.hours, warnings,
+                                  max_bytes=None if args.deep else args.miss_log_tail)
     prewarm = prewarm_report(args, now, warnings)
-    incremental = incremental_report(args, warnings)
-    return {"schema": "leto-build-health/1", "host": socket.gethostname(),
+    incremental = (incremental_report(args, warnings) if args.deep
+                   else {"skipped": "fast mode", "projects": {}})
+    return {"schema": "leto-build-health/1", "host": socket.gethostname(), "mode": "deep" if args.deep else "fast",
             "generated_at": now.isoformat(), "runtime_seconds": round(time.monotonic() - started, 3),
             "config": config, "server": server, "cache": cache, "misses": misses,
             "miss_log": log, "prewarm": prewarm, "incremental": incremental, "warnings": warnings}
@@ -786,6 +813,13 @@ def parse_args(argv=None):
     parser.add_argument("--format", choices=("json", "markdown"), default="json")
     parser.add_argument("--out", type=Path, help="write to FILE instead of stdout")
     parser.add_argument("--hours", type=positive_hours, default=24)
+    parser.add_argument("--deep", action="store_true",
+                        help="also walk the cache (du, compsize) and incremental sessions; at most daily, at low load")
+    parser.add_argument("--miss-log-tail", type=byte_count, default=8 << 20,
+                        help="bytes of the miss log read in fast mode")
+    parser.add_argument("--time-limit", type=int, help="hard limit in seconds (default: 25 fast, 900 deep)")
+    parser.add_argument("--max-memory-pressure", type=float, default=10.0,
+                        help="skip the host when memory PSI some avg10 exceeds this percentage")
     parser.add_argument("--fast", action=argparse.BooleanOptionalAction,
                         help="sample 20 worktree targets (automatic above 100 worktrees)")
     parser.add_argument("--rotate", action="store_true", help="rotate only the miss log, keeping one previous file")
@@ -812,8 +846,35 @@ def parse_args(argv=None):
     return args
 
 
+def memory_pressure(proc_root):
+    try:
+        line = (proc_root / "pressure/memory").read_text().splitlines()[0]
+        return float(dict(field.split("=") for field in line.split()[1:])["avg10"])
+    except (OSError, ValueError, KeyError, IndexError):
+        return None
+
+
+def skipped_report(args, reason):
+    return {"schema": "leto-build-health/1", "host": socket.gethostname(),
+            "generated_at": datetime.now(timezone.utc).isoformat(), "mode": "skipped",
+            "skipped": reason, "runtime_seconds": 0.0, "warnings": [f"Skipped: {reason}"]}
+
+
 def main():
     args = parse_args()
+    # SIGALRM's default action ends the process: a check must never outlive its budget.
+    signal.alarm(args.time_limit or (900 if args.deep else 25))
+    pressure = memory_pressure(args.proc_root)
+    if pressure is not None and pressure > args.max_memory_pressure:
+        report = skipped_report(args, f"under pressure (memory PSI some avg10={pressure:g}%)")
+        text = json.dumps(report, indent=1) + "\n" if args.format == "json" else \
+            f"# Build health · {report['host']}\n\n{report['generated_at']} · skipped: {report['skipped']}\n"
+        (args.out.write_text(text) if args.out else sys.stdout.write(text))
+        return
+    if args.deep:
+        load = os.getloadavg()[0]
+        if load > os.cpu_count() / 2 or (pressure or 0) > 2:
+            raise SystemExit(f"deep scan refused: load {load:.0f}, memory PSI {pressure}")
     if socket.gethostname().split(".")[0] == "devbox":
         os.sched_setaffinity(0, os.sched_getaffinity(0) - set(range(16, 32)))
     os.nice(19)
