@@ -11,10 +11,12 @@
 #   leto/test-sandboxed.sh cargo test --locked --test system -- basedirs
 set -euo pipefail
 cd "$(dirname "$(readlink -f "$0")")/.."
-# Next to the repo, not /tmp: tests that need btrfs reflinks probe their temp
-# dir and skip on other filesystems (on the workers /tmp is ext4).
-mkdir -p target/sandbox-tmp
-tmp=$(mktemp -d "$PWD/target/sandbox-tmp/sccache-test.XXXXXX")
+# Under $HOME, not /tmp: tests that need btrfs reflinks probe their temp dir
+# and skip on other filesystems (on the workers /tmp is ext4). Not inside the
+# repo either: fixture crates there would find this repo's [workspace].
+tmp_root=${LETO_TEST_TMP:-${XDG_CACHE_HOME:-$HOME/.cache}/leto-sccache-test-tmp}
+mkdir -p "$tmp_root"
+tmp=$(mktemp -d "$tmp_root/sccache-test.XXXXXX")
 export TMPDIR="$tmp"
 trap 'rm -rf "$tmp"' EXIT
 : >"$tmp/sccache.conf"
