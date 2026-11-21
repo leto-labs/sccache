@@ -15,8 +15,9 @@ the workspace fallback explicitly.
 ```sh
 cd leto/test-cache
 cargo build --release --locked
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/target/release/leto-test-runner" \
-  cargo nextest run --manifest-path /path/to/project/Cargo.toml
+runner="$PWD/target/release/leto-test-runner"
+cd /path/to/project
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$runner" cargo nextest run
 ```
 
 | Variable | Purpose |
@@ -50,9 +51,9 @@ terminfo database, can change the verdict. Evidence in a record is bounded.
 Paths prefixed with `./` are relative to the reported worktree. Classification
 continues after the evidence limit is reached.
 
-Devbox permits tracing child processes at Yama scope 1. If attachment fails,
-the child runs directly and the record says `unavailable`. Linux unprivileged
-seccomp requires `no_new_privs`, and programs can detect ptrace or timing
+Devbox permits tracing child processes at Yama scope 1. If attachment or filter
+setup fails, the test runs unfiltered and the record says `unavailable`. Unprivileged
+Linux seccomp requires `no_new_privs`, and programs can detect ptrace or timing
 changes. Use the opt-out for privilege-changing binaries, tests that depend
 on debugger attachment or trace state, and tests with timing constraints
 incompatible with observation. Use the logged verdicts as evidence for review.
@@ -70,7 +71,8 @@ time and ambient variables outside the configured names.
   binary digest and mtime, identity, outcome, timings and observer result.
 - `errors/YYYY-MM-DD.jsonl` records runner problems when the sidecar is
   writable. Failure before launch takes the direct exec path. Once a test
-  has started, the runner uses its existing result.
+  has started, the runner uses its existing result. A process-group SIGKILL can
+  end the runner before it appends the record.
 
 ## Weekly report
 
@@ -94,7 +96,35 @@ Pass `--known-flakes` a JSON list of objects with `project`, `binary_id`
 and `test` to label known flakes. Other outcome mismatches require
 investigation. To include wall overhead, the benchmark JSON must contain
 `gate_budget_reference_s` and a `runs` array with `mode` and `wall_s` per run.
-Use `plain` as the baseline mode.
+Use `plain` as the baseline mode. An optional shared `pair` value associates
+each shadow run with its plain control.
+
+## FairFill overhead on devbox
+
+Measured on 2026-11-21 at FairFill revision `d295a51566`. A private
+`git clone --shared` used the gate build and warmed offline Forge fixtures.
+The timed command was the reuse-mode nextest invocation from
+`scripts/check.sh --profile fast`. Each arm used
+`nice -n 10 taskset -c 0-15,32-47`, and all eight runs passed the same
+8,737 tests with 159 skipped.
+
+```sh
+./scripts/cargo.sh nextest run --profile gate \
+  --binaries-metadata "$scratch/binaries.json" --cargo-metadata "$scratch/cargo.json" \
+  --ignore-default-filter --run-ignored default --no-fail-fast
+```
+
+| Runner | Wall runs in seconds | Median paired overhead | Share of 235 s gate |
+|---|---|---:|---:|
+| Plain | 28.47, 43.33, 22.61 | — | — |
+| Default, N=5 | 45.17, 28.27, 27.05 | +4.44 s | 1.89% |
+| Observe all, N=1 | 61.51, 51.22 | +20.46 s | 8.71% |
+
+The default met the 7.05 s median budget. Shared CPU pressure varied across
+the first two pairs, which had raw wall differences of +16.70 s and −15.06 s.
+The lowest-pressure pair ran default first and added 4.44 s. The report
+keeps the individual timings and CPU-pressure readings. The timed command
+covers nextest, and the 235 s reference covers the warm gate.
 
 ## Checks
 

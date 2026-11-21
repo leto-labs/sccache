@@ -18,9 +18,9 @@ class ReportTest(unittest.TestCase):
         benchmark = {
             "gate_budget_reference_s": 235,
             "runs": [
-                {"mode": "plain", "wall_s": 98},
-                {"mode": "plain", "wall_s": 102},
-                {"mode": "default", "wall_s": 106},
+                {"mode": "plain", "wall_s": 98, "pair": 1},
+                {"mode": "plain", "wall_s": 102, "pair": 2},
+                {"mode": "default", "wall_s": 106, "pair": 1},
             ],
         }
         result = report.aggregate(rows, 10 * day, 17 * day, [("toy", "toy", "flake")], benchmark)
@@ -34,7 +34,7 @@ class ReportTest(unittest.TestCase):
         self.assertIs(tests["pure"]["stable"], True)
         self.assertIs(tests["unstable"]["stable"], False)
         self.assertIsNone(tests["expired"]["stable"])
-        self.assertEqual(result["benchmark"]["modes"]["default"]["added_wall_s"], 6)
+        self.assertEqual(result["benchmark"]["modes"]["default"]["added_wall_s"], 8)
         result["runner_errors"] = 0
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp)

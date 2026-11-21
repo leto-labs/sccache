@@ -44,11 +44,20 @@ def measurements(data):
     for mode in modes.values():
         mode["median_wall_s"] = median(row["wall_s"] for row in mode["runs"])
     if "plain" in modes:
-        baseline = modes["plain"]["median_wall_s"]
+        baseline = modes["plain"]
+        by_pair = {run["pair"]: run["wall_s"] for run in baseline["runs"] if "pair" in run}
         for mode in modes.values():
-            mode["added_wall_s"] = round(mode["median_wall_s"] - baseline, 4)
-            mode["added_percent_of_plain"] = round(100 * mode["added_wall_s"] / baseline, 3)
-            mode["added_percent_of_gate"] = round(100 * mode["added_wall_s"] / data["gate_budget_reference_s"], 3)
+            paired = [
+                run["wall_s"] - by_pair[run["pair"]] for run in mode["runs"]
+                if "pair" in run and run["pair"] in by_pair
+            ]
+            mode["paired_deltas_s"] = [round(delta, 4) for delta in paired]
+            delta = (
+                median(paired) if len(paired) == len(mode["runs"])
+                else mode["median_wall_s"] - baseline["median_wall_s"]
+            )
+            mode["added_wall_s"] = round(delta, 4)
+            mode["added_percent_of_gate"] = round(100 * delta / data["gate_budget_reference_s"], 3)
     return {**data, "modes": modes}
 
 
@@ -228,8 +237,10 @@ def markdown(week, report):
         lines.append(f"- {len(mismatches) - 20:,} more in the JSON.")
     lines += ["", "## Overhead", ""]
     if benchmark := report["benchmark"]:
+        reference = benchmark["gate_budget_reference_s"]
         lines += [
-            f"Gate budget reference · {benchmark['gate_budget_reference_s']:g} s.", "",
+            f"Gate budget reference · {reference:g} s. Added wall uses the median paired difference "
+            "when every run has a plain control in its pair.", "",
             "| Mode | Wall runs (s) | Median (s) | Added wall (s) | Share of gate |",
             "|---|---|---:|---:|---:|",
         ]
@@ -237,6 +248,8 @@ def markdown(week, report):
             values = ", ".join(f"{run['wall_s']:.2f}" for run in result["runs"])
             lines.append(f"| {table_text(mode)} | {values} | {result['median_wall_s']:.2f} | "
                          f"{result['added_wall_s']:+.2f} | {result['added_percent_of_gate']:+.2f}% |")
+        if notes := benchmark.get("notes"):
+            lines.extend(["", notes])
     else:
         lines.append("Provide paired run timings with `--benchmark` to measure wall overhead.")
     lines += ["", f"Observer results · {', '.join(f'{key} {value:,}' for key, value in sorted(report['observer'].items()))}.",
