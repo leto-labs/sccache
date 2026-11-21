@@ -1747,31 +1747,77 @@ pub fn resolve_compiler_avoiding_wrapper(
     executable.to_path_buf()
 }
 
-/// Held for reading while a child process is spawned.
+/// Spawns between fork and exec.
 ///
 /// A child forked by one thread inherits every descriptor the process has
 /// open, including a restored executable that another thread is still
 /// writing. `O_CLOEXEC` only drops it at the child's `exec`, and until then
 /// the kernel refuses to execute that file (`ETXTBSY`). Cargo runs build
 /// scripts as soon as the wrapper exits, so it can hit that window.
-static SPAWN_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+struct InflightSpawns {
+    next: u64,
+    running: std::collections::BTreeSet<u64>,
+}
 
-/// Hold the returned guard across `spawn()`. `std` returns from `spawn()` only
-/// after the child has exec'd or failed, so its inherited descriptors are gone.
-pub fn spawn_guard() -> std::sync::RwLockReadGuard<'static, ()> {
-    SPAWN_LOCK
-        .read()
+static SPAWNS: std::sync::Mutex<InflightSpawns> = std::sync::Mutex::new(InflightSpawns {
+    next: 0,
+    running: std::collections::BTreeSet::new(),
+});
+static SPAWN_DONE: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Upper bound for [`wait_for_inflight_spawns`]: a child stuck before its exec
+/// must delay one restore, not every later compile.
+const SPAWN_SETTLE_LIMIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn spawns() -> std::sync::MutexGuard<'static, InflightSpawns> {
+    SPAWNS
+        .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Wait until no spawn that started before this call is still between fork and
-/// exec. Call it after closing a file that someone may execute next.
+/// Marks a spawn in progress until dropped.
+pub struct SpawnGuard(u64);
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        spawns().running.remove(&self.0);
+        SPAWN_DONE.notify_all();
+    }
+}
+
+/// Hold the returned guard across `spawn()`. `std` returns from `spawn()` only
+/// after the child has exec'd or failed, so its inherited descriptors are gone.
+/// Never blocks.
+pub fn spawn_guard() -> SpawnGuard {
+    let mut state = spawns();
+    let id = state.next;
+    state.next += 1;
+    state.running.insert(id);
+    SpawnGuard(id)
+}
+
+/// Wait until every spawn that started before this call has exec'd, for at
+/// most [`SPAWN_SETTLE_LIMIT`]. Call it after closing a file that someone may
+/// execute next. Spawns that start later never hold the closed descriptor.
 pub fn wait_for_inflight_spawns() {
-    drop(
-        SPAWN_LOCK
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
+    wait_for_spawns_started_before_now(SPAWN_SETTLE_LIMIT);
+}
+
+fn wait_for_spawns_started_before_now(limit: std::time::Duration) -> bool {
+    let state = spawns();
+    let before = state.next;
+    let (_state, timeout) = SPAWN_DONE
+        .wait_timeout_while(state, limit, |state| {
+            state.running.first().is_some_and(|&oldest| oldest < before)
+        })
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if timeout.timed_out() {
+        warn!(
+            "a child spawned {}s ago has not exec'd; not waiting for it",
+            limit.as_secs_f32()
+        );
+    }
+    !timeout.timed_out()
 }
 
 /// Compile-request env entry carrying the client's filesystem view. A client
@@ -1805,6 +1851,32 @@ pub fn filesystem_view() -> Option<OsString> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn spawn_barrier_is_bounded_and_never_blocks_new_spawns() {
+        let stuck = super::spawn_guard();
+        let started = Instant::now();
+        let waiter = std::thread::spawn(|| {
+            super::wait_for_spawns_started_before_now(Duration::from_millis(300))
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        // A spawn that starts while the barrier waits neither blocks nor delays it.
+        let later = super::spawn_guard();
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(
+            !waiter.join().unwrap(),
+            "the stuck spawn must time the barrier out"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(stuck);
+        drop(later);
+        // Other tests spawn concurrently, so allow them time to finish.
+        assert!(super::wait_for_spawns_started_before_now(
+            Duration::from_secs(10)
+        ));
+    }
+
     use super::{
         Digest, OsStrExt, TimeMacroFinder, exit_status_from_code, hash_all_archives,
         hash_all_externs, resolve_compiler_avoiding_wrapper,
