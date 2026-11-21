@@ -66,6 +66,7 @@ class HealthReportTest(unittest.TestCase):
         proc = root / "proc" / "42"
         proc.mkdir(parents=True)
         (proc / "status").write_text("VmRSS:\t9437184 kB\n")
+        (proc / "io").write_text("rchar: 1\nread_bytes: 0\nwrite_bytes: 600000000000\ncancelled_write_bytes: 100000000000\n")
 
         prewarm_state = root / "prewarm"
         state = prewarm_state / "fairfill"
@@ -125,6 +126,9 @@ class HealthReportTest(unittest.TestCase):
         self.assertEqual(server["binary_version"], "sccache test-client")
         self.assertEqual(server["sha256"], hashlib.sha256(self.binary.read_bytes()).hexdigest())
         self.assertEqual(server["uptime_seconds"], 120)
+        self.assertEqual(server["disk_write_bytes"], 500_000_000_000)
+        self.assertEqual(server["disk_write_gib_per_hour"], round(500_000_000_000 / 1024 ** 3 * 30, 1))
+        self.assertTrue(any("GiB/h to disk" in warning for warning in report["warnings"]), report["warnings"])
         self.assertEqual(server["rss_bytes"], 9 * 1024 ** 3)
         stats = server["stats"]
         self.assertEqual((stats["requests"], stats["executed"]), (200, 170))
@@ -332,7 +336,7 @@ class FleetTest(unittest.TestCase):
             self.assertEqual((directory / "latest.md").readlink(), Path("second.md"))
             self.assertEqual(json.loads((directory / "latest.json").read_text()), fleet)
             text = (directory / "latest.md").read_text()
-            self.assertIn("| worker-01 | — | 7 | dependency (5) | — | — | 0 | 1.23 s |", text)
+            self.assertIn("| worker-01 | — | 7 | dependency (5) | — | — | — | 0 | 1.23 s |", text)
             self.assertIn("worker-02** · unavailable", text)
             self.assertTrue((directory / "first.md").exists())
 

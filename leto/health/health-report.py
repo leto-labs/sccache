@@ -128,7 +128,7 @@ def server_report(args, now, warnings):
     server = {"available": False, "binary": str(args.binary), "port": args.port, "version": None,
               "binary_version": None, "sha256": None, "unit": args.unit, "unit_state": "unknown",
               "active_enter_timestamp": None, "main_pid": None, "uptime_seconds": None,
-              "rss_bytes": None, "stats": None}
+              "rss_bytes": None, "disk_write_bytes": None, "disk_write_gib_per_hour": None, "stats": None}
     try:
         with args.binary.open("rb") as binary:
             server["sha256"] = hashlib.file_digest(binary, "sha256").hexdigest()
@@ -158,12 +158,22 @@ def server_report(args, now, warnings):
             rss = re.search(r"^VmRSS:\s+(\d+)\s+kB$", status, re.MULTILINE)
             if rss:
                 server["rss_bytes"] = int(rss[1]) * 1024
+            # Bytes the daemon sent to storage, net of truncated dirty pages: the
+            # cache's share of SSD wear. Reflink stores clone and write almost nothing.
+            io = dict(line.split(": ", 1) for line in
+                      (args.proc_root / str(pid) / "io").read_text().splitlines() if ": " in line)
+            written = int(io["write_bytes"]) - int(io.get("cancelled_write_bytes", 0))
+            server["disk_write_bytes"] = written
+            if server["uptime_seconds"]:
+                server["disk_write_gib_per_hour"] = round(written / GIB * 3600 / server["uptime_seconds"], 1)
     except (OSError, ValueError, subprocess.SubprocessError) as error:
         warnings.append(f"Cannot inspect sccache unit or process: {error}")
     if server["unit_state"] != "active":
         warnings.append(f"Systemd unit {args.unit} is {server['unit_state']}")
     if (server["rss_bytes"] or 0) > 8 * GIB:
         warnings.append("Server RSS exceeds 8 GiB")
+    if (server["disk_write_gib_per_hour"] or 0) > 100:
+        warnings.append(f"Server writes {server['disk_write_gib_per_hour']} GiB/h to disk")
 
     info = {}
     try:
@@ -674,9 +684,10 @@ def markdown(report):
     sections = [f"# Build health · {report['host']}",
                 f"{report['generated_at']} · {report['runtime_seconds']} s",
                 "## Server",
-                table(["Unit / PID", "Version", "Binary SHA-256", "Uptime", "RSS"], [[
+                table(["Unit / PID", "Version", "Binary SHA-256", "Uptime", "RSS", "Disk writes"], [[
                     f"{server['unit_state']} / {display(server['main_pid'])}", server["version"], server["sha256"],
-                    display(server["uptime_seconds"], " s"), gib(server["rss_bytes"])]])
+                    display(server["uptime_seconds"], " s"), gib(server["rss_bytes"]),
+                    f"{gib(server['disk_write_bytes'])} ({display(server['disk_write_gib_per_hour'], ' GiB/h')})"]])
                 + "\n" + table(["Requests", "Executed", "Hits", "Misses", "Rust hit rate", "Overall hit rate"], [[
                     stats.get("requests"), stats.get("executed"), summarize(stats.get("hits", {})),
                     summarize(stats.get("misses", {})), display(rates.get("rust"), "%"),
