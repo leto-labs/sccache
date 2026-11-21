@@ -62,6 +62,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+use crate::compile_queue::CompileStage;
 use crate::errors::*;
 
 /// Can dylibs (shared libraries or proc macros) be distributed on this platform?
@@ -631,6 +632,7 @@ where
             };
             return Ok((CompileResult::CacheBypass(reason, start.elapsed()), output));
         }
+        let hashing = service.start_compile_stage(CompileStage::Hashing);
         let result = self
             .generate_hash_key(
                 &creator,
@@ -645,6 +647,7 @@ where
                 service.miss_explain.is_some(),
             )
             .await;
+        drop(hashing);
         debug!(
             "[{}]: generate_hash_key took {}",
             out_pretty,
@@ -672,6 +675,7 @@ where
         debug!("[{}]: Hash key: {}", out_pretty, key);
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
+        let lookup_timing = service.start_compile_stage(CompileStage::CacheLookup);
         let cache_status = async {
             if cache_control == CacheControl::ForceNoCache {
                 Ok(Cache::None)
@@ -805,6 +809,7 @@ where
             }
         };
 
+        drop(lookup_timing);
         match lookup {
             CacheLookupResult::Success(compile_result, output) => {
                 Ok::<_, Error>((compile_result, output))
@@ -1123,6 +1128,7 @@ where
 
     let local_executable = compile_cmd.get_executable();
     let local_executable2 = compile_cmd.get_executable();
+    let dist_setup = service.start_compile_stage(CompileStage::DistSetup);
 
     let do_dist_compile = async move {
         let mut dist_compile_cmd =
@@ -1186,6 +1192,7 @@ where
         }?;
         let job_id = job_alloc.job_id;
         let server_id = job_alloc.server_id;
+        drop(dist_setup);
         debug!("[{}]: Running job", out_pretty);
         let ((job_id, server_id), (jres, path_transformer)) = dist_client
             .do_run_job(

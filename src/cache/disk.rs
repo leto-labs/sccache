@@ -40,6 +40,8 @@ use crate::config::PreprocessorCacheModeConfig;
 pub struct DiskCache {
     /// `LruDiskCache` does all the real work here.
     lru: Arc<Mutex<LazyDiskCache>>,
+    location: String,
+    max_size: u64,
     /// Thread pool to execute disk I/O
     pool: tokio::runtime::Handle,
     preprocessor_cache_mode_config: PreprocessorCacheModeConfig,
@@ -65,6 +67,8 @@ impl DiskCache {
                 max_size,
                 use_weights: None,
             })),
+            location: format!("Local disk: {:?}", Path::new(root.as_ref())),
+            max_size,
             pool: pool.clone(),
             preprocessor_cache_mode_config,
             preprocessor_cache: Arc::new(Mutex::new(LazyDiskCache::Uninit {
@@ -505,7 +509,7 @@ impl CacheStorage for DiskCache {
     }
 
     fn location(&self) -> String {
-        format!("Local disk: {:?}", self.lru.lock().unwrap().path())
+        self.location.clone()
     }
 
     fn cache_type_name(&self) -> &'static str {
@@ -513,10 +517,15 @@ impl CacheStorage for DiskCache {
     }
 
     async fn current_size(&self) -> Result<Option<u64>> {
-        Ok(self.lru.lock().unwrap().get().map(|l| l.size()))
+        // A cache scan or write can hold the lock while stats are requested.
+        Ok(self
+            .lru
+            .try_lock()
+            .ok()
+            .and_then(|mut lru| lru.get().map(|cache| cache.size())))
     }
     async fn max_size(&self) -> Result<Option<u64>> {
-        Ok(Some(self.lru.lock().unwrap().capacity()))
+        Ok(Some(self.max_size))
     }
 
     fn basedirs(&self) -> &[Vec<u8>] {
@@ -588,6 +597,36 @@ mod tests {
 
         assert_eq!(disk.cache_type_name(), "disk");
         assert!(!disk.write_raw_objects());
+    }
+
+    #[test]
+    fn disk_stats_stay_available_while_lru_is_locked() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = crate::util::new_client_runtime().unwrap();
+        let disk = disk_cache(temp.path(), &runtime, CacheMode::ReadWrite);
+        let location = disk.location();
+        let max_size = runtime.block_on(disk.max_size()).unwrap();
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let guard = disk.lru.lock().unwrap();
+            let (disk, runtime) = (&disk, &runtime);
+            scope.spawn(move || {
+                let result = runtime.block_on(async {
+                    (
+                        disk.location(),
+                        disk.max_size().await,
+                        disk.current_size().await,
+                    )
+                });
+                send.send(result).unwrap();
+            });
+            let result = receive.recv_timeout(Duration::from_secs(2));
+            drop(guard);
+            let (actual_location, actual_max, size) = result.unwrap();
+            assert_eq!(actual_location, location);
+            assert_eq!(actual_max.unwrap(), max_size);
+            assert_eq!(size.unwrap(), None);
+        });
     }
 
     #[cfg(target_os = "linux")]

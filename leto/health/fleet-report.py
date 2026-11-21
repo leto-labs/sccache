@@ -54,8 +54,9 @@ def cache_cell(cache):
 
 def headline(report):
     if report.get("skipped"):
-        return [f"skipped: {report['skipped']}", *["—"] * 6, str(len(report["warnings"])), "—"]
+        return [f"skipped: {report['skipped']}", *["—"] * 7, str(len(report["warnings"])), "—"]
     stats = report.get("server", {}).get("stats") or {}
+    queue = stats.get("compile_queue")
     misses = report.get("misses", {})
     counts = misses.get("classifications", {})
     cause = max(counts, key=counts.get) if any(counts.values()) else None
@@ -65,6 +66,7 @@ def headline(report):
     )
     return [
         with_suffix(stats.get("hit_rate_pct", {}).get("rust"), "%"),
+        f"{queue['waiting']}/{queue['running']}, {queue['max_wait_seconds']:.3f} s" if queue else "—",
         with_suffix(misses.get("total")),
         f"{cause} ({counts[cause]})" if cause else "—",
         cache_cell(report.get("cache") or {}),
@@ -79,8 +81,8 @@ def headline(report):
 
 def markdown(fleet):
     lines = ["# Fleet build health", "", fleet["generated_at"], "",
-             "| Host | Rust hit rate | Misses (log tail, ≤24 h) | Top miss cause | Cache | Cache written, last hour | Disk writes incl. compiles | Pre-warm lag | Warnings | Runtime |",
-             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+             "| Host | Rust hit rate | Queue (waiting/running, max) | Misses (log tail, ≤24 h) | Top miss cause | Cache | Cache written, last hour | Disk writes incl. compiles | Pre-warm lag | Warnings | Runtime |",
+             "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
     warnings = []
     for host, report in fleet["hosts"].items():
         cells = [host, *headline(report)]

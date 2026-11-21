@@ -100,6 +100,24 @@ stderr) and the exit code travel back to the CLI.
       C-->>B: exit code + outputs
 ```
 
+### Diagnosing compile delays
+
+`sccache --show-stats` and `--show-adv-stats` report the daemon's jobserver
+capacity, the number of subprocesses waiting for and holding tokens, the
+oldest active wait, and the total, maximum and number of waits over 10 seconds.
+Compiler probes and preprocessors also take tokens. Failed or cancelled
+acquisitions contribute the time they spent waiting. The daemon warns once a
+wait passes 30 seconds, at most once per minute across all waits.
+
+The same stats show active work and elapsed time for request dispatch, compiler
+and task setup, hashing and preprocessing, cache lookup and restore, waits for
+pending writes, Rust miss logging, and distributed job setup. Cache lookup
+time includes storage queues and locks. Client-side mode contributes its daemon
+cache requests to these timings. Its subprocesses use the client's jobserver.
+Queue telemetry covers the lifetime of the daemon, including across `--zero-stats`.
+
+`--stats-format=json` exposes these measurements as `stats.compile_queue`.
+
 ### Client-side mode (`SCCACHE_CLIENT_SIDE`)
 
 The compile pipeline runs **in the CLI process itself**; the daemon is used only

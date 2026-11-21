@@ -14,6 +14,8 @@
 
 use crate::cache::readonly::ReadOnlyStorage;
 use crate::cache::{CacheMode, Storage, storage_from_config};
+use crate::compile_queue::{CompileQueue, StageGuard};
+pub use crate::compile_queue::{CompileQueueStats, CompileStage, WaitStats};
 use crate::compiler::PreprocessorCacheEntry;
 use crate::compiler::{
     CacheControl, CacheStoreVeto, CacheWriteFuture, CompileResult, Compiler, CompilerArguments,
@@ -770,6 +772,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
+        let client = client.with_compile_queue();
         let mut service =
             SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info)
                 .with_rust_options(
@@ -1014,6 +1017,7 @@ where
 {
     /// Server statistics.
     stats: Arc<Mutex<ServerStats>>,
+    compile_queue: Option<Arc<CompileQueue>>,
     pending_cache_writes: Arc<PendingCacheWrites>,
     background_cache_writes: bool,
     same_user: bool,
@@ -1222,6 +1226,11 @@ where
                 }
                 Request::GetStats => {
                     debug!("handle_client: get_stats");
+                    // Give normal writes a chance to settle while keeping stats
+                    // available when a cache write is holding up a compile.
+                    let _ =
+                        time::timeout(Duration::from_secs(1), me.pending_cache_writes.wait(None))
+                            .await;
                     me.get_info()
                         .await
                         .map(|i| Response::Stats(Box::new(i)))
@@ -1247,7 +1256,10 @@ where
                             let _ = tx.send(ServerMessage::Shutdown).await;
                             Ok(())
                         },
-                        me.get_info(),
+                        async {
+                            me.pending_cache_writes.wait(None).await;
+                            me.get_info().await
+                        },
                     )
                     .await
                     .map(move |(_, info)| {
@@ -1278,6 +1290,7 @@ where
                 }
                 Request::StorageGetPath { key } => {
                     debug!("handle_client: storage_get_path key={}", key);
+                    let _lookup = me.start_compile_stage(CompileStage::CacheLookup);
                     me.wait_for_cache_write(&key).await;
                     Ok(Message::WithoutBody(Response::StorageGetPath(
                         me.storage.get_path(&key).await,
@@ -1285,6 +1298,7 @@ where
                 }
                 Request::StorageGetRaw { key } => {
                     debug!("handle_client: storage_get_raw key={}", key);
+                    let _lookup = me.start_compile_stage(CompileStage::CacheLookup);
                     me.wait_for_cache_write(&key).await;
                     let resp = match me.storage.get_raw(&key).await {
                         Ok(opt) => Response::StorageGetRaw(opt.map(|b| b.to_vec())),
@@ -1326,6 +1340,7 @@ where
                 }
                 Request::StorageGetPreprocessorEntry { key } => {
                     debug!("handle_client: storage_get_preprocessor_entry key={}", key);
+                    let _lookup = me.start_compile_stage(CompileStage::Hashing);
                     let result = me
                         .storage
                         .get_preprocessor_cache_entry(&key)
@@ -1345,6 +1360,7 @@ where
                 }
                 Request::StoragePutPreprocessorEntry { key, entry_bytes } => {
                     debug!("handle_client: storage_put_preprocessor_entry key={}", key);
+                    let _store = me.start_compile_stage(CompileStage::Hashing);
                     let result = async {
                         let entry = PreprocessorCacheEntry::read(&entry_bytes)
                             .map_err(|e| format!("{e:#}"))?;
@@ -1387,6 +1403,7 @@ where
     ) -> SccacheService<C> {
         SccacheService {
             stats: Arc::default(),
+            compile_queue: client.compile_queue(),
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
             same_user: false,
@@ -1435,6 +1452,7 @@ where
         let dist_client = DistClientContainer::new_disabled();
         SccacheService {
             stats: Arc::default(),
+            compile_queue: None,
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
             same_user: false,
@@ -1468,6 +1486,7 @@ where
         let client = Client::new_num(1);
         SccacheService {
             stats: Arc::default(),
+            compile_queue: None,
             pending_cache_writes: Arc::default(),
             background_cache_writes: false,
             same_user: false,
@@ -1538,10 +1557,12 @@ where
         let codec = builder.max_frame_length(frame_limit).new_codec();
         let mut sink = FramedWrite::new(writer, codec);
 
-        let (reqs_tx, mut reqs_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reqs_tx, mut reqs_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(SccacheRequest, Option<StageGuard>)>();
         self.same_user = same_user;
 
         let me = Arc::new(self);
+        let handler = me.clone();
 
         // The reader loop below feeds requests into `reqs_tx`; this task drains
         // them, calls the service, and writes responses back to the sink.
@@ -1552,8 +1573,14 @@ where
         // is the cancellation we want once the client disconnects and the reader
         // loop below exits.
         let _handle = util::spawn(async move {
-            while let Some(req) = reqs_rx.recv().await {
-                match util::spawn(me.clone().call(req)).await?? {
+            while let Some((req, queued)) = reqs_rx.recv().await {
+                let call = handler.clone().call(req);
+                let response = util::spawn(async move {
+                    drop(queued);
+                    call.await
+                })
+                .await??;
+                match response {
                     Message::WithoutBody(message) => {
                         sink.send(Bytes::from(protocol::encode_response(&message)?))
                             .await?;
@@ -1579,7 +1606,13 @@ where
             .read_request(&mut reader, frame_limit)
             .await?
         {
-            reqs_tx.send(req)?;
+            let queued = match req {
+                SccacheRequest::Rpc(Request::Compile(_), _) => {
+                    me.start_compile_stage(CompileStage::RequestQueue)
+                }
+                _ => None,
+            };
+            reqs_tx.send((req, queued))?;
         }
 
         Ok(())
@@ -1592,8 +1625,8 @@ where
 
     /// Get info and stats about the cache.
     async fn get_info(&self) -> Result<ServerInfo> {
-        self.pending_cache_writes.wait(None).await;
-        let stats = self.stats.lock().await.clone();
+        let mut stats = self.stats.lock().await.clone();
+        stats.compile_queue = self.compile_queue.as_ref().map(|queue| queue.snapshot());
         ServerInfo::new(stats, Some(&*self.storage)).await
     }
 
@@ -1623,6 +1656,7 @@ where
         key: String,
         manifest: Arc<Manifest>,
     ) {
+        let _logging = self.start_compile_stage(CompileStage::MissLog);
         match self
             .rt
             .spawn_blocking(move || explainer.record(&key, &manifest))
@@ -1643,12 +1677,19 @@ where
         *self.stats.lock().await += delta;
     }
 
+    pub(crate) fn start_compile_stage(&self, stage: CompileStage) -> Option<StageGuard> {
+        self.compile_queue
+            .as_ref()
+            .map(|queue| queue.start_stage(stage))
+    }
+
     /// Handle a compile request from a client.
     ///
     /// This will handle a compile request entirely, generating a response with
     /// the initial information and an optional body which will eventually
     /// contain the results of the compilation.
     async fn handle_compile(&self, compile: Compile) -> Result<SccacheResponse> {
+        let setup = self.start_compile_stage(CompileStage::CompilerSetup);
         let exe = compile.exe;
         let cmd = compile.args;
         let cwd: PathBuf = compile.cwd.into();
@@ -1676,7 +1717,7 @@ where
         let info = self
             .compiler_info(exe.into(), cwd.clone(), &cmd, &env_vars)
             .await;
-        Ok(me.check_compiler(info, cmd, cwd, env_vars).await)
+        Ok(me.check_compiler(info, cmd, cwd, env_vars, setup).await)
     }
 
     /// Run a compile entirely in the current process (used in client-side mode).
@@ -1880,6 +1921,7 @@ where
         cmd: Vec<OsString>,
         cwd: PathBuf,
         env_vars: Vec<(OsString, OsString)>,
+        setup: Option<StageGuard>,
     ) -> SccacheResponse {
         match compiler {
             Err(e) => {
@@ -1893,14 +1935,16 @@ where
                 debug!("check_compiler: Supported compiler");
                 // Now check that we can handle this compiler with
                 // the provided commandline.
-                match c.parse_arguments_with_rust_options(
+                let parsed = c.parse_arguments_with_rust_options(
                     &cmd,
                     &cwd,
                     &env_vars,
                     self.rust_incremental,
                     self.rust_cache_linked,
                     self.rust_hash_cargo_env,
-                ) {
+                );
+                drop(setup);
+                match parsed {
                     CompilerArguments::Ok(hasher) => {
                         debug!("parse_arguments: Ok: {:?}", cmd);
 
@@ -1962,13 +2006,26 @@ where
     /// Given compiler arguments `arguments`, look up
     /// a compile result in the cache or execute the compilation and store
     /// the result in the cache.
-    pub async fn start_compile_task(
+    pub fn start_compile_task(
+        self,
+        compiler: Box<dyn Compiler<C>>,
+        hasher: Box<dyn CompilerHasher<C>>,
+        arguments: Vec<OsString>,
+        cwd: PathBuf,
+        env_vars: Vec<(OsString, OsString)>,
+    ) -> impl Future<Output = Result<CompileFinished>> {
+        let setup = self.start_compile_stage(CompileStage::TaskSetup);
+        self.run_compile_task(compiler, hasher, arguments, cwd, env_vars, setup)
+    }
+
+    async fn run_compile_task(
         self,
         compiler: Box<dyn Compiler<C>>,
         mut hasher: Box<dyn CompilerHasher<C>>,
         arguments: Vec<OsString>,
         cwd: PathBuf,
         env_vars: Vec<(OsString, OsString)>,
+        setup: Option<StageGuard>,
     ) -> Result<CompileFinished> {
         self.stats.lock().await.requests_executed += 1;
 
@@ -2004,7 +2061,9 @@ where
         let me = self.clone();
 
         util::spawn_on(&self.rt, async move {
-            let result = match me.dist_client.get_client().await {
+            let dist_client = me.dist_client.get_client().await;
+            drop(setup);
+            let result = match dist_client {
                 Ok(client) => std::panic::AssertUnwindSafe(hasher.get_cached_or_compile(
                     &me,
                     client,
@@ -2212,6 +2271,7 @@ where
     }
 
     pub(crate) async fn wait_for_cache_write(&self, key: &str) {
+        let _wait = self.start_compile_stage(CompileStage::PendingCacheWrite);
         self.pending_cache_writes.wait(Some(key)).await;
     }
 
@@ -2424,6 +2484,9 @@ pub struct ServerStats {
     /// Linked Rust compiles that exceeded the entry size cap.
     #[serde(skip)]
     pub rust_linked_entry_too_large: u64,
+    /// A snapshot of daemon-local, process-lifetime queue telemetry.
+    #[serde(skip)]
+    pub compile_queue: Option<CompileQueueStats>,
 }
 
 impl std::ops::AddAssign for ServerStats {
@@ -2465,6 +2528,7 @@ impl std::ops::AddAssign for ServerStats {
         self.rust_incremental_not_stored += rhs.rust_incremental_not_stored;
         self.miss_explain += rhs.miss_explain;
         self.rust_linked_entry_too_large += rhs.rust_linked_entry_too_large;
+        // RecordStats carries client-side deltas; the compile queue is daemon-local.
     }
 }
 
@@ -2482,7 +2546,7 @@ pub struct ServerInfo {
 }
 
 mod server_info_stats {
-    use super::{MissExplainStats, ServerStats};
+    use super::{CompileQueueStats, MissExplainStats, ServerStats};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[derive(Serialize, Deserialize)]
@@ -2495,6 +2559,8 @@ mod server_info_stats {
         miss_explain: MissExplainStats,
         #[serde(default)]
         rust_linked_entry_too_large: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        compile_queue: Option<CompileQueueStats>,
     }
 
     pub fn serialize<S: Serializer>(stats: &ServerStats, serializer: S) -> Result<S::Ok, S::Error> {
@@ -2504,6 +2570,7 @@ mod server_info_stats {
                 rust_incremental_not_stored: stats.rust_incremental_not_stored,
                 miss_explain: stats.miss_explain,
                 rust_linked_entry_too_large: stats.rust_linked_entry_too_large,
+                compile_queue: stats.compile_queue.clone(),
             }
             .serialize(serializer)
         } else {
@@ -2520,10 +2587,12 @@ mod server_info_stats {
                 rust_incremental_not_stored,
                 miss_explain,
                 rust_linked_entry_too_large,
+                compile_queue,
             } = StatsJson::<ServerStats>::deserialize(deserializer)?;
             stats.rust_incremental_not_stored = rust_incremental_not_stored;
             stats.miss_explain = miss_explain;
             stats.rust_linked_entry_too_large = rust_linked_entry_too_large;
+            stats.compile_queue = compile_queue;
             Ok(stats)
         } else {
             ServerStats::deserialize(deserializer)
@@ -2570,6 +2639,7 @@ impl Default for ServerStats {
             rust_incremental_not_stored: 0,
             miss_explain: Default::default(),
             rust_linked_entry_too_large: 0,
+            compile_queue: None,
         }
     }
 }
@@ -2770,6 +2840,53 @@ impl ServerStats {
                 name_width = name_width,
                 stat_width = stat_width + suffix_len
             ));
+        }
+
+        if let Some(queue) = &self.compile_queue {
+            use util::fmt_duration_as_secs;
+            writer.write("\nCompiler token queue (since daemon start)");
+            for (name, value) in [
+                ("Token capacity", queue.token_capacity.to_string()),
+                (
+                    "Compiles waiting for a token now",
+                    queue.token_wait.active.to_string(),
+                ),
+                ("Compiles running now", queue.running.to_string()),
+                (
+                    "Total token wait",
+                    fmt_duration_as_secs(&queue.token_wait.total),
+                ),
+                (
+                    "Maximum token wait",
+                    fmt_duration_as_secs(&queue.token_wait.max),
+                ),
+                (
+                    "Oldest current token wait",
+                    fmt_duration_as_secs(&queue.token_wait.oldest),
+                ),
+                (
+                    "Token waits over 10 s",
+                    queue.token_waits_over_10s.to_string(),
+                ),
+            ] {
+                writer.write(&format!("{name:<33} {value:>8}"));
+            }
+            if !queue.stages.is_empty() {
+                writer.write(
+                    "\nBefore compilation           Active       Oldest          Max        Total",
+                );
+                for (stage, wait) in &queue.stages {
+                    writer.write(&format!(
+                        "{:<25} {:>9} {:>12} {:>12} {:>12}",
+                        stage.label(),
+                        wait.active,
+                        fmt_duration_as_secs(&wait.oldest),
+                        fmt_duration_as_secs(&wait.max),
+                        fmt_duration_as_secs(&wait.total),
+                    ));
+                }
+            }
+            writer.write("");
         }
 
         // Compare values. If equal, compare keys to have a fully deterministic order.
@@ -3129,7 +3246,7 @@ fn fatal_error_message(err: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mock_command::{MockChild, MockCommandCreator, exit_status};
+    use crate::mock_command::{ChildOrCall, MockChild, MockCommandCreator, exit_status};
     use crate::test::utils::{TestFixture, next_command, next_command_calls};
     use futures::TryStreamExt;
 
@@ -3578,6 +3695,121 @@ mod tests {
     }
 
     type MockService = SccacheService<MockCreator>;
+
+    #[test]
+    fn compile_records_token_wait_and_clears_queue_gauges() {
+        let (_fixture, runtime, mut service, compile) = rustc_miss_fixture();
+        let client = Client::new_num(1).with_compile_queue();
+        let queue = client.compile_queue().unwrap();
+        service.compile_queue = Some(queue.clone());
+
+        let mut creator = service.creator.lock().unwrap();
+        let ChildOrCall::Call(compile_child) = creator.children.pop().unwrap() else {
+            panic!("expected mocked compiler invocation");
+        };
+        let running_queue = queue.clone();
+        creator.children.push(ChildOrCall::WithJobserver(
+            client.clone(),
+            Box::new(move |args| {
+                let stats = running_queue.snapshot();
+                assert_eq!(stats.token_wait.active, 0);
+                assert_eq!(stats.running, 1);
+                compile_child(args)
+            }),
+        ));
+        drop(creator);
+
+        runtime.block_on(async {
+            let token = client.acquire().await.unwrap();
+            let mut stderr = Vec::new();
+            let compile = service.compile_direct(compile, &mut stderr);
+            tokio::pin!(compile);
+            let wait_for_queue = async {
+                loop {
+                    let stats = service
+                        .get_info()
+                        .await
+                        .unwrap()
+                        .stats
+                        .compile_queue
+                        .unwrap();
+                    if stats.token_wait.active == 1 {
+                        assert_eq!(stats.running, 0);
+                        assert_eq!(stats.token_capacity, 1);
+                        assert_eq!(stats.token_wait.total, Duration::ZERO);
+                        break;
+                    }
+                    time::sleep(Duration::from_millis(1)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut compile => panic!("compile skipped the jobserver: {result:?}"),
+                result = time::timeout(Duration::from_secs(5), wait_for_queue) => result.unwrap(),
+            }
+            service.zero_stats().await;
+            assert_eq!(queue.snapshot().token_wait.active, 1);
+            drop(token);
+
+            let (_, finished, _) = time::timeout(Duration::from_secs(5), compile)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(finished.unwrap().retcode, Some(0));
+            let stats = service
+                .get_info()
+                .await
+                .unwrap()
+                .stats
+                .compile_queue
+                .unwrap();
+            assert_eq!(stats.token_wait.active, 0);
+            assert_eq!(stats.running, 0);
+            assert_eq!(stats.token_wait.oldest, Duration::ZERO);
+            assert!(stats.token_wait.max > Duration::ZERO);
+            assert_eq!(stats.token_wait.total, stats.token_wait.max);
+            assert!(stats.stages.values().all(|stage| stage.active == 0));
+        });
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stats_report_a_compile_waiting_on_a_pending_cache_write() {
+        use crate::test::mock_storage::MockStorage;
+
+        let mut service = MockService::mock_with_storage(
+            Arc::new(MockStorage::new(None, false)),
+            tokio::runtime::Handle::current(),
+        );
+        service.compile_queue = Some(Arc::new(CompileQueue::new(1)));
+        let pending = service.track_cache_write("entry");
+        let waiting = service.wait_for_cache_write("entry");
+        tokio::pin!(waiting);
+        assert!(futures::poll!(&mut waiting).is_pending());
+
+        let response = Arc::new(service.clone())
+            .call(SccacheRequest::Rpc(Request::GetStats, None))
+            .await
+            .unwrap();
+        let Message::WithoutBody(Response::Stats(info)) = response else {
+            panic!("expected stats response");
+        };
+        let queue = info.stats.compile_queue.unwrap();
+        let stage = queue.stages[&CompileStage::PendingCacheWrite];
+        assert_eq!(stage.active, 1);
+        assert!(stage.oldest >= Duration::from_secs(1));
+
+        drop(pending);
+        waiting.await;
+        let queue = service
+            .get_info()
+            .await
+            .unwrap()
+            .stats
+            .compile_queue
+            .unwrap();
+        let stage = queue.stages[&CompileStage::PendingCacheWrite];
+        assert_eq!(stage.active, 0);
+        assert!(stage.max >= Duration::from_secs(1));
+    }
 
     #[test]
     fn test_shutdown_waits_for_deferred_cache_write() {

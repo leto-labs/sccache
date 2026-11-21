@@ -60,13 +60,6 @@ impl LazyDiskCache {
         }
     }
 
-    pub fn capacity(&self) -> u64 {
-        match self {
-            LazyDiskCache::Uninit { max_size, .. } => *max_size,
-            LazyDiskCache::Init(d) => d.capacity(),
-        }
-    }
-
     pub fn path(&self) -> &Path {
         match self {
             LazyDiskCache::Uninit { root, .. } => root.as_ref(),

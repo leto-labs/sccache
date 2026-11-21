@@ -116,6 +116,44 @@ class HealthReportTest(unittest.TestCase):
     def report(self, *extra):
         return REPORT["make_report"](REPORT["parse_args"]([*self.argv, *extra]), now=NOW)
 
+    def test_fast_mode_reports_compiler_queue_and_warns(self):
+        def duration(secs, nanos=0):
+            return {"secs": secs, "nanos": nanos}
+
+        path = self.root / "stats.json"
+        stats = json.loads((FIXTURES / "stats.json").read_bytes())
+        queue = {
+            "token_capacity": 4, "running": 0, "token_waits_over_10s": 5,
+            "token_wait": {"active": 2, "total": duration(205), "max": duration(60), "oldest": duration(61, 500_000_000)},
+            "stages": {"cache_lookup": {"active": 3, "total": duration(80), "max": duration(42), "oldest": duration(10)}},
+        }
+        stats["stats"]["compile_queue"] = queue
+        path.write_text(json.dumps(stats))
+        report = self.report("--stats-json", str(path))
+        parsed = report["server"]["stats"]["compile_queue"]
+        self.assertEqual(parsed, {
+            "waiting": 2, "running": 0, "capacity": 4, "total_wait_seconds": 205,
+            "max_wait_seconds": 61.5, "oldest_wait_seconds": 61.5, "waits_over_10s": 5,
+            "stages": {"cache_lookup": {"active": 3, "total_seconds": 80, "max_seconds": 42, "oldest_seconds": 10}},
+        })
+        self.assertIn("Maximum compiler token wait exceeds 60 s (61.500 s)", report["warnings"])
+        self.assertIn("2 waiting for compiler tokens with none running (possible stuck daemon)", report["warnings"])
+        host_text = REPORT["markdown"](report)
+        self.assertIn("| 2/0 | 4 | 61.500 s | 61.500 s | 205.000 s | 5 |", host_text)
+        self.assertIn("| Cache lookup | 3 | 10.000 s | 42.000 s | 80.000 s |", host_text)
+        old_report = self.report()
+        self.assertIsNone(old_report["server"]["stats"]["compile_queue"])
+        fleet_text = FLEET["markdown"]({"generated_at": "", "hosts": {"new": report, "old": old_report}})
+        self.assertIn("| Queue (waiting/running, max) |", fleet_text)
+        self.assertIn("| new | 75.0% | 2/0, 61.500 s |", fleet_text)
+        self.assertIn("| old | 75.0% | — |", fleet_text)
+
+        queue.update(running=4)
+        queue["token_wait"]["oldest"] = duration(60)
+        path.write_text(json.dumps(stats))
+        warnings = self.report("--stats-json", str(path))["warnings"]
+        self.assertFalse(any("compiler token" in warning for warning in warnings))
+
     def test_host_aggregates_and_warnings(self):
         report = self.report("--deep")
         self.assertEqual(report["schema"], "leto-build-health/1")
@@ -366,7 +404,7 @@ class FleetTest(unittest.TestCase):
             self.assertEqual((directory / "latest.md").readlink(), Path("second.md"))
             self.assertEqual(json.loads((directory / "latest.json").read_text()), fleet)
             text = (directory / "latest.md").read_text()
-            self.assertIn("| worker-01 | — | 7 | dependency (5) | — | — | — | — | 0 | 1.23 s |", text)
+            self.assertIn("| worker-01 | — | — | 7 | dependency (5) | — | — | — | — | 0 | 1.23 s |", text)
             self.assertIn("worker-02** · unavailable", text)
             self.assertTrue((directory / "first.md").exists())
 

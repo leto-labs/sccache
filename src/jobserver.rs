@@ -6,6 +6,7 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
 
+use crate::compile_queue::{CompileQueue, TokenUse};
 use crate::errors::*;
 
 // The execution model of sccache is that on the first run it spawns a server
@@ -39,10 +40,24 @@ pub struct Client {
     tx: Option<mpsc::UnboundedSender<oneshot::Sender<io::Result<jobserver::Acquired>>>>,
     inner: jobserver::Client,
     fifo: bool,
+    capacity: usize,
+    compile_queue: Option<Arc<CompileQueue>>,
 }
 
 pub struct Acquired {
     _token: Option<jobserver::Acquired>,
+}
+
+pub(crate) struct CommandToken {
+    _usage: Option<TokenUse>,
+    _token: Acquired,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for CommandToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandToken").finish_non_exhaustive()
+    }
 }
 
 impl Client {
@@ -63,15 +78,15 @@ impl Client {
         // SAFETY: a `fifo:` jobserver is opened by path; no inherited file
         // descriptors are taken over.
         let inner = unsafe { jobserver::Client::from_env() }?;
-        Some(Client::_new(inner, true))
+        Some(Client::_new(inner, true, 0))
     }
 
     pub fn new_num(num: usize) -> Client {
         let inner = jobserver::Client::new(num).expect("failed to create jobserver");
-        Client::_new(inner, false)
+        Client::_new(inner, false, num)
     }
 
-    fn _new(inner: jobserver::Client, fifo: bool) -> Client {
+    fn _new(inner: jobserver::Client, fifo: bool, capacity: usize) -> Client {
         let (helper, tx) = if fifo {
             (None, None)
         } else {
@@ -97,7 +112,42 @@ impl Client {
             helper,
             tx,
             fifo,
+            capacity,
+            compile_queue: None,
         }
+    }
+
+    pub(crate) fn with_compile_queue(mut self) -> Self {
+        self.compile_queue = Some(Arc::new(CompileQueue::new(self.capacity)));
+        self
+    }
+
+    pub(crate) fn compile_queue(&self) -> Option<Arc<CompileQueue>> {
+        self.compile_queue.clone()
+    }
+
+    pub(crate) async fn acquire_for_command(&self) -> Result<CommandToken> {
+        let Some(queue) = &self.compile_queue else {
+            return Ok(CommandToken {
+                _usage: None,
+                _token: self.acquire().await?,
+            });
+        };
+        let mut usage = queue.start_token();
+        let acquire = self.acquire();
+        tokio::pin!(acquire);
+        let token = match tokio::time::timeout_at(usage.warning_deadline(), &mut acquire).await {
+            Ok(result) => result?,
+            Err(_) => {
+                usage.warn_if_slow();
+                acquire.await?
+            }
+        };
+        usage.acquired();
+        Ok(CommandToken {
+            _usage: Some(usage),
+            _token: token,
+        })
     }
 
     /// Whether this is the build's own jobserver, opened by path (see

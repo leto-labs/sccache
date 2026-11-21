@@ -125,6 +125,31 @@ def hit_rate(hits, misses):
     return round(100 * hits / (hits + misses), 2) if hits + misses else None
 
 
+def duration_seconds(duration):
+    return duration["secs"] + duration["nanos"] / 1_000_000_000
+
+
+def compile_queue_report(queue, warnings):
+    if queue is None:
+        return None
+    wait = queue["token_wait"]
+    oldest = duration_seconds(wait["oldest"])
+    maximum = max(duration_seconds(wait["max"]), oldest)
+    waiting, running = wait["active"], queue["running"]
+    if maximum > 60:
+        warnings.append(f"Maximum compiler token wait exceeds 60 s ({maximum:.3f} s)")
+    if waiting > 0 and running == 0:
+        warnings.append(f"{waiting} waiting for compiler tokens with none running (possible stuck daemon)")
+    return {"waiting": waiting, "running": running, "capacity": queue["token_capacity"],
+            "total_wait_seconds": duration_seconds(wait["total"]),
+            "max_wait_seconds": maximum, "oldest_wait_seconds": oldest,
+            "waits_over_10s": queue["token_waits_over_10s"],
+            "stages": {name: {"active": stage["active"],
+                              **{f"{key}_seconds": duration_seconds(stage[key])
+                                 for key in ("oldest", "max", "total")}}
+                       for name, stage in queue["stages"].items()}}
+
+
 def server_report(args, now, warnings):
     env = client_env(args.port)
     server = {"available": False, "binary": str(args.binary), "port": args.port, "version": None,
@@ -212,6 +237,7 @@ def server_report(args, now, warnings):
         "rust_incremental_not_stored": stats.get("rust_incremental_not_stored"),
         "rust_linked_entry_too_large": stats.get("rust_linked_entry_too_large"),
         "miss_explain": count_map(stats.get("miss_explain")),
+        "compile_queue": compile_queue_report(stats.get("compile_queue"), warnings),
     })
     return server, info
 
@@ -733,6 +759,21 @@ def markdown(report):
     server, cache, config = (report[key] for key in ("server", "cache", "config"))
     stats = server["stats"] or {}
     rates = stats.get("hit_rate_pct", {})
+    queue = stats.get("compile_queue")
+    queue_table = ""
+    if queue:
+        queue_table = "\n" + table(
+            ["Queue (waiting/running)", "Token capacity", "Max token wait", "Oldest current wait",
+             "Total token wait", "Waits over 10 s"], [[
+                f"{queue['waiting']}/{queue['running']}", queue["capacity"],
+                f"{queue['max_wait_seconds']:.3f} s", f"{queue['oldest_wait_seconds']:.3f} s",
+                f"{queue['total_wait_seconds']:.3f} s", queue["waits_over_10s"]]])
+        if queue["stages"]:
+            queue_table += "\n" + table(["Before compilation", "Active", "Oldest", "Max", "Total"], [
+                [name.replace("_", " ").capitalize(), stage["active"],
+                 *[f"{stage[f'{key}_seconds']:.3f} s" for key in ("oldest", "max", "total")]]
+                for name, stage in queue["stages"].items()
+            ])
     misses = report["misses"]
     prewarm = report["prewarm"]
     incremental = report["incremental"]
@@ -752,7 +793,8 @@ def markdown(report):
                     summarize(stats.get("not_cached", {})), summarize(stats.get("cache_errors", {})),
                     f"{display(stats.get('cache_read_errors'))} / {display(stats.get('cache_write_errors'))}",
                     f"{display(stats.get('rust_incremental_not_stored'))} / "
-                    f"{display(stats.get('rust_linked_entry_too_large'))}", summarize(stats.get("miss_explain", {}))]]),
+                    f"{display(stats.get('rust_linked_entry_too_large'))}", summarize(stats.get("miss_explain", {}))]])
+                + queue_table,
                 "## Cache",
                 table(["Directory", "Cap", "Apparent", "Allocated", "btrfs extents", "Entries", "Fill", "On disk",
                        "Entries written in last hour", "Reflink"], [[

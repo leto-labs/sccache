@@ -179,7 +179,7 @@ fn legacy_rust_hash_cargo_env() -> RustHashCargoEnv {
 pub(crate) fn encode_request(request: &Request) -> bincode::Result<Vec<u8>> {
     let mut frame = bincode::serialize(request)?;
     if let Request::RecordStats(stats) = request {
-        encode_stats_extension(&mut frame, stats)?;
+        encode_stats_extension(&mut frame, stats, false)?;
     }
     Ok(frame)
 }
@@ -199,7 +199,7 @@ pub(crate) fn encode_response(response: &Response) -> bincode::Result<Vec<u8>> {
     bincode::serialize_into(&mut frame, response)?;
     match response {
         Response::Stats(info) | Response::ShuttingDown(info) => {
-            encode_stats_extension(&mut frame, &info.stats)?;
+            encode_stats_extension(&mut frame, &info.stats, true)?;
         }
         Response::StorageHandshake(info) => {
             bincode::serialize_into(&mut frame, &info.rust_incremental.mode)?;
@@ -237,7 +237,10 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
     if !extension.is_empty() {
         match &mut response {
             Response::Stats(info) | Response::ShuttingDown(info) => {
-                decode_stats_extension(extension, &mut info.stats)?;
+                let remaining = decode_stats_extension(extension, &mut info.stats)?;
+                if !remaining.is_empty() {
+                    info.stats.compile_queue = Some(bincode::deserialize(remaining)?);
+                }
             }
             Response::StorageHandshake(info) => {
                 let (mode, remaining) = decode_frame(extension)?;
@@ -284,28 +287,41 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
     Ok(response)
 }
 
-fn encode_stats_extension(frame: &mut Vec<u8>, stats: &ServerStats) -> bincode::Result<()> {
+fn encode_stats_extension(
+    frame: &mut Vec<u8>,
+    stats: &ServerStats,
+    include_queue: bool,
+) -> bincode::Result<()> {
+    let queue = stats.compile_queue.as_ref().filter(|_| include_queue);
     bincode::serialize_into(&mut *frame, &stats.rust_incremental_not_stored)?;
-    if stats.miss_explain != Default::default() || stats.rust_linked_entry_too_large != 0 {
+    if stats.miss_explain != Default::default()
+        || stats.rust_linked_entry_too_large != 0
+        || queue.is_some()
+    {
         bincode::serialize_into(&mut *frame, &stats.miss_explain)?;
     }
-    if stats.rust_linked_entry_too_large != 0 {
-        bincode::serialize_into(frame, &stats.rust_linked_entry_too_large)?;
+    if stats.rust_linked_entry_too_large != 0 || queue.is_some() {
+        bincode::serialize_into(&mut *frame, &stats.rust_linked_entry_too_large)?;
+    }
+    if let Some(queue) = queue {
+        bincode::serialize_into(frame, queue)?;
     }
     Ok(())
 }
 
-fn decode_stats_extension(extension: &[u8], stats: &mut ServerStats) -> bincode::Result<()> {
-    let (incremental, remaining) = decode_frame(extension)?;
+fn decode_stats_extension<'a>(
+    extension: &'a [u8],
+    stats: &mut ServerStats,
+) -> bincode::Result<&'a [u8]> {
+    let (incremental, mut remaining) = decode_frame(extension)?;
     stats.rust_incremental_not_stored = incremental;
     if !remaining.is_empty() {
-        let (miss_explain, remaining) = decode_frame(remaining)?;
-        stats.miss_explain = miss_explain;
-        if !remaining.is_empty() {
-            stats.rust_linked_entry_too_large = bincode::deserialize(remaining)?;
-        }
+        (stats.miss_explain, remaining) = decode_frame(remaining)?;
     }
-    Ok(())
+    if !remaining.is_empty() {
+        (stats.rust_linked_entry_too_large, remaining) = decode_frame(remaining)?;
+    }
+    Ok(remaining)
 }
 
 fn decode_frame<T: DeserializeOwned>(frame: &[u8]) -> bincode::Result<(T, &[u8])> {
@@ -452,6 +468,70 @@ mod tests {
             assert_eq!(stats.rust_linked_entry_too_large, oversized);
             assert_eq!(stats.cache_writes, 11);
         }
+    }
+
+    #[tokio::test]
+    async fn compile_queue_stats_are_optional_in_json_and_on_the_wire() {
+        use crate::server::{CompileQueueStats, CompileStage, WaitStats};
+
+        let mut info = ServerInfo::new(ServerStats::default(), None).await.unwrap();
+        let old_json = serde_json::to_value(&info).unwrap();
+        assert!(old_json["stats"].get("compile_queue").is_none());
+        let decoded: ServerInfo = serde_json::from_value(old_json).unwrap();
+        assert_eq!(decoded.stats.compile_queue, None);
+        let old_frame = encode_response(&Response::Stats(Box::new(info.clone()))).unwrap();
+        let Response::Stats(decoded) = decode_response(&old_frame).unwrap() else {
+            panic!("expected stats response");
+        };
+        assert_eq!(decoded.stats.compile_queue, None);
+
+        let queue = CompileQueueStats {
+            token_capacity: 8,
+            running: 7,
+            token_wait: WaitStats {
+                total: Duration::from_secs(37),
+                max: Duration::from_secs(35),
+                active: 2,
+                oldest: Duration::from_secs(14),
+            },
+            token_waits_over_10s: 1,
+            stages: BTreeMap::from([(CompileStage::CacheLookup, WaitStats::default())]),
+        };
+        info.stats.compile_queue = Some(queue.clone());
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["stats"]["compile_queue"]["token_wait"]["active"], 2);
+        let decoded: ServerInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
+
+        for response in [
+            Response::Stats(Box::new(info.clone())),
+            Response::ShuttingDown(Box::new(info.clone())),
+        ] {
+            let frame = encode_response(&response).unwrap();
+            let (Response::Stats(decoded) | Response::ShuttingDown(decoded)) =
+                decode_response(&frame).unwrap()
+            else {
+                panic!("expected stats response");
+            };
+            assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
+            let (_, extension) = decode_frame::<Response>(&frame).unwrap();
+            let (_, remaining) = decode_frame::<u64>(extension).unwrap();
+            let (_, remaining) = decode_frame::<MissExplainStats>(remaining).unwrap();
+            // The previous decoder read the last field and ignored trailing bytes.
+            assert_eq!(bincode::deserialize::<u64>(remaining).unwrap(), 0);
+        }
+
+        let mut delta = info.stats.clone();
+        delta.cache_writes = 3;
+        let frame = encode_request(&Request::RecordStats(Box::new(delta.clone()))).unwrap();
+        let Request::RecordStats(decoded) = decode_request(&frame).unwrap() else {
+            panic!("expected stats delta");
+        };
+        assert_eq!(decoded.compile_queue, None);
+        let mut daemon = ServerStats::default();
+        daemon += delta;
+        assert_eq!(daemon.cache_writes, 3);
+        assert_eq!(daemon.compile_queue, None);
     }
 
     #[test]

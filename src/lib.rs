@@ -37,6 +37,7 @@ pub mod cache;
 mod client;
 mod cmdline;
 mod commands;
+mod compile_queue;
 mod compiler;
 pub mod config;
 pub mod dist;

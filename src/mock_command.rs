@@ -46,7 +46,7 @@
 //! `MockChild` outputs.
 
 use crate::errors::*;
-use crate::jobserver::{Acquired, Client};
+use crate::jobserver::{Client, CommandToken};
 use async_trait::async_trait;
 use std::boxed::Box;
 use std::ffi::{OsStr, OsString};
@@ -157,7 +157,7 @@ pub trait CommandCreatorSync: Clone + Send + Sync + 'static {
 
 pub struct Child {
     inner: tokio::process::Child,
-    token: Acquired,
+    token: CommandToken,
 }
 
 /// Trivial implementation of `CommandChild` for `std::process::Child`.
@@ -319,7 +319,7 @@ impl RunCommand for AsyncCommand {
         // The token is acquired either way: it rate-limits how many children
         // *we* run, which is separate from whether the child can acquire
         // tokens of its own.
-        let token = self.jobserver.acquire().await?;
+        let token = self.jobserver.acquire_for_command().await?;
         let mut inner = tokio::process::Command::from(inner);
         let child = {
             let _spawning = crate::util::spawn_guard();
@@ -403,6 +403,8 @@ pub struct MockChild {
     pub stderr: Option<io::Cursor<Vec<u8>>>,
     /// The `Result` to be handed out when `wait` is called.
     pub wait_result: Option<io::Result<ExitStatus>>,
+    #[cfg(test)]
+    token: Option<CommandToken>,
 }
 
 /// A mocked child process that simply returns stored values for its status and output.
@@ -419,6 +421,8 @@ impl MockChild {
             stdout: Some(io::Cursor::new(stdout.as_ref().to_vec())),
             stderr: Some(io::Cursor::new(stderr.as_ref().to_vec())),
             wait_result: Some(Ok(status)),
+            #[cfg(test)]
+            token: None,
         }
     }
 
@@ -430,6 +434,8 @@ impl MockChild {
             stdout: None,
             stderr: None,
             wait_result: Some(Err(err)),
+            #[cfg(test)]
+            token: None,
         }
     }
 }
@@ -470,13 +476,17 @@ impl CommandChild for MockChild {
     }
 }
 
+type MockSpawn = Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>;
+
 pub enum ChildOrCall {
     Child(Result<MockChild>),
     #[allow(
         dead_code,
         reason = "Read in the async_trait below, but rustc doesn't see it as used"
     )]
-    Call(Box<dyn Fn(&[OsString]) -> Result<MockChild> + Send>),
+    Call(MockSpawn),
+    #[cfg(test)]
+    WithJobserver(Client, MockSpawn),
 }
 
 impl fmt::Debug for ChildOrCall {
@@ -484,6 +494,8 @@ impl fmt::Debug for ChildOrCall {
         match *self {
             ChildOrCall::Child(ref r) => write!(f, "ChildOrCall::Child({:?}", r),
             ChildOrCall::Call(_) => write!(f, "ChildOrCall::Call(...)"),
+            #[cfg(test)]
+            ChildOrCall::WithJobserver(..) => write!(f, "ChildOrCall::WithJobserver(...)"),
         }
     }
 }
@@ -543,6 +555,13 @@ impl RunCommand for MockCommand {
         match self.child.take().unwrap() {
             ChildOrCall::Child(c) => c,
             ChildOrCall::Call(f) => f(&self.args),
+            #[cfg(test)]
+            ChildOrCall::WithJobserver(jobserver, f) => {
+                let token = jobserver.acquire_for_command().await?;
+                let mut child = f(&self.args)?;
+                child.token = Some(token);
+                Ok(child)
+            }
         }
     }
 }
