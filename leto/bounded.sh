@@ -36,7 +36,11 @@ if [[ -n $scope_unit ]]; then
     -p TimeoutStopSec=5s -p RuntimeMaxSec="${limit}s" -- "$@"
 fi
 
-stop() { systemctl --user stop "$unit" >/dev/null 2>&1 || true; }
+stop() {
+  systemctl --user stop "$unit" >/dev/null 2>&1 || true
+  # An OOM-killed scope stays listed as failed until reset.
+  systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+}
 trap stop EXIT
 trap 'stop; exit 130' INT TERM
 status=0
