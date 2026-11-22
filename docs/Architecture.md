@@ -108,6 +108,10 @@ oldest active wait, and the total, maximum and number of waits over 10 seconds.
 Compiler probes and preprocessors also take tokens. Failed or cancelled
 acquisitions contribute the time they spent waiting. The daemon warns once a
 wait passes 30 seconds, at most once per minute across all waits.
+On Unix, the daemon also reports tokens currently in use in its private
+jobserver. This includes extra tokens acquired by rustc's codegen threads.
+The gauge is omitted for inherited jobservers such as Cargo's FIFO because
+their total capacity is unknown. It is also omitted on Windows.
 
 The same stats show active work and elapsed time for request dispatch, compiler
 and task setup, hashing and preprocessing, cache lookup and restore, waits for
@@ -115,6 +119,14 @@ pending writes, Rust miss logging, and distributed job setup. Cache lookup
 time includes storage queues and locks. Client-side mode contributes its daemon
 cache requests to these timings. Its subprocesses use the client's jobserver.
 Queue telemetry covers the lifetime of the daemon, including across `--zero-stats`.
+
+For daemon-side Rust compiles, a hashing stage over 30 seconds or a cache
+lookup and restore stage over 10 seconds logs a warning on completion. Each
+stage can warn at most once per minute. The warning includes the crate name,
+the files and bytes hashed for the request, the longest measured blocking-pool
+queue wait, the sum of completed blocking-task runtimes, and the request's
+remaining queued blocking tasks. Stage elapsed time also includes work outside
+the blocking pool, such as compiler subprocesses and remote cache requests.
 
 `--stats-format=json` exposes these measurements as `stats.compile_queue`.
 

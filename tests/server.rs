@@ -141,7 +141,17 @@ if "$compile"; then
     first=false
     if [ ! -e compiler-started ]; then first=true; fi
     printf '%s\n' "$$" >> compiler-started
-    if "$first"; then sleep "${SCCACHE_TEST_COMPILE_DELAY:-0}"; fi
+    if "$first"; then
+        if [ -n "$SCCACHE_TEST_COMPILE_GATE" ]; then
+            attempts=0
+            while [ ! -e "$SCCACHE_TEST_COMPILE_GATE" ] && [ "$attempts" -lt 300 ]; do
+                sleep 0.1
+                attempts=$((attempts + 1))
+            done
+        else
+            sleep "${SCCACHE_TEST_COMPILE_DELAY:-0}"
+        fi
+    fi
     if [ -n "$SCCACHE_TEST_COMPILER_EXIT" ]; then exit "$SCCACHE_TEST_COMPILER_EXIT"; fi
 fi
 exec rustc "$@"
@@ -256,6 +266,37 @@ exec rustc "$@"
             .assert()
             .success()
             .stderr(predicate::str::is_empty());
+    }
+
+    #[test]
+    fn test_show_stats_reports_tokens_in_use() {
+        let fixture = Fixture::new(5, false, 0);
+        let server = fixture.start_server();
+        let gate = fixture.path("compiler-release");
+        let compile = Process::spawn(fixture.compile("0").env("SCCACHE_TEST_COMPILE_GATE", &gate));
+        fixture.wait_for_compile();
+        let output = fixture
+            .command()
+            .arg("--show-stats")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let text = String::from_utf8(output).unwrap();
+        print!("{text}");
+        assert!(text.lines().any(|line| {
+            line.strip_prefix("Tokens in use now")
+                .is_some_and(|count| count.trim() == "1")
+        }));
+        let stats = fixture.stats();
+        let queue = &stats["stats"]["compile_queue"];
+        assert_eq!(queue["running"], 1);
+        assert_eq!(queue["tokens_in_use"], 1);
+        fs::write(gate, "").unwrap();
+        compile.wait().assert().success();
+        fixture.stop_server();
+        server.wait().assert().success();
     }
 
     #[test_case(None ; "stop RPC")]

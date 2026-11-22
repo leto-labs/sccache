@@ -307,8 +307,9 @@ sccache --show-stats
 sccache --stop-server
 ```
 
-The server appends a JSON line for each Rust cache lookup that returns a
-miss. `new` means there is no history for the crate's compilation identity.
+The server queues a JSON line in the background for each Rust cache lookup
+that returns a miss. Log entries and explanation counters can lag compilation.
+`new` means there is no history for the crate's compilation identity.
 `own-input` lists inputs such as a source file, an environment variable, or
 a specific argument such as `arg:-C opt-level`. `dependency` names the changed
 externs. `unchanged` means the same key was previously stored and is now missing.

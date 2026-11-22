@@ -237,7 +237,7 @@ impl<'a> Explanation<'a> {
 pub(crate) struct MissExplain {
     root: PathBuf,
     log: PathBuf,
-    log_lock: Mutex<()>,
+    log_lock: tokio::sync::Mutex<()>,
     history_lock: Mutex<()>,
 }
 
@@ -246,7 +246,7 @@ impl MissExplain {
         Self {
             root: cache.join(DIRECTORY),
             log,
-            log_lock: Mutex::new(()),
+            log_lock: tokio::sync::Mutex::new(()),
             history_lock: Mutex::new(()),
         }
     }
@@ -265,7 +265,7 @@ impl MissExplain {
         }
     }
 
-    pub fn record(&self, key: &str, manifest: &Manifest) -> Result<Classification> {
+    pub fn prepare(&self, key: &str, manifest: &Manifest) -> Result<(Classification, Vec<u8>)> {
         let history = Self::read(&self.path(&manifest.identity)).unwrap_or_else(|err| {
             debug!("Could not read Rust miss history: {err:#}");
             Vec::new()
@@ -273,20 +273,37 @@ impl MissExplain {
         let explanation = Explanation::new(key, manifest, &history);
         let mut line = serde_json::to_vec(&explanation)?;
         line.push(b'\n');
-        let _lock = self.log_lock.lock().unwrap_or_else(|err| err.into_inner());
+        Ok((explanation.classification, line))
+    }
+
+    pub async fn append(&self, line: Vec<u8>, pool: &tokio::runtime::Handle) -> Result<()> {
+        // Wait outside the blocking pool so logging cannot occupy its workers
+        // while another append holds the lock.
+        let _lock = self.log_lock.lock().await;
+        let path = self.log.clone();
+        pool.spawn_blocking(move || Self::write_log(&path, &line))
+            .await?
+    }
+
+    fn write_log(path: &Path, line: &[u8]) -> Result<()> {
         let mut options = fs::OpenOptions::new();
         options.create(true).append(true);
-        let mut log = match options.open(&self.log) {
+        let mut log = match options.open(path) {
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                if let Some(dir) = self.log.parent() {
+                if let Some(dir) = path.parent() {
                     fs::create_dir_all(dir)?;
                 }
-                options.open(&self.log)?
+                options.open(path)?
             }
             result => result?,
         };
-        log.write_all(&line)?;
-        Ok(explanation.classification)
+        log.write_all(line)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lock_log(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.log_lock.try_lock().unwrap()
     }
 
     pub fn remember(&self, key: String, manifest: &Manifest) -> Result<()> {
@@ -457,8 +474,11 @@ mod test {
                 .collect::<Vec<_>>(),
             ["five", "one", "four", "three"],
         );
-        assert_eq!(store.record("one", &manifest)?, Classification::Unchanged);
-        assert_eq!(store.record("one", &manifest)?, Classification::Unchanged);
+        for _ in 0..2 {
+            let (classification, line) = store.prepare("one", &manifest)?;
+            assert_eq!(classification, Classification::Unchanged);
+            MissExplain::write_log(&log, &line)?;
+        }
         assert_eq!(fs::read_to_string(log)?.lines().count(), 2);
         Ok(())
     }

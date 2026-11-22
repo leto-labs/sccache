@@ -2344,6 +2344,43 @@ fn write_compile_basedirs_config(checkout: &Path) -> Result<()> {
     Ok(())
 }
 
+fn wait_for_miss_log(
+    path: &Path,
+    expected: usize,
+    include: impl Fn(&serde_json::Value) -> bool,
+) -> Result<Vec<serde_json::Value>> {
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error.into()),
+        };
+        let mut entries = Vec::new();
+        for line in contents
+            .split_inclusive('\n')
+            .filter(|line| line.ends_with('\n'))
+        {
+            let entry = serde_json::from_str(line)?;
+            if include(&entry) {
+                entries.push(entry);
+            }
+        }
+        if entries.len() >= expected {
+            return Ok(entries);
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "expected {expected} entries in {}, got {}",
+            path.display(),
+            entries.len()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test_case(false ; "server side")]
 #[test_case(true ; "client side requested")]
 #[serial]
@@ -2420,13 +2457,19 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
             "Rust misses explained (own-input)",
         ))?;
 
-    let contents = fs::read_to_string(log)?;
-    let entries = contents
-        .lines()
-        .map(serde_json::from_str::<Value>)
-        .collect::<serde_json::Result<Vec<_>>>()?;
-    assert_eq!(entries.len(), 6, "{contents}");
-    for (old, new) in entries[..3].iter().zip(&entries[3..]) {
+    let entries = wait_for_miss_log(&log, 6, |_| true)?;
+    assert_eq!(entries.len(), 6);
+    let in_checkout = |checkout: &Path, name: &str| {
+        entries
+            .iter()
+            .find(|entry| {
+                entry["basedir"] == checkout.to_str().unwrap() && entry["crate_name"] == name
+            })
+            .unwrap()
+    };
+    for crate_name in ["explain_leaf", "explain_middle", "explain_top"] {
+        let old = in_checkout(&a, crate_name);
+        let new = in_checkout(&b, crate_name);
         assert_eq!(old["classification"], "new");
         assert_eq!(old["crate_name"], new["crate_name"]);
         assert_eq!(old["identity"], new["identity"]);
@@ -2438,7 +2481,7 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
             .iter()
             .map(|d| d["name"].as_str().unwrap())
             .collect();
-        match new["crate_name"].as_str().unwrap() {
+        match crate_name {
             "explain_leaf" => {
                 assert_eq!(new["classification"], "own-input");
                 assert_eq!(names, ["env:TEST_ENV_VAR", "source:leaf/src/lib.rs"]);
@@ -2447,7 +2490,7 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
                 assert_eq!(new["classification"], "dependency");
                 assert_eq!(names, ["extern:leaf"]);
                 assert!(
-                    entries[3]["artifacts"]
+                    in_checkout(&b, "explain_leaf")["artifacts"]
                         .as_array()
                         .unwrap()
                         .contains(&differences[0]["artifact"])
@@ -2601,23 +2644,18 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
     fs::write(a.join("nat/answer.c"), "int answer(void) { return 43; }\n")?;
     zero_incremental_stats()?;
     answer(&a, 43)?;
-    let pm_misses = || -> Result<Vec<String>> {
-        let entries = fs::read_to_string(&miss_log)?;
-        let mut keys = Vec::new();
-        for line in entries.lines() {
-            let miss: serde_json::Value = serde_json::from_str(line)?;
-            if miss["crate_name"] == "pm" {
-                keys.push(
-                    miss["key"]
-                        .as_str()
-                        .context("missing link cache key")?
-                        .to_owned(),
-                );
-            }
-        }
-        Ok(keys)
+    let pm_misses = |expected| -> Result<Vec<String>> {
+        wait_for_miss_log(&miss_log, expected, |miss| miss["crate_name"] == "pm")?
+            .into_iter()
+            .map(|miss| {
+                miss["key"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("missing link cache key")
+            })
+            .collect()
     };
-    let misses = pm_misses()?;
+    let misses = pm_misses(2)?;
     assert_eq!(misses.len(), 2);
     assert_eq!(
         misses[0], misses[1],
@@ -2629,7 +2667,7 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
         .assert()
         .try_success()?;
     answer(&a, 43)?;
-    assert_eq!(pm_misses()?.len(), 2, "the updated manifest should hit");
+    assert_eq!(pm_misses(2)?.len(), 2, "the updated manifest should hit");
 
     let clean_pm = || -> Result<()> {
         cargo(&b)
@@ -2645,7 +2683,7 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
         .assert()
         .try_success()?;
     incremental_stats(&test, 0, 1)?;
-    assert_eq!(pm_misses()?.len(), 3);
+    assert_eq!(pm_misses(3)?.len(), 3);
 
     clean_pm()?;
     cargo(&b)
@@ -2660,7 +2698,7 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
         .assert()
         .try_success()?;
     incremental_stats(&test, 0, 1)?;
-    assert_eq!(pm_misses()?.len(), 4);
+    assert_eq!(pm_misses(4)?.len(), 4);
 
     clean_pm()?;
     cargo(&b)
@@ -2669,7 +2707,7 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
         .assert()
         .try_success()?;
     incremental_stats(&test, 0, 1)?;
-    assert_eq!(pm_misses()?.len(), 5);
+    assert_eq!(pm_misses(5)?.len(), 5);
 
     fs::write(
         &wrapper,
@@ -2684,7 +2722,7 @@ fn test_rust_cargo_linked_proc_macro(linker: &str) -> Result<()> {
             .assert()
             .try_success()?;
         incremental_stats(&test, 0, 0)?;
-        assert_eq!(pm_misses()?.len(), expected);
+        assert_eq!(pm_misses(expected)?.len(), expected);
     }
     assert_failed_linked_proc_macro_runs_once(&test, &rustc, driver, fuse_ld.as_deref())?;
     Ok(())

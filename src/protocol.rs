@@ -1,4 +1,5 @@
 use crate::cache::{CacheMode, GetPathResult};
+use crate::compile_queue::{CompileQueueStats, CompileStage, WaitStats};
 use crate::compiler::ColorMode;
 use crate::config::{
     PreprocessorCacheModeConfig, RustCacheLinked, RustHashCargoEnv, RustIncrementalFirstBuild,
@@ -7,6 +8,7 @@ use crate::config::{
 };
 use crate::server::{DistInfo, ServerInfo, ServerStats};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 
 // Bincode's fixed-width, little-endian discriminant for StoragePutRaw.
@@ -241,7 +243,21 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
             Response::Stats(info) | Response::ShuttingDown(info) => {
                 let remaining = decode_stats_extension(extension, &mut info.stats)?;
                 if !remaining.is_empty() {
-                    info.stats.compile_queue = Some(bincode::deserialize(remaining)?);
+                    let (queue, remaining) = decode_frame::<
+                        CompileQueueWire<BTreeMap<CompileStage, WaitStats>>,
+                    >(remaining)?;
+                    info.stats.compile_queue = Some(CompileQueueStats {
+                        token_capacity: queue.token_capacity,
+                        running: queue.running,
+                        token_wait: queue.token_wait,
+                        token_waits_over_10s: queue.token_waits_over_10s,
+                        stages: queue.stages,
+                        tokens_in_use: if remaining.is_empty() {
+                            None
+                        } else {
+                            Some(bincode::deserialize(remaining)?)
+                        },
+                    });
                 }
             }
             Response::StorageHandshake(info) => {
@@ -289,6 +305,17 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
     Ok(response)
 }
 
+// The queue extension predates the token gauge. Keep its original prefix so
+// readers that stop after the queue can still decode it.
+#[derive(Deserialize, Serialize)]
+struct CompileQueueWire<Stages> {
+    token_capacity: usize,
+    running: usize,
+    token_wait: WaitStats,
+    token_waits_over_10s: u64,
+    stages: Stages,
+}
+
 fn encode_stats_extension(
     frame: &mut Vec<u8>,
     stats: &ServerStats,
@@ -306,7 +333,19 @@ fn encode_stats_extension(
         bincode::serialize_into(&mut *frame, &stats.rust_linked_entry_too_large)?;
     }
     if let Some(queue) = queue {
-        bincode::serialize_into(frame, queue)?;
+        bincode::serialize_into(
+            &mut *frame,
+            &CompileQueueWire {
+                token_capacity: queue.token_capacity,
+                running: queue.running,
+                token_wait: queue.token_wait,
+                token_waits_over_10s: queue.token_waits_over_10s,
+                stages: &queue.stages,
+            },
+        )?;
+        if let Some(tokens_in_use) = queue.tokens_in_use {
+            bincode::serialize_into(frame, &tokens_in_use)?;
+        }
     }
     Ok(())
 }
@@ -474,8 +513,6 @@ mod tests {
 
     #[tokio::test]
     async fn compile_queue_stats_are_optional_in_json_and_on_the_wire() {
-        use crate::server::{CompileQueueStats, CompileStage, WaitStats};
-
         let mut info = ServerInfo::new(ServerStats::default(), None).await.unwrap();
         let old_json = serde_json::to_value(&info).unwrap();
         assert!(old_json["stats"].get("compile_queue").is_none());
@@ -498,10 +535,31 @@ mod tests {
             },
             token_waits_over_10s: 1,
             stages: BTreeMap::from([(CompileStage::CacheLookup, WaitStats::default())]),
+            tokens_in_use: None,
+        };
+        info.stats.compile_queue = Some(queue.clone());
+        let old_json = serde_json::to_value(&info).unwrap();
+        assert!(
+            old_json["stats"]["compile_queue"]
+                .get("tokens_in_use")
+                .is_none()
+        );
+        let decoded: ServerInfo = serde_json::from_value(old_json).unwrap();
+        assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
+        let old_queue_frame = encode_response(&Response::Stats(Box::new(info.clone()))).unwrap();
+        let Response::Stats(decoded) = decode_response(&old_queue_frame).unwrap() else {
+            panic!("expected stats response");
+        };
+        assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
+
+        let queue = CompileQueueStats {
+            tokens_in_use: Some(8),
+            ..queue
         };
         info.stats.compile_queue = Some(queue.clone());
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["stats"]["compile_queue"]["token_wait"]["active"], 2);
+        assert_eq!(json["stats"]["compile_queue"]["tokens_in_use"], 8);
         let decoded: ServerInfo = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
 
@@ -521,6 +579,17 @@ mod tests {
             let (_, remaining) = decode_frame::<MissExplainStats>(remaining).unwrap();
             // The previous decoder read the last field and ignored trailing bytes.
             assert_eq!(bincode::deserialize::<u64>(remaining).unwrap(), 0);
+            let (_, remaining) = decode_frame::<u64>(remaining).unwrap();
+            let legacy_queue: CompileQueueWire<BTreeMap<CompileStage, WaitStats>> =
+                bincode::deserialize(remaining).unwrap();
+            assert_eq!(legacy_queue.running, 7);
+            assert_eq!(legacy_queue.stages, queue.stages);
+            if matches!(response, Response::Stats(_)) {
+                assert_eq!(
+                    frame.strip_suffix(&8_u64.to_le_bytes()),
+                    Some(old_queue_frame.as_slice())
+                );
+            }
         }
 
         let mut delta = info.stats.clone();

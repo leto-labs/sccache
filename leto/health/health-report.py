@@ -141,6 +141,7 @@ def compile_queue_report(queue, warnings):
     if waiting > 0 and running == 0:
         warnings.append(f"{waiting} waiting for compiler tokens with none running (possible stuck daemon)")
     return {"waiting": waiting, "running": running, "capacity": queue["token_capacity"],
+            "tokens_in_use": queue.get("tokens_in_use"),
             "total_wait_seconds": duration_seconds(wait["total"]),
             "max_wait_seconds": maximum, "oldest_wait_seconds": oldest,
             "waits_over_10s": queue["token_waits_over_10s"],
@@ -762,10 +763,11 @@ def markdown(report):
     queue = stats.get("compile_queue")
     queue_table = ""
     if queue:
+        tokens = queue.get("tokens_in_use")
         queue_table = "\n" + table(
-            ["Queue (waiting/running)", "Token capacity", "Max token wait", "Oldest current wait",
+            ["Queue (waiting/running, tokens in use)", "Token capacity", "Max token wait", "Oldest current wait",
              "Total token wait", "Waits over 10 s"], [[
-                f"{queue['waiting']}/{queue['running']}", queue["capacity"],
+                f"{queue['waiting']}/{queue['running']}, {tokens if tokens is not None else '—'}", queue["capacity"],
                 f"{queue['max_wait_seconds']:.3f} s", f"{queue['oldest_wait_seconds']:.3f} s",
                 f"{queue['total_wait_seconds']:.3f} s", queue["waits_over_10s"]]])
         if queue["stages"]:

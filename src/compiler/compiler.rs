@@ -62,7 +62,7 @@ use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-use crate::compile_queue::CompileStage;
+use crate::compile_queue::{self, CompileStage, StageWork};
 use crate::errors::*;
 
 /// Can dylibs (shared libraries or proc macros) be distributed on this platform?
@@ -633,8 +633,10 @@ where
             return Ok((CompileResult::CacheBypass(reason, start.elapsed()), output));
         }
         let hashing = service.start_compile_stage(CompileStage::Hashing);
-        let result = self
-            .generate_hash_key(
+        let diagnose = hashing.is_some() && self.language() == Language::Rust;
+        let hash_work = StageWork::new(diagnose);
+        let result = hash_work
+            .scope(self.generate_hash_key(
                 &creator,
                 cwd.clone(),
                 env_vars.clone(),
@@ -645,9 +647,11 @@ where
                 &basedirs,
                 cache_control,
                 service.miss_explain.is_some(),
-            )
+            ))
             .await;
-        drop(hashing);
+        if let Some(hashing) = hashing {
+            hashing.warn_if_slow(&out_pretty, &hash_work, &hash_work);
+        }
         debug!(
             "[{}]: generate_hash_key took {}",
             out_pretty,
@@ -676,6 +680,7 @@ where
         // If `ForceRecache` is enabled, we won't check the cache.
         let start = Instant::now();
         let lookup_timing = service.start_compile_stage(CompileStage::CacheLookup);
+        let lookup_work = StageWork::new(diagnose);
         let cache_status = async {
             if cache_control == CacheControl::ForceNoCache {
                 Ok(Cache::None)
@@ -696,16 +701,19 @@ where
             let verify = async {
                 let cached = cache_status.await?;
                 match (linked.clone(), cached) {
-                    (Some(linked), Cache::Hit(mut entry)) => pool
-                        .spawn_blocking(move || match linked.verify(&mut entry) {
-                            Ok(()) => Cache::Hit(entry),
-                            Err(error) => {
-                                debug!("Rust link manifest rejected: {error:#}");
-                                Cache::Miss
+                    (Some(linked), Cache::Hit(mut entry)) => {
+                        compile_queue::spawn_blocking(&pool, move || {
+                            match linked.verify(&mut entry) {
+                                Ok(()) => Cache::Hit(entry),
+                                Err(error) => {
+                                    debug!("Rust link manifest rejected: {error:#}");
+                                    Cache::Miss
+                                }
                             }
                         })
                         .await
-                        .context("could not verify the Rust link manifest"),
+                        .context("could not verify the Rust link manifest")
+                    }
                     (_, cached) => Ok(cached),
                 }
             };
@@ -723,7 +731,7 @@ where
             })
             .collect::<Vec<_>>();
 
-        let lookup = match cache_status.await {
+        let lookup = match lookup_work.scope(cache_status).await {
             (Ok(Ok(Cache::Hit(mut entry))), duration) => {
                 debug!(
                     "[{}]: Cache hit in {}",
@@ -758,7 +766,10 @@ where
                 };
 
                 let hit = CompileResult::CacheHit(duration);
-                match entry.extract_objects(filtered_outputs, &pool).await {
+                match lookup_work
+                    .scope(entry.extract_objects(filtered_outputs, &pool))
+                    .await
+                {
                     Ok(()) => CacheLookupResult::Success(hit, output),
                     Err(e) => {
                         debug!("[{}]: Failed to restore cached outputs: {e:#}", out_pretty);
@@ -809,7 +820,9 @@ where
             }
         };
 
-        drop(lookup_timing);
+        if let Some(lookup_timing) = lookup_timing {
+            lookup_timing.warn_if_slow(&out_pretty, &lookup_work, &hash_work);
+        }
         match lookup {
             CacheLookupResult::Success(compile_result, output) => {
                 Ok::<_, Error>((compile_result, output))
@@ -842,13 +855,12 @@ where
                 }
 
                 let explanation = service.miss_explain.clone().zip(manifest.map(Arc::new));
-                if miss_type == MissType::Normal
-                    && let Some((explainer, manifest)) = &explanation
-                {
-                    service
-                        .record_rust_miss(explainer.clone(), key.clone(), manifest.clone())
-                        .await;
-                }
+                let history_read = explanation
+                    .as_ref()
+                    .filter(|_| miss_type == MissType::Normal)
+                    .map(|(explainer, manifest)| {
+                        service.record_rust_miss(explainer.clone(), key.clone(), manifest.clone())
+                    });
 
                 let mut link_manifest = None;
                 let mut linked_outputs = None;
@@ -1012,6 +1024,11 @@ where
                         .put_objects(&write_key, outputs?, stdout, stderr, &pool, Some(staged))
                         .await?;
                     if let Some((explainer, manifest)) = explanation {
+                        // Preserve the previous history for classification. The
+                        // signal arrives before the independent log append.
+                        if let Some(history_read) = history_read {
+                            let _ = history_read.await;
+                        }
                         match pool
                             .spawn_blocking(move || explainer.remember(write_key, &manifest))
                             .await

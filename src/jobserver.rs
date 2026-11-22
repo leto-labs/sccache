@@ -118,7 +118,9 @@ impl Client {
     }
 
     pub(crate) fn with_compile_queue(mut self) -> Self {
-        self.compile_queue = Some(Arc::new(CompileQueue::new(self.capacity)));
+        // Windows would have to acquire and release a token to sample the semaphore.
+        let jobserver = (cfg!(unix) && !self.fifo).then(|| self.inner.clone());
+        self.compile_queue = Some(Arc::new(CompileQueue::new(self.capacity, jobserver)));
         self
     }
 
@@ -217,5 +219,23 @@ mod test {
     #[test]
     fn private_pool_is_not_fifo() {
         assert!(!Client::new_num(1).is_fifo());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tokens_in_use_includes_tokens_taken_by_other_jobserver_clients() {
+        let client = Client::new_num(2).with_compile_queue();
+        let queue = client.compile_queue().unwrap();
+        assert_eq!(queue.snapshot().tokens_in_use, Some(0));
+        let other_client = client.inner.clone();
+        let external_token = other_client.acquire().unwrap();
+        let token = client.acquire_for_command().await.unwrap();
+        let stats = queue.snapshot();
+        assert_eq!(stats.running, 1);
+        assert_eq!(stats.tokens_in_use, Some(2));
+        drop(external_token);
+        assert_eq!(queue.snapshot().tokens_in_use, Some(1));
+        drop(token);
+        assert_eq!(queue.snapshot().tokens_in_use, Some(0));
     }
 }

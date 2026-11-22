@@ -1665,27 +1665,37 @@ where
         self.notification_tx.as_ref()
     }
 
-    pub(crate) async fn record_rust_miss(
+    pub(crate) fn record_rust_miss(
         &self,
         explainer: Arc<MissExplain>,
         key: String,
         manifest: Arc<Manifest>,
-    ) {
-        let _logging = self.start_compile_stage(CompileStage::MissLog);
-        match self
-            .rt
-            .spawn_blocking(move || explainer.record(&key, &manifest))
-            .await
-        {
-            Ok(Ok(classification)) => self
-                .stats
-                .lock()
-                .await
-                .miss_explain
-                .increment(classification),
-            Ok(Err(err)) => debug!("Could not log Rust cache miss: {err:#}"),
-            Err(err) => debug!("Could not run Rust cache miss logging: {err:#}"),
-        }
+    ) -> oneshot::Receiver<()> {
+        let (history_read, ready) = oneshot::channel();
+        let logging = self.start_compile_stage(CompileStage::MissLog);
+        let active = self.info.clone();
+        let stats = self.stats.clone();
+        let pool = self.rt.clone();
+        self.rt.spawn(async move {
+            let (_active, _logging) = (active, logging);
+            let result = {
+                let explainer = explainer.clone();
+                pool.spawn_blocking(move || explainer.prepare(&key, &manifest))
+                    .await
+            };
+            match result {
+                Ok(Ok((classification, line))) => {
+                    stats.lock().await.miss_explain.increment(classification);
+                    let _ = history_read.send(());
+                    if let Err(err) = explainer.append(line, &pool).await {
+                        debug!("Could not log Rust cache miss: {err:#}");
+                    }
+                }
+                Ok(Err(err)) => debug!("Could not prepare Rust cache miss explanation: {err:#}"),
+                Err(err) => debug!("Could not run Rust cache miss logging: {err:#}"),
+            }
+        });
+        ready
     }
 
     async fn merge_stats(&self, delta: ServerStats) {
@@ -2860,6 +2870,9 @@ impl ServerStats {
         if let Some(queue) = &self.compile_queue {
             use util::fmt_duration_as_secs;
             writer.write("\nCompiler token queue (since daemon start)");
+            if let Some(in_use) = queue.tokens_in_use {
+                writer.write(&format!("{:<33} {:>8}", "Tokens in use now", in_use));
+            }
             for (name, value) in [
                 ("Token capacity", queue.token_capacity.to_string()),
                 (
@@ -3180,7 +3193,7 @@ impl Future for ShutdownOrInactive {
 }
 
 /// Helper future which tracks the `ActiveInfo` below. This future will resolve
-/// once all services and their deferred cache writes have been dropped.
+/// once all services and their deferred cache writes and miss logs have been dropped.
 pub(crate) struct WaitUntilZero {
     info: std::sync::Weak<std::sync::Mutex<Info>>,
 }
@@ -3682,7 +3695,10 @@ mod tests {
             )),
         );
         mock_rustc_hash_inputs(creator);
-        // The compile itself.
+        mock_rustc_compile(creator, f);
+    }
+
+    fn mock_rustc_compile(creator: &MockCreator, f: &TestFixture) {
         let out_dir = f.tempdir.path().to_path_buf();
         next_command_calls(creator, move |_| {
             std::fs::write(out_dir.join("libdep.rlib"), "rlib")?;
@@ -3710,6 +3726,69 @@ mod tests {
     }
 
     type MockService = SccacheService<MockCreator>;
+
+    #[test]
+    fn rust_miss_compiles_with_the_log_locked_and_explains_against_previous_history() {
+        let (fixture, runtime, mut service, compile) = rustc_miss_fixture();
+        let root = fixture.tempdir.path();
+        let log = root.join("misses.jsonl");
+        let explainer = Arc::new(MissExplain::new(&root.join("cache"), log.clone()));
+        service.miss_explain = Some(explainer.clone());
+        service.compile_queue = Some(Arc::new(CompileQueue::new(1, None)));
+        let rustc = PathBuf::from(&compile.exe);
+        let (baseline_done, info) = WaitUntilZero::new();
+        service.info = info;
+        let (_, finished) = compile_body(&runtime, &service, compile);
+        assert_eq!(finished.retcode, Some(0));
+
+        let (update_done, info) = WaitUntilZero::new();
+        service.info = info;
+        runtime.block_on(async {
+            time::timeout(Duration::from_secs(5), baseline_done)
+                .await
+                .unwrap();
+        });
+        let baseline: serde_json::Value = serde_json::from_slice(&fs::read(&log).unwrap()).unwrap();
+        assert_eq!(baseline["classification"], "new");
+
+        fs::write(root.join("lib.rs"), "pub const NEW_INPUT: u32 = 1;").unwrap();
+        mock_rustc_hash_inputs(&service.creator);
+        mock_rustc_compile(&service.creator, &fixture);
+        let log_lock = explainer.lock_log();
+        let compile = dep_compile(&fixture, &rustc);
+        runtime.block_on(async {
+            let (_, finished, _) = time::timeout(
+                Duration::from_secs(5),
+                service.compile_direct(compile, &mut Vec::new()),
+            )
+            .await
+            .expect("the locked log must not hold up the compiler")
+            .unwrap();
+            assert_eq!(finished.unwrap().retcode, Some(0));
+            let stats = service.get_info().await.unwrap().stats;
+            assert_eq!(stats.cache_writes, 2);
+            assert_eq!(
+                stats.compile_queue.unwrap().stages[&CompileStage::MissLog].active,
+                1
+            );
+        });
+        assert_eq!(fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+        let stats = service.stats.clone();
+        drop(log_lock);
+        drop(service);
+        runtime.block_on(async {
+            time::timeout(Duration::from_secs(5), update_done)
+                .await
+                .unwrap();
+            assert_eq!(stats.lock().await.miss_explain.own_input, 1);
+        });
+        let log = fs::read_to_string(log).unwrap();
+        let updated: serde_json::Value = serde_json::from_str(log.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(updated["classification"], "own-input");
+        assert_eq!(updated["closest_key"], baseline["key"]);
+        assert_ne!(updated["key"], baseline["key"]);
+    }
 
     #[test]
     fn compile_records_token_wait_and_clears_queue_gauges() {
@@ -3794,7 +3873,7 @@ mod tests {
             Arc::new(MockStorage::new(None, false)),
             tokio::runtime::Handle::current(),
         );
-        service.compile_queue = Some(Arc::new(CompileQueue::new(1)));
+        service.compile_queue = Some(Arc::new(CompileQueue::new(1, None)));
         let pending = service.track_cache_write("entry");
         let waiting = service.wait_for_cache_write("entry");
         tokio::pin!(waiting);

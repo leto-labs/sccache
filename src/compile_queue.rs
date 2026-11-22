@@ -12,8 +12,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::runtime::Handle;
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +28,8 @@ pub struct CompileQueueStats {
     pub token_wait: WaitStats,
     pub token_waits_over_10s: u64,
     pub stages: BTreeMap<CompileStage, WaitStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in_use: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -111,9 +117,22 @@ struct QueueState {
     running: usize,
     last_warning: Option<Instant>,
     stages: BTreeMap<CompileStage, Timing>,
+    last_stage_warning: BTreeMap<CompileStage, Instant>,
 }
 
 impl QueueState {
+    fn reserve_stage_warning(&mut self, stage: CompileStage, now: Instant) -> bool {
+        if self
+            .last_stage_warning
+            .get(&stage)
+            .is_some_and(|&last| now - last < Duration::from_secs(60))
+        {
+            return false;
+        }
+        self.last_stage_warning.insert(stage, now);
+        true
+    }
+
     fn reserve_warning(&mut self, now: Instant, elapsed: Duration) -> Option<(usize, usize)> {
         if elapsed > TokenUse::WARN_AFTER
             && self
@@ -145,22 +164,30 @@ fn log_token_warning(warning: Option<(usize, usize)>) {
 
 pub(crate) struct CompileQueue {
     capacity: usize,
+    jobserver: Option<jobserver::Client>,
     state: Mutex<QueueState>,
 }
 
 impl CompileQueue {
-    pub(crate) fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize, jobserver: Option<jobserver::Client>) -> Self {
         Self {
             capacity,
+            jobserver,
             state: Mutex::default(),
         }
     }
 
     pub(crate) fn snapshot(&self) -> CompileQueueStats {
+        let tokens_in_use = self
+            .jobserver
+            .as_ref()
+            .and_then(|client| client.available().ok())
+            .and_then(|available| self.capacity.checked_sub(available));
         let state = self.state.lock().unwrap();
         let now = Instant::now();
         CompileQueueStats {
             token_capacity: self.capacity,
+            tokens_in_use,
             running: state.running,
             token_wait: state.token_wait.snapshot(now),
             token_waits_over_10s: state.token_waits_over_10s,
@@ -203,6 +230,43 @@ pub(crate) struct StageGuard {
     start: Instant,
 }
 
+impl StageGuard {
+    pub(crate) fn warn_if_slow(self, crate_name: &str, work: &StageWork, hash_work: &StageWork) {
+        let threshold = match self.stage {
+            CompileStage::Hashing => Duration::from_secs(30),
+            CompileStage::CacheLookup => Duration::from_secs(10),
+            _ => return,
+        };
+        let now = Instant::now();
+        let elapsed = now - self.start;
+        if elapsed <= threshold || work.0.is_none() {
+            return;
+        }
+        let stage = self.stage;
+        let warn = self
+            .queue
+            .state
+            .lock()
+            .unwrap()
+            .reserve_stage_warning(stage, now);
+        drop(self);
+        if warn {
+            let work = work.0.as_ref().unwrap();
+            let (files, bytes) = hash_work.0.as_ref().map_or((0, 0), |hash_work| {
+                (hash_work.files.load(Relaxed), hash_work.bytes.load(Relaxed))
+            });
+            let wait = Duration::from_nanos(work.max_blocking_wait.load(Relaxed));
+            let run = Duration::from_nanos(work.total_blocking_work.load(Relaxed));
+            let pending = work.pending.load(Relaxed);
+            warn!(
+                "Slow {stage:?} for Rust crate {crate_name}: {elapsed:.3?}, \
+                 input_files={files}, bytes_hashed={bytes}, blocking_wait_max={wait:.3?}, \
+                 blocking_work_total={run:.3?}, blocking_tasks_pending={pending}"
+            );
+        }
+    }
+}
+
 impl Drop for StageGuard {
     fn drop(&mut self) {
         let mut state = self.queue.state.lock().unwrap();
@@ -213,6 +277,75 @@ impl Drop for StageGuard {
             .unwrap()
             .finish(self.start, elapsed);
     }
+}
+
+#[derive(Default)]
+struct WorkCounters {
+    files: AtomicU64,
+    bytes: AtomicU64,
+    max_blocking_wait: AtomicU64,
+    total_blocking_work: AtomicU64,
+    pending: AtomicU64,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct StageWork(Option<Arc<WorkCounters>>);
+
+tokio::task_local! {
+    static STAGE_WORK: StageWork;
+}
+
+impl StageWork {
+    pub(crate) fn new(enabled: bool) -> Self {
+        Self(enabled.then(Arc::default))
+    }
+
+    pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
+        if self.0.is_some() {
+            STAGE_WORK.scope(self.clone(), future).await
+        } else {
+            future.await
+        }
+    }
+
+    pub(crate) fn record_file(&self, bytes: u64) {
+        if let Some(work) = &self.0 {
+            work.files.fetch_add(1, Relaxed);
+            work.bytes.fetch_add(bytes, Relaxed);
+        }
+    }
+}
+
+pub(crate) fn spawn_blocking<T: Send + 'static>(
+    pool: &Handle,
+    task: impl FnOnce() -> T + Send + 'static,
+) -> JoinHandle<T> {
+    spawn_blocking_with_work(pool, |_| task())
+}
+
+pub(crate) fn spawn_blocking_with_work<T: Send + 'static>(
+    pool: &Handle,
+    task: impl FnOnce(&StageWork) -> T + Send + 'static,
+) -> JoinHandle<T> {
+    let work = STAGE_WORK.try_with(Clone::clone).unwrap_or_default();
+    let Some(counters) = &work.0 else {
+        return pool.spawn_blocking(move || task(&work));
+    };
+    counters.pending.fetch_add(1, Relaxed);
+    let queued = std::time::Instant::now();
+    pool.spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let counters = work.0.as_ref().unwrap();
+        counters
+            .max_blocking_wait
+            .fetch_max((started - queued).as_nanos() as u64, Relaxed);
+        counters.pending.fetch_sub(1, Relaxed);
+        let result = task(&work);
+        counters
+            .total_blocking_work
+            .fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+        result
+    })
 }
 
 pub(crate) struct TokenUse {
@@ -262,8 +395,80 @@ mod tests {
     use super::*;
 
     #[tokio::test(start_paused = true)]
+    async fn slow_stage_warnings_respect_thresholds_and_rate_limits() {
+        let queue = Arc::new(CompileQueue::new(1, None));
+        let work = StageWork::new(true);
+        let hashing = queue.start_stage(CompileStage::Hashing);
+        let lookup = queue.start_stage(CompileStage::CacheLookup);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        lookup.warn_if_slow("example", &work, &work);
+        assert!(queue.state.lock().unwrap().last_stage_warning.is_empty());
+
+        let lookup = queue.start_stage(CompileStage::CacheLookup);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        hashing.warn_if_slow("example", &work, &work);
+        lookup.warn_if_slow("example", &work, &work);
+        assert!(
+            !queue
+                .state
+                .lock()
+                .unwrap()
+                .last_stage_warning
+                .contains_key(&CompileStage::Hashing)
+        );
+        let first_lookup_warning =
+            queue.state.lock().unwrap().last_stage_warning[&CompileStage::CacheLookup];
+
+        let hashing = queue.start_stage(CompileStage::Hashing);
+        let lookup = queue.start_stage(CompileStage::CacheLookup);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        hashing.warn_if_slow("example", &work, &work);
+        lookup.warn_if_slow("example", &work, &work);
+        assert_eq!(
+            queue.state.lock().unwrap().last_stage_warning[&CompileStage::Hashing],
+            Instant::now()
+        );
+        assert_eq!(
+            queue.state.lock().unwrap().last_stage_warning[&CompileStage::CacheLookup],
+            first_lookup_warning
+        );
+
+        let lookup = queue.start_stage(CompileStage::CacheLookup);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        lookup.warn_if_slow("example", &work, &work);
+        assert_eq!(
+            queue.state.lock().unwrap().last_stage_warning[&CompileStage::CacheLookup],
+            Instant::now()
+        );
+    }
+
+    #[test]
+    fn blocking_work_measures_queue_delay_and_hash_input_bytes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = runtime.spawn_blocking(move || blocked.recv().unwrap());
+        let work = StageWork::new(true);
+        let counters = work.0.as_ref().unwrap();
+        runtime.block_on(work.scope(async {
+            let task = spawn_blocking_with_work(runtime.handle(), |work| work.record_file(128));
+            assert_eq!(counters.pending.load(Relaxed), 1);
+            release.send(()).unwrap();
+            task.await.unwrap();
+            worker.await.unwrap();
+        }));
+        assert_eq!(counters.pending.load(Relaxed), 0);
+        assert_eq!(counters.files.load(Relaxed), 1);
+        assert_eq!(counters.bytes.load(Relaxed), 128);
+        assert!(counters.max_blocking_wait.load(Relaxed) > 0);
+        assert!(counters.total_blocking_work.load(Relaxed) > 0);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancelled_token_wait_is_recorded_and_warnings_are_rate_limited() {
-        let queue = Arc::new(CompileQueue::new(1));
+        let queue = Arc::new(CompileQueue::new(1, None));
         let first = queue.start_token();
         let second = queue.start_token();
 

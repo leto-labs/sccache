@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::compile_queue;
 use crate::mock_command::{CommandChild, RunCommand};
 use blake3::Hasher as blake3_Hasher;
 use byteorder::{BigEndian, ByteOrder};
@@ -118,7 +119,7 @@ impl Digest {
     /// Calculate the BLAKE3 digest of the contents of `path`, running
     /// the actual hash computation on a background thread in `pool`.
     pub async fn reader(path: PathBuf, pool: &tokio::runtime::Handle) -> Result<String> {
-        pool.spawn_blocking(move || {
+        compile_queue::spawn_blocking_with_work(pool, move |work| {
             let mut digest = Digest::new();
             if path.is_dir() {
                 // For directories (e.g., from
@@ -130,10 +131,10 @@ impl Digest {
                 for entry in &entries {
                     let rel = entry.strip_prefix(&path).unwrap_or(entry);
                     digest.delimiter(rel.to_string_lossy().as_bytes());
-                    digest.update_from_file(entry)?;
+                    work.record_file(digest.update_from_file(entry)?);
                 }
             } else {
-                digest.update_from_file(&path)?;
+                work.record_file(digest.update_from_file(&path)?);
             }
             Ok(digest.finish())
         })
@@ -141,10 +142,12 @@ impl Digest {
     }
 
     /// Open `path` and stream its contents into `self`.
-    fn update_from_file(&mut self, path: &Path) -> Result<()> {
+    fn update_from_file(&mut self, path: &Path) -> Result<u64> {
+        let before = self.inner.count();
         let mut file = File::open(path)
             .with_context(|| format!("Failed to open file for hashing: {path:?}"))?;
-        read_chunks(&mut file, |chunk| self.update(chunk))
+        read_chunks(&mut file, |chunk| self.update(chunk))?;
+        Ok(self.inner.count() - before)
     }
 
     /// Recursively collect all file paths within a directory.
@@ -429,7 +432,7 @@ pub async fn hash_all_archives(
     let count = files.len();
     let iter = files.iter().map(|path| {
         let path = path.clone();
-        pool.spawn_blocking(move || -> Result<String> {
+        compile_queue::spawn_blocking_with_work(pool, move |work| -> Result<String> {
             let mut m = Digest::new();
             let archive_file = File::open(&path)
                 .with_context(|| format!("Failed to open file for hashing: {:?}", path))?;
@@ -449,6 +452,7 @@ pub async fn hash_all_archives(
                 hash_regular_archive(&mut m, &archive_mmap)?;
             }
 
+            work.record_file(m.inner.count());
             Ok(m.finish())
         })
     });
@@ -481,7 +485,7 @@ pub async fn hash_all_externs(
             return Digest::file(path, pool).await;
         }
         let library = path.clone();
-        pool.spawn_blocking(move || -> Result<String> {
+        compile_queue::spawn_blocking_with_work(pool, move |work| -> Result<String> {
             let data = fs::read(&library)?;
             let mut m = Digest::new();
             let input = if whole_elf_dylib && data.starts_with(b"\x7fELF") {
@@ -490,6 +494,7 @@ pub async fn hash_all_externs(
                 rustc_metadata_section(&data).unwrap_or(&data)
             };
             m.update(input);
+            work.record_file(m.inner.count());
             Ok(m.finish())
         })
         .await?

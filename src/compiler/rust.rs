@@ -15,6 +15,7 @@
 pub(crate) mod linked;
 
 use crate::cache::{FileObjectSource, Storage};
+use crate::compile_queue;
 use crate::compiler::args::*;
 use crate::compiler::{
     CacheStoreVeto, Cacheable, ColorMode, Compilation, CompileCommand, CompileCommandImpl,
@@ -492,12 +493,11 @@ where
     // Parse the dep-info file, then hash the contents of those files.
     let cwd = cwd.to_owned();
     let name2 = crate_name.to_owned();
-    let parsed = pool
-        .spawn_blocking(move || {
-            parse_dep_file(&dep_file, &cwd)
-                .with_context(|| format!("Failed to parse dep info for {}", name2))
-        })
-        .await?;
+    let parsed = compile_queue::spawn_blocking(pool, move || {
+        parse_dep_file(&dep_file, &cwd)
+            .with_context(|| format!("Failed to parse dep info for {}", name2))
+    })
+    .await?;
 
     parsed.map(move |(files, env_deps, dep_info)| {
         trace!(

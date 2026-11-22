@@ -298,7 +298,7 @@ impl CacheRead {
     where
         T: IntoIterator<Item = FileObjectSource> + Send + Sync + 'static,
     {
-        pool.spawn_blocking(move || {
+        crate::compile_queue::spawn_blocking(pool, move || {
             for FileObjectSource {
                 key,
                 path,

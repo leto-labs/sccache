@@ -16,6 +16,7 @@ use crate::cache::{
     Cache, CacheMode, CacheRead, CacheStorage, CacheWrite, GetPathResult, OpenCacheObject,
     PreprocessorCacheStorage,
 };
+use crate::compile_queue;
 use crate::compiler::PreprocessorCacheEntry;
 use crate::lru_disk_cache::{Error as LruError, LruDiskCache, ReadSeek, Result as LruResult};
 use async_trait::async_trait;
@@ -332,24 +333,23 @@ impl CacheStorage for DiskCache {
         let rw_mode = self.rw_mode;
         let reflink = self.reflink;
 
-        self.pool
-            .spawn_blocking(move || {
-                let io = match open_entry(lru.lock().unwrap().get_or_init()?, &path, rw_mode) {
-                    Ok(f) => f,
-                    Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get({}): FileNotInCache", key);
-                        return Ok(Cache::Miss);
-                    }
-                    Err(LruError::Io(e)) => {
-                        trace!("DiskCache::get({}): IoError: {:?}", key, e);
-                        return Err(e.into());
-                    }
-                    Err(_) => unreachable!(),
-                };
-                let hit = CacheRead::from_file(io, reflink)?;
-                Ok(Cache::Hit(hit))
-            })
-            .await?
+        compile_queue::spawn_blocking(&self.pool, move || {
+            let io = match open_entry(lru.lock().unwrap().get_or_init()?, &path, rw_mode) {
+                Ok(f) => f,
+                Err(LruError::FileNotInCache) => {
+                    trace!("DiskCache::get({}): FileNotInCache", key);
+                    return Ok(Cache::Miss);
+                }
+                Err(LruError::Io(e)) => {
+                    trace!("DiskCache::get({}): IoError: {:?}", key, e);
+                    return Err(e.into());
+                }
+                Err(_) => unreachable!(),
+            };
+            let hit = CacheRead::from_file(io, reflink)?;
+            Ok(Cache::Hit(hit))
+        })
+        .await?
     }
 
     async fn get_with_raw(&self, key: &str) -> Result<(Cache, Option<Bytes>)> {
@@ -369,27 +369,26 @@ impl CacheStorage for DiskCache {
         let key = key.to_owned();
         let rw_mode = self.rw_mode;
 
-        self.pool
-            .spawn_blocking(move || {
-                match open_entry(lru.lock().unwrap().get_or_init()?, &path, rw_mode) {
-                    Ok(mut io) => {
-                        let mut data = Vec::new();
-                        io.read_to_end(&mut data)?;
-                        trace!("DiskCache::get_raw({}): Found {} bytes", key, data.len());
-                        Ok(Some(Bytes::from(data)))
-                    }
-                    Err(LruError::FileNotInCache) => {
-                        trace!("DiskCache::get_raw({}): FileNotInCache", key);
-                        Ok(None)
-                    }
-                    Err(LruError::Io(e)) => {
-                        trace!("DiskCache::get_raw({}): IoError: {:?}", key, e);
-                        Err(e.into())
-                    }
-                    Err(_) => unreachable!(),
+        compile_queue::spawn_blocking(&self.pool, move || {
+            match open_entry(lru.lock().unwrap().get_or_init()?, &path, rw_mode) {
+                Ok(mut io) => {
+                    let mut data = Vec::new();
+                    io.read_to_end(&mut data)?;
+                    trace!("DiskCache::get_raw({}): Found {} bytes", key, data.len());
+                    Ok(Some(Bytes::from(data)))
                 }
-            })
-            .await?
+                Err(LruError::FileNotInCache) => {
+                    trace!("DiskCache::get_raw({}): FileNotInCache", key);
+                    Ok(None)
+                }
+                Err(LruError::Io(e)) => {
+                    trace!("DiskCache::get_raw({}): IoError: {:?}", key, e);
+                    Err(e.into())
+                }
+                Err(_) => unreachable!(),
+            }
+        })
+        .await?
     }
 
     async fn get_path(&self, key: &str) -> GetPathResult {
