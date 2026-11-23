@@ -2,6 +2,7 @@
 """Summarize the Rust miss log and follow changed externs to their root crates."""
 
 import argparse
+from collections import Counter
 import json
 import os
 import sys
@@ -60,11 +61,19 @@ def main():
         parser.error("specify a log file or set SCCACHE_MISS_EXPLAIN")
     try:
         with open(args.log, encoding="utf-8") as log:
+            groups = Counter()
             for event in explain(log):
                 if args.json:
                     print(json.dumps(event))
                 else:
+                    profile = event.get("profile") or "(unknown)"
+                    kind = event.get("target_kind") or "(unknown)"
+                    groups[profile, kind] += 1
                     print_text(event)
+            if groups:
+                print("\nMisses by profile and target kind")
+                for (profile, kind), count in sorted(groups.items()):
+                    print(f"  {profile} / {kind}  {count}")
     except (OSError, ValueError, KeyError) as err:
         sys.exit(f"{args.log}: {err}")
 

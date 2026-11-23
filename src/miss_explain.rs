@@ -18,11 +18,12 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::hash::Hash;
 use std::io::{self, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component as PathComponent, Path, PathBuf};
 use std::sync::Mutex;
 
 pub(crate) const DIRECTORY: &str = "explain";
 const HISTORY_SIZE: usize = 4;
+const MAX_LISTED_FEATURES: usize = 10;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Component {
@@ -38,8 +39,162 @@ pub(crate) struct Manifest {
     pub crate_name: String,
     pub cwd: String,
     pub basedir: Option<String>,
+    pub compilation: Compilation,
     pub artifacts: Vec<String>,
     pub components: Vec<Component>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct Compilation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    crate_types: Vec<String>,
+    is_test: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_kind: Option<&'static str>,
+    #[serde(flatten)]
+    features: FeatureSet,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum FeatureSet {
+    Features(Vec<String>),
+    FeaturesHash(String),
+}
+
+impl Compilation {
+    pub(crate) fn new<'a>(
+        cwd: &Path,
+        out_dir: &Path,
+        basedir: Option<&Path>,
+        crate_name: &str,
+        crate_types: Vec<&str>,
+        cfgs: impl Iterator<Item = &'a OsStr>,
+        target: Option<&str>,
+    ) -> Self {
+        let resolved = cwd.join(out_dir);
+        let relative = basedir
+            .and_then(|dir| resolved.strip_prefix(dir).ok())
+            .unwrap_or(out_dir);
+        let (profile, layout_kind) = cargo_layout(&resolved, crate_name, &crate_types);
+
+        let mut is_test = false;
+        let mut features = Vec::new();
+        for cfg in cfgs.filter_map(OsStr::to_str).map(str::trim) {
+            is_test |= cfg == "test";
+            if let Some((name, value)) = cfg.split_once('=')
+                && name.trim() == "feature"
+                && let Some(feature) = value
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|s| s.strip_suffix('"'))
+            {
+                features.push(feature);
+            }
+        }
+        features.sort_unstable();
+        features.dedup();
+        // A hand-written cfg can contain arbitrary strings, including paths.
+        let features = if features.len() > MAX_LISTED_FEATURES
+            || features.iter().any(|feature| {
+                feature.contains(['/', '\\', ':']) || feature.chars().any(char::is_control)
+            }) {
+            let mut digest = Digest::new();
+            for feature in features {
+                digest.update(feature.as_bytes());
+                digest.update(b"\0");
+            }
+            FeatureSet::FeaturesHash(digest.finish())
+        } else {
+            FeatureSet::Features(features.into_iter().map(str::to_owned).collect())
+        };
+
+        let target_kind = layout_kind.or(match crate_types.as_slice() {
+            _ if is_test => Some("test"),
+            ["bin"] => Some("bin"),
+            ["proc-macro"] => Some("proc-macro"),
+            [] => None,
+            _ => Some("lib"),
+        });
+        Self {
+            out_dir: display_out_dir(relative),
+            profile: profile.map(str::to_owned),
+            crate_types: crate_types.into_iter().map(str::to_owned).collect(),
+            is_test,
+            target: target
+                .filter(|name| {
+                    name.starts_with(|ch: char| ch.is_ascii_alphanumeric())
+                        && name
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                })
+                .map(str::to_owned),
+            target_kind,
+            features,
+        }
+    }
+}
+
+fn display_out_dir(path: &Path) -> Option<String> {
+    if path
+        .components()
+        .any(|part| !matches!(part, PathComponent::Normal(_) | PathComponent::CurDir))
+    {
+        return None;
+    }
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    let path = path.replace('\\', "/");
+    Some(if path.is_empty() {
+        ".".into()
+    } else {
+        path.into()
+    })
+}
+
+fn cargo_layout<'a>(
+    out_dir: &'a Path,
+    crate_name: &str,
+    crate_types: &[&str],
+) -> (Option<&'a str>, Option<&'static str>) {
+    let parent = out_dir.parent();
+    let package = if out_dir.ends_with("out") {
+        parent
+    } else {
+        Some(out_dir)
+    };
+    let (profile_dir, target_kind) = if out_dir.ends_with("out")
+        && let Some(build) = package.and_then(Path::parent).and_then(Path::parent)
+        && build.ends_with("build")
+    {
+        // Newer Cargo uses build/<package>/<unit>/out for all targets.
+        let is_build_script = crate_types == ["bin"] && crate_name.starts_with("build_script_");
+        (build.parent(), is_build_script.then_some("build-script"))
+    } else if let Some(build) = package.and_then(Path::parent)
+        && build.ends_with("build")
+    {
+        (build.parent(), Some("build-script"))
+    } else if out_dir.ends_with("examples") {
+        (parent, Some("example"))
+    } else if out_dir.ends_with("deps") {
+        (parent, None)
+    } else {
+        (None, None)
+    };
+    let profile = profile_dir
+        .and_then(Path::file_name)
+        .and_then(OsStr::to_str)
+        .filter(|name| {
+            name.chars()
+                .all(|ch| ch.is_alphanumeric() || matches!(ch, '-' | '_'))
+        })
+        .map(|name| if name == "debug" { "dev" } else { name });
+    (profile, target_kind)
 }
 
 impl Manifest {
@@ -176,6 +331,8 @@ struct Explanation<'a> {
     identity: &'a str,
     cwd: &'a str,
     basedir: Option<&'a str>,
+    #[serde(flatten)]
+    compilation: &'a Compilation,
     artifacts: &'a [String],
     key: &'a str,
     closest_key: Option<&'a str>,
@@ -225,6 +382,7 @@ impl<'a> Explanation<'a> {
             identity: &manifest.identity,
             cwd: &manifest.cwd,
             basedir: manifest.basedir.as_deref(),
+            compilation: &manifest.compilation,
             artifacts: &manifest.artifacts,
             key,
             closest_key,
@@ -342,6 +500,7 @@ impl MissExplain {
 #[cfg(test)]
 mod test {
     use super::*;
+    use serde_json::{Value, json};
 
     fn manifest(components: &[(&str, &str)]) -> Manifest {
         let mut manifest = Manifest {
@@ -349,6 +508,15 @@ mod test {
             crate_name: "example".into(),
             cwd: "/work/example".into(),
             basedir: Some("/work".into()),
+            compilation: Compilation::new(
+                Path::new("/work/example"),
+                Path::new("target/debug/deps"),
+                None,
+                "example",
+                vec!["rlib"],
+                std::iter::empty(),
+                None,
+            ),
             artifacts: vec!["libexample.rmeta".into()],
             components: Vec::new(),
         };
@@ -363,6 +531,126 @@ mod test {
             key: key.into(),
             components: manifest(components).components,
         }
+    }
+
+    fn compilation(out_dir: &str, cfgs: &[&str], target: Option<&str>) -> Value {
+        let mut manifest = manifest(&[]);
+        manifest.compilation = Compilation::new(
+            Path::new("/work/example"),
+            Path::new(out_dir),
+            Some(Path::new("/work")),
+            "example",
+            vec!["rlib"],
+            cfgs.iter().map(OsStr::new),
+            target,
+        );
+        serde_json::to_value(Explanation::new("current", &manifest, &[])).unwrap()
+    }
+
+    #[test]
+    fn records_only_relative_or_basedir_stripped_output_paths() {
+        for (path, expected) in [
+            (
+                "/work/example/target/debug/deps",
+                json!("example/target/debug/deps"),
+            ),
+            ("target/debug/deps", json!("example/target/debug/deps")),
+            ("/work", json!(".")),
+        ] {
+            assert_eq!(compilation(path, &[], None)["out_dir"], expected);
+        }
+        for path in ["/work-other/target/debug/deps", "/work/../private/deps"] {
+            assert!(compilation(path, &[], None).get("out_dir").is_none());
+        }
+        let external = compilation("/private/custom-target/fast/deps", &[], None);
+        assert!(external.get("out_dir").is_none());
+        assert_eq!(external["profile"], "fast");
+    }
+
+    #[test]
+    fn derives_profiles_and_target_kinds_from_cargo_output_paths() {
+        for (path, profile, kind) in [
+            ("target/debug/deps", "dev", "lib"),
+            ("target/release/deps", "release", "lib"),
+            ("target/élan/deps", "élan", "lib"),
+            (
+                "build-output/aarch64-unknown-linux-gnu/fast/deps",
+                "fast",
+                "lib",
+            ),
+            ("custom-target/release/examples", "release", "example"),
+            ("target/debug/build/pkg-abcd", "dev", "build-script"),
+            (
+                "custom-target/fast/build/pkg-abcd/out",
+                "fast",
+                "build-script",
+            ),
+            ("custom-target/fast/build/pkg/abcd/out", "fast", "lib"),
+        ] {
+            let record = compilation(path, &[], None);
+            assert_eq!(record["profile"], profile, "{path}");
+            assert_eq!(record["target_kind"], kind, "{path}");
+        }
+        assert!(
+            compilation("arbitrary-output", &[], None)
+                .get("profile")
+                .is_none()
+        );
+        assert_eq!(
+            cargo_layout(
+                Path::new("custom-target/fast/build/pkg/abcd/out"),
+                "build_script_custom",
+                &["bin"],
+            ),
+            (Some("fast"), Some("build-script")),
+        );
+    }
+
+    #[test]
+    fn records_target_triple_and_test_cfg() {
+        let target = "thumbv8m.main-none-eabi";
+        let record = compilation("target/debug/deps", &["test"], Some(target));
+        assert_eq!(record["is_test"], true);
+        assert_eq!(record["target_kind"], "test");
+        assert_eq!(record["crate_types"], json!(["rlib"]));
+        assert_eq!(record["target"], target);
+        let record = compilation(
+            "target/debug/deps",
+            &[r#"feature="test""#],
+            Some("/private/custom-target"),
+        );
+        assert_eq!(record["is_test"], false);
+        assert_eq!(record["features"], json!(["test"]));
+        assert!(record.get("target").is_none());
+    }
+
+    #[test]
+    fn lists_ten_distinct_features_and_hashes_larger_sets() {
+        let names: Vec<_> = (0..11).map(|n| format!("feature-{n:02}")).collect();
+        let cfgs: Vec<_> = names
+            .iter()
+            .map(|name| format!(r#"feature = "{name}""#))
+            .collect();
+        let mut inputs: Vec<_> = cfgs[..10].iter().rev().map(String::as_str).collect();
+        inputs.extend([cfgs[0].as_str(), r#"unrelated="value""#]);
+        let small = compilation("target/debug/deps", &inputs, None);
+        assert_eq!(small["features"], json!(names[..10]));
+        assert!(small.get("features_hash").is_none());
+
+        inputs.push(&cfgs[10]);
+        let large = compilation("target/debug/deps", &inputs, None);
+        assert!(large.get("features").is_none());
+        assert_eq!(large["features_hash"].as_str().unwrap().len(), 64);
+        inputs.reverse();
+        let reordered = compilation("target/debug/deps", &inputs, None);
+        assert_eq!(reordered["features_hash"], large["features_hash"]);
+        inputs[0] = r#"feature="different""#;
+        let changed = compilation("target/debug/deps", &inputs, None);
+        assert_ne!(changed["features_hash"], large["features_hash"]);
+
+        let private = compilation("target/debug/deps", &[r#"feature="/private/file""#], None);
+        assert!(private.get("features_hash").is_some());
+        assert!(!private.to_string().contains("/private/file"));
     }
 
     #[test]

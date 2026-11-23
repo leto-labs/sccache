@@ -2431,7 +2431,10 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
             checkout.join("middle/src/lib.rs"),
             "pub const ANSWER: (&str, u32) = leaf::ANSWER;\n",
         )?;
-        fs::write(checkout.join("leaf/Cargo.toml"), package("explain_leaf"))?;
+        fs::write(
+            checkout.join("leaf/Cargo.toml"),
+            package("explain_leaf") + "\n[features]\ndefault = [\"tracing\"]\ntracing = []\n",
+        )?;
         fs::write(
             checkout.join("leaf/src/lib.rs"),
             format!("pub const ANSWER: (&str, u32) = (env!(\"TEST_ENV_VAR\"), {value});\n"),
@@ -2442,7 +2445,8 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
     cargo_build(&test, &a)?;
     // Restart to verify the baselines survive a server restart.
     start(&test)?;
-    test.env.push(("TEST_ENV_VAR", "checkout-b".into()));
+    let keyed_env_value = "explain-misses-private-env-value";
+    test.env.push(("TEST_ENV_VAR", keyed_env_value.into()));
     cargo_build(&test, &b)?;
 
     let stats: Value = serde_json::from_slice(&test.show_stats()?.get_output().stdout)?;
@@ -2459,6 +2463,7 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
 
     let entries = wait_for_miss_log(&log, 6, |_| true)?;
     assert_eq!(entries.len(), 6);
+    assert!(!fs::read_to_string(&log)?.contains(keyed_env_value));
     let in_checkout = |checkout: &Path, name: &str| {
         entries
             .iter()
@@ -2476,6 +2481,24 @@ fn test_rust_cargo_explain_cross_worktree_misses(client_side: bool) -> Result<()
         assert_eq!(old["key"], new["closest_key"]);
         assert_eq!(old["basedir"], a.to_str().unwrap());
         assert_eq!(new["basedir"], b.to_str().unwrap());
+        for entry in [old, new] {
+            assert!(
+                entry["out_dir"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("target/debug/")
+            );
+            assert_eq!(entry["profile"], "dev");
+            assert_eq!(entry["target_kind"], "lib");
+            assert_eq!(entry["crate_types"], json!(["rlib"]));
+            assert_eq!(entry["is_test"], false);
+            let features = if crate_name == "explain_leaf" {
+                json!(["default", "tracing"])
+            } else {
+                json!([])
+            };
+            assert_eq!(entry["features"], features);
+        }
         let differences = new["differences"].as_array().unwrap();
         let names: Vec<_> = differences
             .iter()

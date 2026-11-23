@@ -2501,15 +2501,54 @@ impl ParsedArguments {
 
     fn explain_manifest(&self, cwd: &Path, basedirs: &[Vec<u8>]) -> Manifest {
         let output_dir = cwd.join(&self.output_dir);
+        let output_basedir = output_dir
+            .ancestors()
+            .find(|dir| matches_basedir(dir, basedirs));
         let basedir = cwd
             .ancestors()
-            .chain(output_dir.ancestors())
-            .find(|dir| matches_basedir(dir, basedirs));
+            .find(|dir| matches_basedir(dir, basedirs))
+            .or(output_basedir);
+        let crate_types = [
+            self.crate_types.rlib.then_some("rlib"),
+            self.crate_types.staticlib.then_some("staticlib"),
+            self.linked_check
+                .or(self.linked.as_ref().map(|options| options.kind))
+                .filter(|kind| matches!(*kind, "bin" | "proc-macro")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let cfgs = self.arguments.iter().filter_map(|arg| match arg {
+            Argument::UnknownFlag(flag) if flag == "--test" => Some(OsStr::new("test")),
+            Argument::WithValue("--cfg", PassThrough(value), _) => Some(value.as_os_str()),
+            _ => None,
+        });
+        let target = self
+            .arguments
+            .iter()
+            .rev()
+            .find_map(|arg| match arg.get_data() {
+                Some(Target(target)) => Some(target),
+                _ => None,
+            })
+            .and_then(|target| match target {
+                ArgTarget::Name(name) => Some(name.as_str()),
+                _ => None,
+            });
         Manifest {
             identity: self.unit_hash(b"rust-miss-explain"),
             crate_name: self.crate_name.clone(),
             cwd: cwd.to_string_lossy().into_owned(),
             basedir: basedir.map(|dir| dir.to_string_lossy().into_owned()),
+            compilation: miss_explain::Compilation::new(
+                cwd,
+                &self.output_dir,
+                output_basedir,
+                &self.crate_name,
+                crate_types,
+                cfgs,
+                target,
+            ),
             artifacts: Vec::new(),
             components: Vec::new(),
         }
@@ -6180,6 +6219,26 @@ hash 42fac6f0 stable_crate_id StableCrateId(12206970385906972588)
                 identity("checkout-b", &["-Cmetadata=a", "-Cmetadata=b", changes]),
                 "{changes}",
             );
+        }
+    }
+
+    #[test]
+    fn test_miss_explain_compilation_args() {
+        let cwd = Path::new("/checkout");
+        for flag in ["--test", "--cfg=test"] {
+            let CompilerArguments::Ok(args) = parse_rust_lib(
+                &[flag, "--target=thumbv8m.main-none-eabi"],
+                cwd,
+                RustIncremental::Off,
+            ) else {
+                panic!("expected cacheable args");
+            };
+            let diagnostic =
+                serde_json::to_value(args.explain_manifest(cwd, &[]).compilation).unwrap();
+            assert_eq!(diagnostic["out_dir"], "out");
+            assert_eq!(diagnostic["is_test"], true);
+            assert_eq!(diagnostic["target_kind"], "test");
+            assert_eq!(diagnostic["target"], "thumbv8m.main-none-eabi");
         }
     }
 

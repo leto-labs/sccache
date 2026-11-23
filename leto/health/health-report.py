@@ -409,6 +409,7 @@ def miss_log_report(path, now, hours, warnings, max_bytes=None):
     except OverflowError:
         since = datetime.min.replace(tzinfo=timezone.utc)
     projects = defaultdict(Counter)
+    groups = defaultdict(lambda: defaultdict(Counter))
     components = defaultdict(Counter)
     crates = defaultdict(Counter)
     crate_components = defaultdict(Counter)
@@ -462,6 +463,10 @@ def miss_log_report(path, now, hours, warnings, max_bytes=None):
                         continue
                     project = project_for(cwd)
                     projects[project][classification] += 1
+                    profile, kind = (event.get(key) for key in ("profile", "target_kind"))
+                    profile = profile if isinstance(profile, str) and profile else "(unknown)"
+                    kind = kind if isinstance(kind, str) and kind else "(unknown)"
+                    groups[project][profile, kind][classification] += 1
                     if classification == "own-input":
                         kinds = {component_kind(name, event) for name in names if not name.startswith("extern:")}
                         components[project].update(kinds)
@@ -488,6 +493,11 @@ def miss_log_report(path, now, hours, warnings, max_bytes=None):
             "total": sum(counts.values()),
             "classifications": {**dict.fromkeys(CLASSES, 0), **counts},
             "unchanged": counts["unchanged"],
+            "by_profile_target": [
+                {"profile": profile, "target_kind": kind, "total": sum(group.values()),
+                 "classifications": {**dict.fromkeys(CLASSES, 0), **group}}
+                for (profile, kind), group in sorted(groups[project].items())
+            ],
             "own_input_components": top(components[project]),
             "own_input_crates": [
                 {"crate": crate, "count": count,
@@ -816,6 +826,12 @@ def markdown(report):
                          f"{entry['crate']} ({entry['count']}, {display(entry['main_component'])})"
                          for entry in project["own_input_crates"]) or None, summarize(project["dependency_externs"])]
                     for name, project in misses["projects"].items()
+                ]),
+                table(["Project", "Profile", "Target kind", "Total", "Classifications"], [
+                    [name, group["profile"], group["target_kind"], group["total"],
+                     summarize(group["classifications"])]
+                    for name, project in misses["projects"].items()
+                    for group in project["by_profile_target"]
                 ]),
                 "## Miss log",
                 table(["File", "Bytes", "Lines", "Oldest", "Newest"], [

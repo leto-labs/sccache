@@ -284,6 +284,44 @@ class HealthReportTest(unittest.TestCase):
         self.assertLess(log["current"]["line_count"], 4096 // 50)
         self.assertIn("## Cache", REPORT["markdown"](report))
 
+    def test_miss_counts_by_profile_and_target_kind(self):
+        log = self.root / "profile-misses.jsonl"
+        event = {
+            "time": "2026-10-10T11:30:00+00:00",
+            "cwd": "/home/build/.t3/worktrees/fairfill/feature",
+            "basedir": None,
+            "crate_name": "engine",
+            "artifacts": [],
+            "classification": "new",
+            "differences": [],
+        }
+        rows = [
+            {**event, "profile": "dev", "target_kind": "lib"},
+            {**event, "profile": "dev", "target_kind": "lib", "classification": "unchanged"},
+            {**event, "profile": "dev", "target_kind": "test"},
+            {**event, "profile": "fast", "target_kind": "lib"},
+            event,
+        ]
+        log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        report = self.report("--miss-log", str(log))
+        project = report["misses"]["projects"]["fairfill"]
+        self.assertEqual(project["total"], 5)
+        self.assertEqual(
+            [(group["profile"], group["target_kind"], group["total"])
+             for group in project["by_profile_target"]],
+            [("(unknown)", "(unknown)", 1), ("dev", "lib", 2),
+             ("dev", "test", 1), ("fast", "lib", 1)],
+        )
+        self.assertEqual(project["by_profile_target"][1]["classifications"],
+                         {"new": 1, "own-input": 0, "dependency": 0, "unchanged": 1})
+        self.assertIn("| fairfill | dev | test | 1 |", REPORT["markdown"](report))
+
+        reader = HERE.parent / "explain-misses.py"
+        text = subprocess.check_output([sys.executable, reader, log], text=True)
+        self.assertIn("  (unknown) / (unknown)  1\n  dev / lib  2\n  dev / test  1\n  fast / lib  1\n", text)
+        jsonl = subprocess.check_output([sys.executable, reader, "--json", log], text=True)
+        self.assertEqual([json.loads(line) for line in jsonl.splitlines()], rows)
+
     def test_host_under_memory_pressure_is_skipped(self):
         proc = self.root / "proc"
         (proc / "pressure").mkdir(exist_ok=True)

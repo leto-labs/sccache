@@ -324,6 +324,24 @@ earlier misses in the same checkout and reports unresolved externs when a
 producer is absent from the log. Pass `--json` to include the root crates in
 JSON output.
 
+Newer records include `out_dir` from rustc's `--out-dir`, relative to a
+matching basedir or given as a relative path. An absolute output directory
+outside the basedirs is omitted. `profile` is inferred from Cargo output
+directories, including custom target directories. Cargo shares `debug` between
+dev and test and `release` between release and bench, so these paths report
+`dev` and `release` respectively.
+
+`crate_types` lists the Rust crate types, `is_test` covers both `--test`
+and `--cfg test`, and `target` is the explicit target triple when available.
+`target_kind` identifies libraries, binaries, proc macros, examples, build
+scripts and test harnesses when the arguments and layout provide enough
+information. Up to ten distinct enabled feature names appear in sorted
+`features`. Larger sets and sets containing path-like names use a
+`features_hash` BLAKE3 digest of the sorted, NUL-terminated UTF-8 names.
+These diagnostics do not affect cache keys. The text reader and host health
+report group misses by profile and target kind. Older log entries appear
+under `(unknown)`.
+
 The server stores up to four distinct keys per crate identity under
 `$SCCACHE_DIR/explain` as it writes cache entries. This history survives a
 server restart, and existing cache hits do not populate it. Keep the log
