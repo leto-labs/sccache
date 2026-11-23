@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a weekly stage-0 report from the local runner's JSONL logs."""
+"""Summarize the local runner's shadow and stage 1 JSONL logs."""
 
 import argparse
 from collections import Counter, defaultdict
@@ -76,8 +76,56 @@ def count_hit(totals, category, row):
     totals["would_be"][category]["seconds"] += row["duration_ns"] / NS
 
 
+def stage_one(rows):
+    groups = defaultdict(list)
+    quarantines = {}
+    for row in rows:
+        cache = row["cache"]
+        groups[(cache["mode"], row["project"], row["worktree"], row["run_id"])].append(row)
+        if cache.get("quarantined"):
+            quarantines[identity(row)] = row
+    runs = []
+    totals = Counter({key: 0 for key in (
+        "passed", "replayed", "verified", "mismatches", "cancelled", "quarantined_runs"
+    )})
+    for (mode, project, worktree, run_id), invocations in groups.items():
+        final = {identity(row): row for row in invocations}
+        counts = {
+            "passed": sum(row["outcome"] == {"exit": 0} for row in final.values()),
+            "replayed": sum(row["cache"]["action"] == "replayed" for row in final.values()),
+            "verified": sum(row["cache"].get("verification") == "matched" for row in invocations),
+            "mismatches": sum(row["cache"].get("verification") == "mismatch" for row in invocations),
+            "cancelled": sum(row["cache"].get("verification") == "cancelled" for row in invocations),
+            "quarantined_runs": sum(bool(row["cache"].get("quarantined")) for row in invocations),
+        }
+        totals.update(counts)
+        runs.append({
+            **counts, "mode": mode, "project": project, "worktree": worktree, "run_id": run_id,
+            "time_ns": invocations[-1]["time_ns"],
+        })
+    return {
+        "totals": dict(totals), "runs": sorted(runs, key=lambda row: row["time_ns"]),
+        "quarantine": [
+            {"project": project, "binary_id": binary_id, "test": test, "run_id": row["run_id"],
+             "time_ns": row["time_ns"]}
+            for (project, binary_id, test), row in sorted(quarantines.items())
+        ],
+    }
+
+
+def gate_summary(run):
+    summary = (f"{run['passed']:,} passed ({run['replayed']:,} replayed, "
+               f"{run['verified']:,} verified by rerun)")
+    if run["mismatches"]:
+        noun = "mismatch" if run["mismatches"] == 1 else "mismatches"
+        summary += f", {run['mismatches']:,} verification {noun}"
+    return summary
+
+
 def aggregate(rows, start, end, known_flakes=(), benchmark=None):
     rows = sorted((row for row in rows if row["time_ns"] < end), key=lambda row: row["time_ns"])
+    stage = stage_one(row for row in rows if "cache" in row and row["time_ns"] >= start)
+    rows = [row for row in rows if "cache" not in row]
     classes = defaultdict(Counter)
     recent_classes = defaultdict(set)
     for row in rows:
@@ -173,6 +221,7 @@ def aggregate(rows, start, end, known_flakes=(), benchmark=None):
         "projects": projects,
         "tests": [value for _, value in sorted(tests.items())],
         "mismatches": list(mismatches.values()), "benchmark": measurements(benchmark),
+        "stage1": stage,
     }
 
 
@@ -184,7 +233,7 @@ def rebuild_totals(counts):
 
 
 FIELDS = ("time_ns", "key", "binary", "worktree", "run_id", "mtime", "digest", "duration_ns", "setup_ns",
-          "outcome", "project", "binary_id", "test", "attempt", "stress")
+          "outcome", "project", "binary_id", "test", "attempt", "stress", "cache")
 
 
 def ancestors(path):
@@ -232,7 +281,11 @@ def select_logs(directory, kind, first_day, last_day, max_bytes):
     whether older data was left out.
     """
     chosen, budget, truncated = [], max_bytes, False
-    paths = sorted((directory / kind).glob("*.jsonl"), reverse=True)
+    directories = (directory,) if isinstance(directory, Path) else directory
+    paths = sorted(
+        (path for root in directories for path in (root / kind).glob("*.jsonl")),
+        key=lambda path: path.name, reverse=True,
+    )
     for path in paths:
         if not first_day <= path.stem <= last_day:
             continue
@@ -306,6 +359,15 @@ def markdown(week, report):
                      f"{row['outcome']} · {row['classification']} ({row['count']:,}).")
     if len(mismatches) > 20:
         lines.append(f"- {len(mismatches) - 20:,} more in the JSON.")
+    stage = report["stage1"]
+    if stage["runs"]:
+        lines += ["", "## Stage 1", "", gate_summary(stage["totals"]) + ".",
+                  f"{stage['totals']['cancelled']:,} cancelled verifications. "
+                  f"{len(stage['quarantine']):,} test identities encountered in quarantine."]
+        for row in stage["quarantine"][:20]:
+            test_name = table_text(row["test"]).replace(chr(96), "")
+            lines.append(f"- {table_text(row['project'])} / {table_text(row['binary_id'])} / "
+                         f"`{test_name}`.")
     lines += ["", "## Overhead", ""]
     if benchmark := report["benchmark"]:
         reference = benchmark["gate_budget_reference_s"]
@@ -351,14 +413,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     now = datetime.now(timezone.utc)
     parser.add_argument("--week", default=now.strftime("%G-W%V"), help="UTC ISO week, e.g. 2026-W47")
-    parser.add_argument("--store", type=Path, default=Path(os.environ.get(
-        "LETO_TEST_CACHE_DIR", Path.home() / ".cache/leto-test-results/v0")))
+    parser.add_argument("--store", type=Path, help="read only this store")
+    parser.add_argument("--gate-summary", action="store_true", help="print a single gate run's summary")
+    parser.add_argument("--run-id", help="select this nextest run for --gate-summary")
+    parser.add_argument("--worktree", type=Path, help="select this worktree for --gate-summary")
     parser.add_argument("--output", type=Path, default=Path.home() / "data/core/test-cache")
     parser.add_argument("--known-flakes", type=Path, help="JSON array of project, binary_id and test objects")
     parser.add_argument("--benchmark", type=Path, help="JSON containing gate_budget_reference_s and runs (mode, wall_s)")
     parser.add_argument("--max-bytes", type=int, default=256 << 20,
                         help="read at most this many log bytes, newest first (default 256 MiB)")
     options = parser.parse_args()
+    base = Path.home() / ".cache/leto-test-results"
+    override = options.store or os.environ.get("LETO_TEST_CACHE_DIR")
+    stores = (Path(override),) if override else (base / "v0", base / "v1")
+    if options.gate_summary and not override:
+        stores = (base / "v1",)
     year, week = options.week.split("-W")
     monday = date.fromisocalendar(int(year), int(week), 1)
     monday = datetime.combine(monday, datetime.min.time(), timezone.utc)
@@ -369,10 +438,25 @@ def main():
     # The purity history reaches one week back from the report week.
     first_day = (monday - timedelta(days=7)).date().isoformat()
     last_day = (monday + timedelta(days=6)).date().isoformat()
-    runs, truncated = select_logs(options.store, "runs", first_day, last_day, options.max_bytes)
+    runs, truncated = select_logs(stores, "runs", first_day, last_day, options.max_bytes)
     read = {}
+    if options.gate_summary:
+        worktree = str(options.worktree.resolve()) if options.worktree else None
+        rows = sorted(
+            (row for row in logs(runs, "runs", read)
+             if row.get("cache", {}).get("mode") == "gate"
+             and (options.run_id is None or row["run_id"] == options.run_id)
+             and (worktree is None or row["worktree"] == worktree)),
+            key=lambda row: row["time_ns"],
+        )
+        summaries = stage_one(rows)["runs"]
+        if not summaries:
+            parser.exit(1, "No matching gate run in the test cache event log.\n")
+        run = summaries[-1]
+        print(gate_summary(run))
+        return int(run["mismatches"] > 0)
     report = aggregate(logs(runs, "runs", read), start, end, known, benchmark)
-    errors, _ = select_logs(options.store, "errors", first_day, last_day, 16 << 20)
+    errors, _ = select_logs(stores, "errors", first_day, last_day, 16 << 20)
     report["runner_errors"] = sum(start <= row["time_ns"] < end for row in logs(errors, "errors"))
     report["input"] = {"bytes_read": read.get("bytes_read", 0), "max_bytes": options.max_bytes,
                        "truncated": truncated, "first_file": runs[0][0].name if runs else None}
@@ -382,4 +466,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

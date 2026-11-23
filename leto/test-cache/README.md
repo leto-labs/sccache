@@ -1,6 +1,6 @@
-# Leto test cache shadow runner
+# Leto test cache runner
 
-Stage 0 records which nextest test results might be reusable. Every test runs
+The default mode, `shadow`, records which nextest test results might be reusable. Every test runs
 once per nextest invocation as usual, including on repeated keys and on retries.
 The runner inherits the test's arguments, environment, working directory,
 process group and standard streams. There is no sandbox policy, output capture,
@@ -22,23 +22,66 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$runner" cargo nextest run
 
 | Variable | Purpose |
 |---|---|
-| `LETO_TEST_CACHE=off` | Direct exec for all invocations. |
-| `LETO_TEST_CACHE_DIR` | Host store. Defaults to `~/.cache/leto-test-results/v0`. |
+| `LETO_TEST_CACHE` | `shadow` (default), `off` (direct exec), `replay` (read results), or `gate` (read, verify and store results). |
+| `LETO_TEST_CACHE_DIR` | Host store override for the selected mode. Use separate directories for shadow and stage 1. |
 | `LETO_TEST_CACHE_OBSERVE` | Positive sampling interval in UTC days per key. Defaults to 5. Set 1 to observe every invocation. |
 | `LETO_TEST_CACHE_PROJECT` | Stable report name for a project across worktrees. Defaults to the worktree's directory name. |
 | `LETO_TEST_CACHE_WORKSPACE` | Absolute worktree root when nextest omits `NEXTEST_WORKSPACE_ROOT`. The current directory is the final fallback. |
 | `LETO_TEST_CACHE_ENV` | Comma-separated additional keyed names and prefix patterns ending in `*`. Values enter only the key hash; records, error logs, the digest memo and reports never contain them (`keyed_env_values_never_reach_records_errors_or_reports`). Paths a test opens or probes are recorded as paths, so a secret embedded in a file path the test touches would appear. |
 | `SCCACHE_BASEDIRS` | Colon-separated absolute roots for key normalisation in addition to the worktree. The longest matching path prefix wins. |
 
-The key includes the binary and resolved shared-library closure, exact argument
+The shadow key includes the binary and resolved shared-library closure, exact argument
 bytes, observer profile, kernel and architecture. The environment portion
 includes `CARGO_PKG_*`, `LANG`, `LC_*`, `TZ`, `RUST_*`, `PROPTEST_*` and
 configured names. It uses relative manifest and workspace paths and includes
 the original manifest path length. `TMPDIR`, runner configuration and the
-other nextest variables are excluded from the key. The child sees all original
-values.
+other nextest variables are excluded from the key. In shadow mode the child
+sees all original values.
 
-## Observation
+## Stage 1
+
+`LETO_TEST_CACHE=replay` reads passes written by gate mode and runs misses
+normally. It writes invocation records and leaves result files, digest memos
+and quarantine unchanged. `LETO_TEST_CACHE=gate` can also store new passes
+and records negative entries for impurity. Both modes bypass caching on
+retries, stress runs and instrumented invocations with `LLVM_PROFILE_FILE`.
+
+Gate uses the shadow key plus the sandbox profile digest. To store a pass it
+runs the test with Landlock, seccomp and the observer. The test sees the keyed
+environment and a fresh writable `TMPDIR`. File reads are restricted to the
+test executable, its shared libraries and fixed system paths. The observer
+checks metadata probes and denials. If a sandboxed run fails or has impure
+evidence, gate reruns it with the original environment and reports that result.
+A passing fallback records an impure entry. A failing fallback records only
+the invocation. Gate logs and runs tests normally if Landlock ABI 6 or newer
+or the observer is unavailable.
+
+Gate verifies the first 20 hits in each nextest run (or all hits when there
+are fewer), then selects each remaining hit with a deterministic 5% sample
+based on the run ID and cache key. It compares the uncached exit status,
+stdout and stderr, ignoring the elapsed time in libtest's final summary.
+A mismatch fails the test, deletes the entry and quarantines the project,
+binary ID and test name for 30 days. Use the same project name in each
+worktree to share quarantine state.
+
+Stage 1 stores results under `~/.cache/leto-test-results/v1/<prefix>/<key>`.
+Entries expire after seven days. Each of the 256 shards evicts its oldest
+entries at 4 MiB for a total result capacity of 1 GiB. Output over 1 MiB
+is ineligible for storage. Captured output is authenticated and encrypted
+with a key derived from the keyed environment so its values do not appear
+in plaintext even when a test prints them.
+
+After a gate, print the split for its nextest run:
+
+```sh
+python3 report.py --gate-summary --run-id "$run_id"
+```
+
+Use `--worktree "$PWD"` to select the latest gate recorded for that worktree.
+The command exits nonzero if the selected run has a verification mismatch or
+if it cannot find a matching run.
+
+## Shadow observation
 
 A key has one assigned observation day per sampling period. Traced runs use
 ptrace with a seccomp trace filter on filesystem, socket and process calls.
@@ -66,7 +109,9 @@ incompatible with observation. Use the logged verdicts as evidence for review.
 The observer has finite syscall coverage and the key omits inputs such as
 time and ambient variables outside the configured names.
 
-## Host store
+## Shadow store
+
+Shadow uses `~/.cache/leto-test-results/v0`.
 
 - `digests/` contains atomic BLAKE3 memo entries keyed by device, inode,
   size, mtime and ctime. A file touched within two seconds is rehashed and
@@ -88,7 +133,8 @@ python3 report.py --week 2026-W47 --store /path/to/measurement/store \
   --benchmark /path/to/benchmark.json
 ```
 
-By default the report writes `~/data/core/test-cache/<ISO week>.{json,md}`
+By default the report reads both host stores, writes
+`~/data/core/test-cache/<ISO week>.{json,md}`
 and updates the `latest.json` and `latest.md` symlinks. It derives prior
 outcomes and compares the first binary stamp seen in each nextest run.
 It counts hypothetical stage 1 passes with stable pure evidence and
@@ -97,6 +143,8 @@ Eligibility also requires a matching first-attempt pass within seven days.
 File candidates would require manifest verification in stage 2. Test
 seconds are sums of recorded process durations and may overlap. Cumulative
 setup time is reported separately from paired wall-time measurements.
+The Stage 1 section counts actual replays, verification results and
+quarantined identities encountered during the report week.
 
 Pass `--known-flakes` a JSON list of objects with `project`, `binary_id`
 and `test` to label known flakes. Other outcome mismatches require

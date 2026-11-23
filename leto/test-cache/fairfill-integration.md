@@ -41,3 +41,16 @@ FairFill pins the runner path in two files, and both must change together:
 - `scripts/test_cargo_wrapper.py`, whose `TestCacheRunnerTests` build a fake home with the same versioned path.
 
 Send both changes in one message. The 4c75a082 bump (2026-11-22) failed 2 of those tests until the second file was updated.
+
+Once both pins point to a stage 1 runner, add one export to the FairFill job
+before it invokes `scripts/cargo.sh` or `scripts/check.sh`:
+
+```sh
+export LETO_TEST_CACHE=replay  # focused nextest runs
+export LETO_TEST_CACHE=gate    # lane gates
+```
+
+Use one export per job. Leaving the variable unset selects shadow mode.
+Append the gate summary to the job log with
+`python3 /path/to/report.py --gate-summary --run-id "$run_id"`, using the
+run ID printed by nextest.

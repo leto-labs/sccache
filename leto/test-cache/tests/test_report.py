@@ -1,6 +1,8 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -11,6 +13,41 @@ spec.loader.exec_module(report)
 
 
 class ReportTest(unittest.TestCase):
+    def test_stage_one_counts_and_gate_summary(self):
+        base = {"project": "toy", "worktree": "/toy", "binary_id": "toy", "run_id": "gate-id"}
+        rows = [
+            {**base, "test": test, "time_ns": time, "outcome": {"exit": exit_code},
+             "cache": {"mode": "gate", "action": action, "verification": verification,
+                       "quarantined": quarantined}}
+            for time, test, exit_code, action, verification, quarantined in [
+                (1, "replayed", 0, "replayed", None, False),
+                (2, "verified", 0, "verified", "matched", False),
+                (3, "stored", 0, "stored", None, False),
+                (4, "bad", 125, "quarantined", "mismatch", True),
+                (5, "bad", 125, "quarantined", None, True),
+                (6, "cancelled", 15, "miss", "cancelled", False),
+            ]
+        ]
+        stage = report.aggregate(map(report.slim, rows), 0, 7)["stage1"]
+        run, = stage["runs"]
+        self.assertEqual(report.gate_summary(run),
+                         "3 passed (1 replayed, 1 verified by rerun), 1 verification mismatch")
+        self.assertEqual(run["cancelled"], 1)
+        self.assertEqual(run["quarantined_runs"], 2)
+        self.assertEqual([row["test"] for row in stage["quarantine"]], ["bad"])
+        with tempfile.TemporaryDirectory() as temp:
+            store = Path(temp)
+            (store / "runs").mkdir()
+            log = store / "runs/2026-11-19.jsonl"
+            log.write_text("".join(json.dumps(row) + "\n" for row in rows))
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "report.py"), "--week", "2026-W47",
+                 "--store", str(store), "--gate-summary", "--run-id", "gate-id"],
+                check=False, capture_output=True, text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertEqual(result.stdout.strip(), report.gate_summary(run))
+
     def test_checkout_ancestor_lookups_stay_pure(self):
         row = {"worktree": "/home/u/.t3/worktrees/p/lane"}
         lookups = {"class": "other", "reason": "read outside checkout and allowed system paths",
