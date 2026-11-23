@@ -4,9 +4,9 @@
 project's `scripts/cargo.sh`. It fetches from that checkout into a dedicated
 shared clone with a detached HEAD. The canonical checkout is read-only. Each
 project has a lock, a last-successful commit marker, a log, and a status file
-under `~/.cache/leto-maintenance/prewarm/<project>/`. Failed or deferred builds
-are retried on the next trigger. The runner records a commit only after every
-configured Cargo command succeeds.
+under `~/.cache/leto-maintenance/prewarm/<project>/`. A failed tip backs off
+before retrying. A deferred build remains eligible on the next trigger. The
+runner records a commit only after every configured Cargo command succeeds.
 See [the proposed fleet settings](proposed-confs.md) for project command lists
 and their sizing estimates.
 
@@ -74,6 +74,8 @@ and `SCCACHE_SERVER_AUTOSTART=false` for warming. The config and cache roots hon
 | `PREWARM_BRANCH` | `main`. Local branch to warm. |
 | `PREWARM_COMMANDS` | `check --workspace --all-targets;test --workspace --no-run`. Semicolon-separated Cargo argument lists in priority order, highest first. Each begins with a subcommand that accepts `-j`, which the runner supplies. |
 | `PREWARM_COMMAND_TIMEOUTS` | `900`. Wall seconds per command, including pauses. Use one positive value for every command or a semicolon-separated value for each entry in `PREWARM_COMMANDS`. |
+| `PREWARM_BACKOFF_MAX_MINUTES` | `120`. Maximum retry delay for consecutive failures at the same tip. The delay starts at seven minutes and doubles after each failure. |
+| `PREWARM_TARGET_MAX_GIB` | `200`. Combined allocated GiB limit for Cargo's target and build directories after a successful warm. Set to `0` to disable automatic cleanup. |
 | `PREWARM_MEMORY_MAX` | `8G`. Hard cap on each Cargo command and its descendants, with swap disabled. Accepts positive bytes or a size with a systemd suffix (`K`, `M`, `G`, `T`). |
 | `PREWARM_JOBS` | A quarter of the CPUs in the runner's affinity, rounded down with a minimum of one. |
 | `PREWARM_MIN_SPARE_CPUS` | `8`. Minimum host-wide spare logical CPUs after accounting for the runner's own usage. |
@@ -90,8 +92,9 @@ and `SCCACHE_SERVER_AUTOSTART=false` for warming. The config and cache roots hon
 
 Match the lane's toolchain, client settings, Rust flags, and Cargo profiles.
 The runner leaves Rust flags, incremental settings, and build paths to Cargo
-and the project wrapper. Keep build paths local to the checkout. If the
-checkout's `.cargo/config.toml` has an `[env]` entry for `SCCACHE_BASEDIRS`,
+and the project wrapper. Set checkout-local build paths in Cargo config or the
+wrapper's environment so its `cargo metadata` reports the paths used to build.
+If the checkout's `.cargo/config.toml` has an `[env]` entry for `SCCACHE_BASEDIRS`,
 Cargo applies it. Otherwise the runner exports the dedicated checkout's path.
 For a project such as Longbow, put
 `LONGBOW_SCCACHE_BIN` and other lane-specific environment in its `.conf`.
@@ -146,8 +149,9 @@ host-wide totals. Adjust `PREWARM_JOBS` for the runner's affinity on either
 host, and raise the memory threshold if lane builds need more headroom.
 The gate runs before each command. When the host becomes busy between
 commands, the runner defers the rest of the attempt. The pause allowance
-applies across all commands in an attempt. A command timeout, pause timeout,
-or scope OOM ends the attempt and leaves the commit eligible for retry.
+applies across all commands in an attempt. Running out of pause allowance
+defers the attempt. A command timeout or scope OOM counts as a failure.
+A new tip or a successful warm clears the previous failure streak.
 
 Pre-warm requires client-side compilation. Cargo's sccache clients run the
 compiler as their own child process and use the shared daemon as a cache
@@ -176,11 +180,23 @@ compile requests, hits, misses, and writes. These are shared-server counters,
 so concurrent lanes also contribute to them. `status.json` records the latest
 attempt, the last successfully warmed commit, per-command budgets and
 results, timings, and disk use. It records `oom` for a scope OOM kill and
-`timed_out` for a command that runs out of time. Check
+`timed_out` for a command that runs out of time. For a failed tip, it keeps
+the failure count, next retry time, and last error across triggers. The error
+includes the command and the last non-empty line from its 64 KiB stderr tail,
+or the runner's failure message when stderr is empty. Check
 both files to confirm a merge warmed, then compare hits and build time for
 the same commands in a fresh lane. Existing incremental sessions can bypass
 the cache or skip cache writes, and some crate types are uncacheable. The
-checkout keeps its build output by default to speed subsequent warm-ups.
+checkout keeps its build output below the cap to speed subsequent warm-ups.
+
+After every successful warm with a cap enabled, an idle-priority disk scan
+measures Cargo's output directories with a 30-second budget. Going over the
+cap or timing out triggers a full clean. This removes Cargo's fingerprints
+along with their artifacts and keeps even a single oversized build from
+accumulating output. The next tip can restore cacheable outputs from the
+shared cache and rebuild the rest. The runner records allocated bytes before
+and after, the paths removed, and any cleanup error under `target_prune` in
+`status.json`.
 
 Disk reports include apparent and allocated bytes for the whole clone and
 break out `target/` from the rest of the checkout. Any other checkout-local

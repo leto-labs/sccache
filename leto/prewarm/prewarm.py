@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import math
 import os
 from pathlib import Path
 import re
+import selectors
 import shlex
 import shutil
 import signal
@@ -20,6 +21,11 @@ from uuid import uuid4
 
 DEFAULT_COMMANDS = "check --workspace --all-targets;test --workspace --no-run"
 CARGO = ["bash", "scripts/cargo.sh"]
+GIB = 1024 ** 3
+BACKOFF_BASE_MINUTES = 7
+STDERR_TAIL_BYTES = 64 * 1024
+DISK_SCAN_SECONDS = 30
+PAUSE_LIMIT = "maximum pause time reached; retrying on the next trigger"
 
 
 class PrewarmError(Exception):
@@ -343,6 +349,42 @@ def stop_scope(unit, env, log):
     return result
 
 
+class BuildStderr:
+    def __init__(self, pipe, selector, log):
+        self.pipe = pipe
+        self.selector = selector
+        self.log = log
+        self.tail = bytearray()
+        selector.register(pipe, selectors.EVENT_READ)
+
+    def read(self):
+        data = os.read(self.pipe.fileno(), STDERR_TAIL_BYTES)
+        if not data:
+            return False
+        self.log.buffer.write(data)
+        self.log.buffer.flush()
+        self.tail.extend(data)
+        del self.tail[:-STDERR_TAIL_BYTES]
+        return True
+
+    def wait(self, process, timeout):
+        deadline = time.monotonic() + timeout
+        while remaining := max(0, deadline - time.monotonic()):
+            # A descendant may still hold stderr open after the command exits.
+            if not self.selector.select(0 if process.poll() is not None else remaining):
+                break
+            if not self.read():
+                return process.wait(timeout=max(0, deadline - time.monotonic()))
+        return process.wait(timeout=0)
+
+    def finish(self):
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline and self.selector.select(0) and self.read():
+            pass
+        return next((line.strip() for line in reversed(self.tail.decode(errors="replace").splitlines())
+                     if line.strip()), None)
+
+
 def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, log, interrupted):
     command = [*CARGO, *args]
     entry = {"command": shlex.join(command), "budget_seconds": budget, "result": "failed"}
@@ -362,8 +404,10 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
     cpu_streak_since = None
     try:
         previous = gate.cpu_sample(build_running=True)
-        with subprocess.Popen([*scope, *command], cwd=checkout, env=env, stdout=log,
-                              stderr=subprocess.STDOUT, start_new_session=True) as process:
+        with (selectors.DefaultSelector() as selector,
+              subprocess.Popen([*scope, *command], cwd=checkout, env=env, stdout=log,
+                               stderr=subprocess.PIPE, start_new_session=True) as process):
+            stderr = BuildStderr(process.stderr, selector, log)
             try:
                 while True:
                     interrupted()
@@ -374,10 +418,10 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
                     if paused_at is not None:
                         remaining = pause_budget - status["paused_seconds"] - (time.monotonic() - paused_at)
                         if remaining <= 0:
-                            raise PrewarmError("maximum pause time reached; retrying on the next trigger")
+                            raise PrewarmError(PAUSE_LIMIT, "deferred")
                         timeout = min(timeout, remaining)
                     try:
-                        code = process.wait(timeout=timeout)
+                        code = stderr.wait(process, timeout)
                     except subprocess.TimeoutExpired:
                         lock = gate.lock_blocker()
                         if lock is not None and paused_at is None:
@@ -396,7 +440,7 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
                                 status["paused_seconds"] += time.monotonic() - paused_at
                                 paused_at = None
                                 if status["paused_seconds"] >= pause_budget:
-                                    raise PrewarmError("maximum pause time reached; retrying on the next trigger")
+                                    raise PrewarmError(PAUSE_LIMIT, "deferred")
                                 signal_group(process, signal.SIGCONT)
                                 previous = gate.cpu_sample(build_running=True)
                                 log_event(log, f"resumed pid={process.pid}: pause locks free")
@@ -426,7 +470,7 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
                             status["paused_seconds"] += time.monotonic() - paused_at
                             if status["paused_seconds"] >= pause_budget:
                                 paused_at = None
-                                raise PrewarmError("maximum pause time reached; retrying on the next trigger")
+                                raise PrewarmError(PAUSE_LIMIT, "deferred")
                             signal_group(process, signal.SIGCONT)
                             paused_at = None
                             cpu_streak_since = None
@@ -440,7 +484,10 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
                 if process.returncode is None:
                     signal_group(process, signal.SIGKILL)
                     process.wait()
-                scope_result = stop_scope(unit, env, log)
+                try:
+                    scope_result = stop_scope(unit, env, log)
+                finally:
+                    entry["stderr"] = stderr.finish()
                 if scope_result == "oom-kill":
                     raise PrewarmError(f"command scope OOM kill (MemoryMax={memory_max})", "oom")
                 if scope_result == "timeout":
@@ -450,6 +497,8 @@ def build(checkout, args, env, gate, budget, memory_max, pause_budget, status, l
         entry["result"] = error.result
         raise
     finally:
+        if entry["result"] not in ("failed", "timed_out", "oom"):
+            entry.pop("stderr", None)
         now = time.monotonic()
         if paused_at is not None:
             status["paused_seconds"] += now - paused_at
@@ -474,17 +523,58 @@ def stats_snapshot(checkout, env, settings):
     }
 
 
-def clean_checkout(checkout, env):
+def output_dirs(checkout, env, log):
     metadata = json.loads(capture([*CARGO, "metadata", "--offline", "--no-deps", "--format-version", "1"],
-                                  cwd=checkout, env=env))
+                                  cwd=checkout, env=env, stderr=log, timeout=DISK_SCAN_SECONDS))
     dirs = {Path(metadata[key]).resolve() for key in ("target_directory", "build_directory")
             if metadata.get(key)}
     for directory in dirs:
-        if directory == checkout or not directory.is_relative_to(checkout):
-            raise PrewarmError(f"refusing to clean an output path outside the dedicated checkout: {directory}")
-    for directory in sorted(dirs):
+        if (directory == checkout or not directory.is_relative_to(checkout)
+                or directory.is_relative_to(checkout / ".git")):
+            raise PrewarmError(f"refusing to clean an unsafe output path: {directory}")
+    return sorted(directory for directory in dirs if dirs.isdisjoint(directory.parents))
+
+
+def clean_checkout(checkout, dirs, pruned, log):
+    for directory in dirs:
+        if git(checkout, "ls-files", "-z", "--", str(directory), log=log):
+            raise PrewarmError(f"refusing to clean an output path containing tracked files: {directory}")
+    for directory in dirs:
         if directory.exists():
             shutil.rmtree(directory)
+            pruned.append(str(directory.relative_to(checkout)))
+
+
+def output_size(dirs, log):
+    paths = [path for path in dirs if path.exists()]
+    if not paths:
+        return 0
+    try:
+        output = capture(["timeout", "--kill-after=1", str(DISK_SCAN_SECONDS),
+                          "du", "--null", "--summarize", "--total", "--block-size=1", "--", *paths],
+                         stderr=log)
+    except subprocess.CalledProcessError as error:
+        if error.returncode in (124, 137):
+            return None
+        raise
+    return int(output.rstrip("\0").rsplit("\0", 1)[-1].split("\t", 1)[0])
+
+
+def cap_output(checkout, env, cap_bytes, status, log):
+    report = {"cap_bytes": cap_bytes, "before_bytes": None, "after_bytes": None, "pruned": []}
+    status["target_prune"] = report
+    try:
+        dirs = output_dirs(checkout, env, log)
+        size = report["before_bytes"] = output_size(dirs, log)
+        if size is None or size > cap_bytes:
+            report["reason"] = "measurement_timeout" if size is None else "over_cap"
+            clean_checkout(checkout, dirs, report["pruned"], log)
+            report["after_bytes"] = output_size(dirs, log)
+        else:
+            report["after_bytes"] = size
+    except (PrewarmError, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+        report["error"] = str(error)
+    log_event(log, f"target cap {json.dumps(report)}")
 
 
 def disk_usage(checkout):
@@ -493,7 +583,7 @@ def disk_usage(checkout):
         total = target = 0
         if checkout.exists():
             output = capture(["du", "--null", "--block-size=1", "--max-depth=1", *flags, "."],
-                             cwd=checkout)
+                             cwd=checkout, timeout=DISK_SCAN_SECONDS)
             counts = {}
             for entry in output.rstrip("\0").split("\0"):
                 size, path = entry.split("\t", 1)
@@ -506,7 +596,8 @@ def disk_usage(checkout):
     if checkout.exists() and capture(["stat", "-f", "-c", "%T", "."], cwd=checkout).strip() == "btrfs":
         for command in (["compsize", "-b", "."], ["sudo", "-n", "compsize", "-b", "."]):
             try:
-                sizes["compsize"] = capture(command, cwd=checkout, stderr=subprocess.DEVNULL).strip()
+                sizes["compsize"] = capture(command, cwd=checkout, stderr=subprocess.DEVNULL,
+                                            timeout=DISK_SCAN_SECONDS).strip()
             except (OSError, subprocess.SubprocessError):
                 continue
             break
@@ -519,7 +610,55 @@ def write_atomic(path, data):
     temporary.replace(path)
 
 
-def prewarm(checkout, marker, settings, status, log, interrupted):
+def reset_backoff(status):
+    status.update(failures=0, failed_tip=None, next_attempt_after=None, last_error=None)
+
+
+def load_backoff(path, status, log):
+    try:
+        previous = json.loads(path.read_text())
+        failures = previous.get("failures", 0)
+        if not failures:
+            return
+        retry = datetime.fromisoformat(previous["next_attempt_after"])
+        if (type(failures) is not int or failures < 1 or retry.tzinfo is None
+                or not re.fullmatch(r"[a-f0-9]{40}|[a-f0-9]{64}", previous["failed_tip"])):
+            raise ValueError("invalid retry state")
+        status.update({key: previous[key] for key in ("failures", "failed_tip", "next_attempt_after", "last_error")})
+    except FileNotFoundError:
+        pass
+    except (OSError, AttributeError, TypeError, ValueError, KeyError) as error:
+        log_event(log, f"retry state unavailable: {error}")
+
+
+def pending_result(tip, status, log):
+    status["tip_commit"] = tip
+    if tip != status["failed_tip"]:
+        reset_backoff(status)
+    if tip == status["last_warmed_commit"]:
+        reset_backoff(status)
+        log_event(log, f"already warmed {tip}")
+        return "unchanged"
+    retry = status["next_attempt_after"]
+    if retry and datetime.now(timezone.utc) < datetime.fromisoformat(retry):
+        log_event(log, f"backoff at {tip} after {status['failures']} failure(s), next attempt at {retry}")
+        return "backoff"
+    return None
+
+
+def record_failure(status, error, max_minutes):
+    failures = status["failures"] + 1
+    delay = min(max_minutes, BACKOFF_BASE_MINUTES << min(failures - 1, max_minutes.bit_length()))
+    retry = datetime.now(timezone.utc) + timedelta(minutes=delay)
+    command = status["commands"][-1] if status["commands"] else {}
+    if command.get("result") == "succeeded":
+        command = {}
+    status.update(failures=failures, failed_tip=status["tip_commit"],
+                  next_attempt_after=retry.isoformat(timespec="seconds"),
+                  last_error={"command": command.get("command"), "line": command.get("stderr") or str(error)})
+
+
+def prewarm(checkout, marker, settings, cap_bytes, status, log, interrupted):
     repo = Path(settings["PREWARM_REPO"]).expanduser().resolve(strict=True)
     ref = f"refs/heads/{settings.get('PREWARM_BRANCH', 'main')}"
     if not repo.is_dir() or repo == checkout or repo.is_relative_to(checkout):
@@ -527,10 +666,8 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
 
     git(repo, "check-ref-format", ref, log=log)
     tip = git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}", log=log)
-    status["tip_commit"] = tip
-    if tip == status["last_warmed_commit"]:
-        log_event(log, f"already warmed {tip}")
-        return "unchanged"
+    if result := pending_result(tip, status, log):
+        return result
 
     cpus = len(os.sched_getaffinity(0))
     jobs = int(settings.get("PREWARM_JOBS", max(1, cpus // 4)))
@@ -545,11 +682,12 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
         log_event(log, f"deferred {tip}: {reason}")
         return "deferred"
 
-    tip = prepare_checkout(repo, checkout, ref, log)
-    status["tip_commit"] = tip
-    if tip == status["last_warmed_commit"]:
-        log_event(log, f"already warmed {tip}")
-        return "unchanged"
+    ensure_compression(checkout.parent, settings.get("PREWARM_COMPRESSION", "zstd:1"), log)
+    fetched_tip = prepare_checkout(repo, checkout, ref, log)
+    if fetched_tip != tip:
+        tip = fetched_tip
+        if result := pending_result(tip, status, log):
+            return result
 
     env = cargo_env(checkout, settings)
     env.update(SCCACHE_CLIENT_SIDE="required", SCCACHE_SERVER_AUTOSTART="false")
@@ -572,8 +710,11 @@ def prewarm(checkout, marker, settings, status, log, interrupted):
             args[job_position:job_position] = ["-j", str(jobs)]
             build(checkout, args, env, gate, budget, memory_max, pause_budget, status, log, interrupted)
         interrupted()
+        if cap_bytes:
+            cap_output(checkout, env, cap_bytes, status, log)
         write_atomic(marker, f"{tip}\n")
         status["last_warmed_commit"] = tip
+        reset_backoff(status)
         return "warmed"
     finally:
         try:
@@ -600,6 +741,7 @@ def run(project, clean):
     state.mkdir(parents=True, exist_ok=True)
     checkout = state / "checkout"
     marker = state / "last-warmed"
+    status_path = state / "status.json"
     stop_signal = None
 
     def request_stop(signum, _frame):
@@ -623,36 +765,49 @@ def run(project, clean):
         started = time.monotonic()
         status = {"result": "failed", "tip_commit": None, "last_warmed_commit": None,
                   "build_seconds": 0.0, "paused_seconds": 0.0, "commands": [], "disk": None}
+        reset_backoff(status)
+        load_backoff(status_path, status, log)
+        backoff_max = None
         try:
             status["last_warmed_commit"] = marker.read_text().strip() if marker.exists() else None
             validate_checkout(checkout)
             config = read_config(configdir / "leto-prewarm" / f"{project}.conf")
             settings = {**os.environ, **config}
-            ensure_compression(state, settings.get("PREWARM_COMPRESSION", "zstd:1"), log)
             if clean:
                 if checkout.exists():
-                    clean_checkout(checkout, cargo_env(checkout, settings))
+                    dirs = output_dirs(checkout, cargo_env(checkout, settings), log)
+                    clean_checkout(checkout, dirs, [], log)
                 status["result"] = "cleaned"
             else:
-                status["result"] = prewarm(checkout, marker, settings, status, log, interrupted)
+                cap = float(settings.get("PREWARM_TARGET_MAX_GIB", "200")) * GIB
+                if not math.isfinite(cap) or cap < 0:
+                    raise PrewarmError("PREWARM_TARGET_MAX_GIB must be finite and nonnegative")
+                backoff_max = int(settings.get("PREWARM_BACKOFF_MAX_MINUTES", "120"))
+                if backoff_max < 1:
+                    raise PrewarmError("PREWARM_BACKOFF_MAX_MINUTES must be a positive integer")
+                status["result"] = prewarm(checkout, marker, settings, math.ceil(cap), status, log, interrupted)
         except (PrewarmError, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
             if isinstance(error, PrewarmError):
                 status["result"] = error.result
-            status["error"] = str(error)
+            if status["result"] != "deferred":
+                status["error"] = str(error)
+                if status["tip_commit"] and backoff_max is not None and stop_signal is None:
+                    record_failure(status, error, backoff_max)
             log_event(log, f"{project}: {error}")
         finally:
-            try:
-                validate_checkout(checkout)
-                status["disk"] = disk_usage(checkout)
-            except (PrewarmError, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
-                log_event(log, f"disk usage unavailable: {error}")
-            else:
-                log_event(log, f"disk {json.dumps(status['disk'])}")
+            if status["result"] != "backoff":
+                try:
+                    validate_checkout(checkout)
+                    status["disk"] = disk_usage(checkout)
+                except (PrewarmError, OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+                    log_event(log, f"disk usage unavailable: {error}")
+                else:
+                    log_event(log, f"disk {json.dumps(status['disk'])}")
             status["finished_at"] = timestamp()
             status["duration_seconds"] = time.monotonic() - started
             for key in ("duration_seconds", "build_seconds", "paused_seconds"):
                 status[key] = round(status[key], 3)
-            write_atomic(state / "status.json", json.dumps(status, indent=2) + "\n")
+            write_atomic(status_path, json.dumps(status, indent=2) + "\n")
             log_event(log, f"{project}: {status['result']} tip={status['tip_commit']} "
                       f"last_warmed={status['last_warmed_commit']} in {status['duration_seconds']:.2f}s "
                       f"(build {status['build_seconds']:.2f}s, paused {status['paused_seconds']:.2f}s)")

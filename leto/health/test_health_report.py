@@ -287,6 +287,33 @@ class HealthReportTest(unittest.TestCase):
         self.assertGreater(prewarm["lag_minutes"], 180)
         self.assertFalse(any("over 3 hours" in warning for warning in report["warnings"]), report["warnings"])
 
+    def test_prewarm_backoff_reports_last_error_even_before_first_warm(self):
+        state = self.root / "prewarm" / "fairfill"
+        status_path = state / "status.json"
+        status = json.loads(status_path.read_text())
+        tip = "a" * 40
+        retry = "2026-10-10T12:28:00+00:00"
+        detail = "data-root guard rejected build " + "x" * 250
+        status.update(result="backoff", last_warmed_commit=None, failures=3,
+                      failed_tip=tip, next_attempt_after=retry,
+                      last_error={"command": "bash scripts/cargo.sh check -j 1", "line": detail})
+        status_path.write_text(json.dumps(status))
+
+        report = self.report()
+        warm = report["prewarm"]["fairfill"]
+        self.assertEqual((warm["failures"], warm["failed_tip"], warm["next_attempt_after"]), (3, tip, retry))
+        self.assertEqual(warm["last_error"], {"command": "bash scripts/cargo.sh check -j 1",
+                                             "line": detail[:199] + "…"})
+        self.assertIn(f"Pre-warm fairfill failing at {tip[:12]} (3 times, next try in 28 min): {detail[:199]}…",
+                      report["warnings"])
+        self.assertIn(f"| 3 | {tip[:12]} | {retry} | bash scripts/cargo.sh check -j 1 | {detail[:199]}… |",
+                      REPORT["markdown"](report))
+
+        status.update(result="failed", failures=1, next_attempt_after="2026-10-10T11:59:00+00:00")
+        status_path.write_text(json.dumps(status))
+        self.assertTrue(any("(1 time, retry due): data-root guard" in warning
+                            for warning in self.report()["warnings"]))
+
     def test_default_fast_mode_reads_only_bounded_sources(self):
         report = self.report("--miss-log-tail", "4096")
         self.assertEqual(report["mode"], "fast")

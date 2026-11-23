@@ -535,6 +535,23 @@ def read_dirs(path):
         return []
 
 
+def prewarm_failure(name, project, now):
+    failures = project["failures"]
+    tip = project["failed_tip"]
+    if type(failures) is not int or failures < 1 or not isinstance(tip, str):
+        return None
+    retry = timestamp(project["next_attempt_after"])
+    if retry is None:
+        next_try = ""
+    else:
+        minutes = math.ceil((retry - now).total_seconds() / 60)
+        next_try = f", next try in {minutes} min" if minutes > 0 else ", retry due"
+    error = project["last_error"]
+    line = f": {error['line']}" if error and error["line"] else ""
+    times = "time" if failures == 1 else "times"
+    return f"Pre-warm {name} failing at {tip[:12]} ({failures} {times}{next_try}){line}"
+
+
 def prewarm_report(args, now, warnings):
     projects = {}
     try:
@@ -543,21 +560,28 @@ def prewarm_report(args, now, warnings):
     except OSError as error:
         warnings.append(f"Cannot list pre-warm projects: {error}")
         return projects
+    status_keys = ("result", "last_warmed_commit", "duration_seconds", "paused_seconds", "disk",
+                   "failures", "failed_tip", "next_attempt_after")
     for name in sorted(names):
         state = args.prewarm_state / name
-        project = {"result": None, "last_warmed_commit": None, "branch": None,
-                   "lag_commits": None, "lag_minutes": None, "duration_seconds": None,
-                   "paused_seconds": None, "disk": None}
+        project = dict.fromkeys((*status_keys, "last_error", "branch", "lag_commits", "lag_minutes"))
         projects[name] = project
         try:
             status = json.loads((state / "status.json").read_bytes())
             if not isinstance(status, dict):
                 raise ValueError("expected a JSON object")
-            project.update({key: status.get(key) for key in ("result", "last_warmed_commit",
-                            "duration_seconds", "paused_seconds", "disk")})
+            project.update({key: status.get(key) for key in status_keys})
         except (OSError, ValueError) as error:
             warnings.append(f"Cannot read pre-warm status for {name}: {error}")
             continue
+
+        error = status.get("last_error")
+        if isinstance(error, dict) and isinstance(error.get("line"), str):
+            line = " ".join(error["line"].split())
+            project["last_error"] = {"command": error.get("command"),
+                                     "line": line if len(line) <= 200 else line[:199] + "…"}
+        if warning := prewarm_failure(name, project, now):
+            warnings.append(warning)
 
         warmed = status.get("last_warmed_commit")
         if not isinstance(warmed, str) or not re.fullmatch(r"[a-fA-F0-9]{7,64}", warmed):
@@ -844,10 +868,14 @@ def markdown(report):
                 ]),
                 "## Pre-warm",
                 table(["Project", "Result", "Warmed commit", "Commits behind", "Age (min)", "Duration (s)",
-                       "Paused (s)", "Checkout (allocated)"], [
+                       "Paused (s)", "Checkout (allocated)", "Failures", "Failed tip", "Next retry (UTC)",
+                       "Failed command", "Last error"], [
                     [name, entry["result"], entry["last_warmed_commit"], entry["lag_commits"], entry["lag_minutes"],
                      entry["duration_seconds"], entry["paused_seconds"],
-                     gib(((entry["disk"] or {}).get("checkout") or {}).get("allocated_bytes"))]
+                     gib(((entry["disk"] or {}).get("checkout") or {}).get("allocated_bytes")),
+                     entry.get("failures"), str(entry["failed_tip"])[:12] if entry.get("failed_tip") else None,
+                     entry.get("next_attempt_after"), (entry.get("last_error") or {}).get("command"),
+                     (entry.get("last_error") or {}).get("line")]
                     for name, entry in prewarm.items()
                 ]),
                 "## Incremental sessions",

@@ -158,8 +158,15 @@ cat >"$repo/scripts/cargo.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ! -v CARGO_MAKEFLAGS && ! -v MAKEFLAGS && ! -v MFLAGS ]]
+if [[ "$1" == metadata ]]; then exec cargo "$@"; fi
 printf '%s|%s|%s|%s\n' "$*" "${FIXTURE_EXTRA:-}" "${SCCACHE_BASEDIRS:-}" "${SCCACHE_CLIENT_SIDE:-}" \
   >>"$FIXTURE_CONTROL/cargo.log"
+if [[ -e "$FIXTURE_CONTROL/fail" ]]; then
+  head -c 131072 /dev/zero | tr '\000' 'x' >&2
+  printf '\nearlier stderr line\ndata-root guard rejected build\n\n  \n' >&2
+  printf 'later stdout line\n'
+  exit 65
+fi
 export RUSTC_WRAPPER="${FIXTURE_CONTROL%/*}/bin/sccache"
 if [[ -e "$FIXTURE_CONTROL/busy-after" ]]; then
   cargo "$@"
@@ -239,11 +246,45 @@ assert status["last_warmed_commit"] == (sys.argv[3] or None), status
 for key in ("apparent_bytes", "allocated_bytes"):
     disk = status["disk"]
     assert disk["checkout"][key] == disk["source"][key] + disk["target"][key], disk
-    if sys.argv[2] == "warmed":
+    if sys.argv[2] == "warmed" and not status.get("target_prune", {}).get("pruned"):
         assert disk["target"][key] > 0, disk
     if sys.argv[2] == "cleaned":
         assert disk["target"][key] == 0, disk
-assert status["duration_seconds"] >= status["build_seconds"] >= status["paused_seconds"], status
+assert status["duration_seconds"] >= max(status["build_seconds"], status["paused_seconds"]), status
+PY
+}
+
+retry_is() {
+  python3 - "$state/status.json" "$@" <<'PY'
+from datetime import datetime, timedelta
+import json
+import sys
+from pathlib import Path
+
+status = json.loads(Path(sys.argv[1]).read_text())
+failures = int(sys.argv[2])
+assert status["failures"] == failures, status
+if failures:
+    assert status["failed_tip"] == sys.argv[3], status
+    if len(sys.argv) > 4:
+        retry = datetime.fromisoformat(status["next_attempt_after"])
+        finished = datetime.fromisoformat(status["finished_at"])
+        assert abs(retry - finished - timedelta(minutes=int(sys.argv[4]))) < timedelta(seconds=10), status
+else:
+    assert all(status[key] is None for key in ("failed_tip", "next_attempt_after", "last_error")), status
+PY
+}
+
+expire_retry() {
+  python3 - "$state/status.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+status = json.loads(path.read_text())
+status["next_attempt_after"] = "2000-01-01T00:00:00+00:00"
+path.write_text(json.dumps(status))
 PY
 }
 
@@ -313,6 +354,7 @@ change_tip 3
 set_cpu 16 0
 run
 status_is deferred "$last_warmed"
+retry_is 0
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 4 ]] || fail "started Cargo without spare CPU"
 [[ $(git -C "$checkout" rev-parse HEAD) == "$last_warmed" ]] || fail "fetched without spare CPU"
 grep -q 'deferred .*: spare CPU' "$tmp/run.log" || fail "missing CPU deferral reason"
@@ -406,9 +448,9 @@ touch "$FIXTURE_CONTROL/hold"
 prewarm_pid=$!
 wait_for test -s "$FIXTURE_CONTROL/rustc.pid"
 set_cpu 16 0
-if wait "$prewarm_pid"; then fail "expired pause reported success"; fi
-prewarm_pid=
-status_is failed "$last_warmed"
+settled
+status_is deferred "$last_warmed"
+retry_is 0
 grep -q 'maximum pause time reached' "$tmp/background.log" || fail "build did not time out"
 rustc_pid=$(cat "$FIXTURE_CONTROL/rustc.pid")
 if ps -o state= -p "$rustc_pid" | grep -Eq '^[^ZX]$'; then
@@ -418,7 +460,7 @@ rm -- "$FIXTURE_CONTROL/hold"
 set_cpu 0 0
 run
 status_is warmed "$tip"
-printf 'ok - pause timeout leaves the tip eligible for retry\n'
+printf 'ok - running out of pause allowance defers without backoff\n'
 
 last_warmed=$tip
 change_tip 7
@@ -429,6 +471,7 @@ export PREWARM_MEMORY_MAX=96M
 touch "$FIXTURE_CONTROL/busy-after"
 run
 status_is deferred "$last_warmed"
+retry_is 0
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 1 ]] || fail "later command ran after memory became scarce"
 grep -Fq '"deferred_command": "check --workspace --all-targets"' "$state/status.json" \
   || fail "deferred command missing from status"
@@ -460,6 +503,7 @@ if PREWARM_COMMAND_TIMEOUTS='1;20' "$runner" fixture >"$tmp/run.log"; then
   fail "expired command budget reported success"
 fi
 status_is timed_out "$last_warmed"
+retry_is 1 "$tip" 7
 grep -q '"error": "command time budget reached (1s)"' "$state/status.json" || fail "timeout reason missing"
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 1 ]] || fail "a command ran after the timeout"
 rustc_pid=$(cat "$FIXTURE_CONTROL/rustc.pid")
@@ -467,22 +511,114 @@ if ps -o state= -p "$rustc_pid" | grep -Eq '^[^ZX]$'; then
   fail "command timeout left the compiler running"
 fi
 rm -- "$FIXTURE_CONTROL/hold"
-printf 'ok - command timeout kills the compiler group and leaves the tip eligible for retry\n'
+printf 'ok - command timeout kills the compiler group and starts backoff\n'
 
+expire_retry
 touch "$FIXTURE_CONTROL/oom"
 if "$runner" fixture >"$tmp/run.log"; then fail "scope OOM reported success"; fi
 status_is oom "$last_warmed"
+retry_is 2 "$tip" 14
 grep -q 'command scope OOM kill (MemoryMax=96M)' "$state/status.json" || fail "scope OOM reason missing"
 [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == 1 ]] || fail "a command ran after the OOM kill"
 diff -u <(cut -d '|' -f 1 "$FIXTURE_CONTROL/scopes.log") "$FIXTURE_CONTROL/stops.log" \
   || fail "command scopes were not stopped"
 rm -- "$FIXTURE_CONTROL/oom"
+expire_retry
 run
 status_is warmed "$tip"
-printf 'ok - scope OOM ends the attempt, records the reason and leaves the tip eligible for retry\n'
+retry_is 0
+printf 'ok - scope OOM records the reason and counts toward backoff, and success clears it\n'
 
+last_warmed=$tip
+change_tip 9
+touch "$FIXTURE_CONTROL/fail"
+export PREWARM_BACKOFF_MAX_MINUTES=30
+: >"$FIXTURE_CONTROL/cargo.log"
+for delay in 7 14 28 30 30; do
+  failure_count=$(($(wc -l <"$FIXTURE_CONTROL/cargo.log") + 1))
+  if "$runner" fixture >"$tmp/run.log"; then fail "failing build reported success"; fi
+  status_is failed "$last_warmed"
+  retry_is "$failure_count" "$tip" "$delay"
+  run
+  grep -Fq '"result": "backoff"' "$state/status.json" || fail "retry did not back off"
+  retry_is "$failure_count" "$tip"
+  [[ $(wc -l <"$FIXTURE_CONTROL/cargo.log") == "$failure_count" ]] || fail "ran Cargo during backoff"
+  python3 - "$state/status.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+error = json.loads(Path(sys.argv[1]).read_text())["last_error"]
+assert error == {
+    "command": "bash scripts/cargo.sh test --workspace --no-run --profile fast -j 1",
+    "line": "data-root guard rejected build",
+}, error
+PY
+  expire_retry
+done
+if "$runner" fixture >"$tmp/run.log"; then fail "failing build reported success"; fi
+change_tip 10
+if "$runner" fixture >"$tmp/run.log"; then fail "new tip did not attempt a build"; fi
+retry_is 1 "$tip" 7
+expire_retry
+exec {bench_lock}>"$tmp/bench.lock"
+flock -x "$bench_lock"
+run
+status_is deferred "$last_warmed"
+retry_is 1 "$tip"
+flock -u "$bench_lock"
+exec {bench_lock}>&-
+rm -- "$FIXTURE_CONTROL/fail"
+run
+status_is warmed "$tip"
+retry_is 0
+unset PREWARM_BACKOFF_MAX_MINUTES
+printf 'ok - same-tip failures back off up to the cap, record the last stderr line and reset on tip change or success\n'
+
+change_tip 11
+mkdir -p "$checkout/artifacts"
+dd if=/dev/zero of="$checkout/artifacts/stale" bs=1M count=2 status=none
+CARGO_TARGET_DIR="$checkout/artifacts" PREWARM_TARGET_MAX_GIB=0 run
+[[ -f "$checkout/artifacts/stale" ]] || fail "disabled cap removed existing artifacts"
+if grep -Fq '"target_prune"' "$state/status.json"; then fail "disabled cap measured outputs"; fi
+change_tip 12
 mkdir -p "$tmp/outside"
 touch "$tmp/outside/keep"
+ln -s "$tmp/outside" "$checkout/artifacts/linked"
+CARGO_TARGET_DIR="$checkout/artifacts" CARGO_BUILD_BUILD_DIR="$checkout/build-artifacts" \
+  PREWARM_TARGET_MAX_GIB=0.001 run
+status_is warmed "$tip"
+[[ ! -e "$checkout/artifacts" && ! -e "$checkout/build-artifacts" && -d "$checkout/target" \
+  && -f "$checkout/crate/src/lib.rs" && -f "$tmp/outside/keep" ]] \
+  || fail "cap did not clean only the configured Cargo output directory"
+python3 - "$state/status.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+report = json.loads(Path(sys.argv[1]).read_text())["target_prune"]
+assert report["before_bytes"] > report["cap_bytes"] > report["after_bytes"] == 0, report
+assert report["pruned"] == ["artifacts", "build-artifacts"], report
+PY
+printf 'ok - over-cap output is fully cleaned after success and the cap can be disabled\n'
+
+cat >"$tmp/bin/timeout" <<'EOF'
+#!/usr/bin/env bash
+[[ "$*" == '--kill-after=1 30 du --null --summarize --total --block-size=1 -- '* ]] || exit 2
+exit 124
+EOF
+chmod +x "$tmp/bin/timeout"
+change_tip 13
+run
+status_is warmed "$tip"
+[[ ! -e "$checkout/target" ]] || fail "timed-out measurement did not clean the target"
+grep -Fq '"reason": "measurement_timeout"' "$state/status.json" || fail "missing measurement timeout reason"
+rm -- "$tmp/bin/timeout"
+printf 'ok - an output measurement timeout triggers a full clean\n'
+
+change_tip 14
+run
+status_is warmed "$tip"
 if CARGO_TARGET_DIR="$tmp/outside" "$runner" fixture --clean >"$tmp/run.log"; then
   fail "clean accepted an external Cargo target"
 fi

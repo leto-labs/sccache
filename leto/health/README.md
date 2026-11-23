@@ -48,7 +48,9 @@ The miss window includes the current log and its `.1` archive. Each component
 kind or extern counts at most once per miss. In the pre-warm section, age is
 time since the last successful warm using the `last-warmed` marker when
 available. Commit lag compares that commit with the canonical local branch
-in the project's config.
+in the project's config. A failed tip shows its failure count, next retry
+time, and a short error line. The warnings include the error and how long
+until the next retry is due.
 
 Incremental discovery checks `target/<profile>/incremental` and
 `target/<triple>/<profile>/incremental`. With `--fast`, or when discovery
