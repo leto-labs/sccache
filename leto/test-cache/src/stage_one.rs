@@ -235,7 +235,7 @@ impl Run<'_> {
             self.action = "unavailable";
             return plain(command);
         };
-        if let Some(signal) = cancelled(status) {
+        if let Some(signal) = process::interrupted() {
             return Ok(signal);
         }
 
@@ -345,7 +345,7 @@ impl Run<'_> {
         let capture = Capture::new()?;
         capture.command(command.as_mut().unwrap())?;
         let status = plain(command)?;
-        if let Some(signal) = cancelled(status) {
+        if let Some(signal) = process::interrupted() {
             self.verification = Some("cancelled");
             capture.emit()?;
             return Ok(signal);
@@ -391,17 +391,6 @@ impl Run<'_> {
 
 fn plain(command: &mut Option<Command>) -> io::Result<i32> {
     process::run(command, None).map(|(status, _)| process::interrupted().unwrap_or(status))
-}
-
-fn cancelled(status: i32) -> Option<i32> {
-    process::interrupted().or_else(|| {
-        (libc::WIFSIGNALED(status)
-            && matches!(
-                libc::WTERMSIG(status),
-                libc::SIGINT | libc::SIGTERM | libc::SIGHUP
-            ))
-        .then_some(status)
-    })
 }
 
 fn emit((stdout, stderr): &Streams) -> io::Result<()> {

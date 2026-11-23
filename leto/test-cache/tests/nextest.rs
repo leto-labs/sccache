@@ -610,6 +610,7 @@ fn stage_command(root: &Path, binary: &Path, test: &str, mode: &str, run: &str) 
             | "tests::swallowed_denial"
             | "tests::metadata_only"
             | "tests::verification"
+            | "tests::verification_signal"
             | "tests::prints_keyed_values"
     ) {
         command.arg("--ignored");
@@ -753,6 +754,17 @@ fn stage_one_stores_replays_expires_and_quarantines() {
         assert_eq!(last()["cache"]["action"], "quarantined");
         assert!(!path.exists());
     }
+
+    let test = "tests::verification_signal";
+    assert!(run(test, "gate", "fill").status.success());
+    assert_eq!(last()["cache"]["action"], "stored");
+    let signaled = stage_command(root, &binary, test, "gate", "signaled")
+        .env("TOY_UNKEYED", "terminate")
+        .output()
+        .unwrap();
+    assert_eq!(signaled.status.code(), Some(125), "{}", details(&signaled));
+    assert_eq!(last()["cache"]["verification"], "mismatch");
+    assert_eq!(last()["cache"]["quarantined"], true);
 }
 
 #[test]

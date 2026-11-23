@@ -44,6 +44,14 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn verification_signal() {
+        if std::env::var_os("TOY_UNKEYED").is_some() {
+            killed();
+        }
+    }
+
+    #[test]
+    #[ignore]
     fn prints_keyed_values() {
         println!("{}", std::env::var("AWS_SECRET_ACCESS_KEY").unwrap());
         eprintln!("{}", std::env::var("ALCHEMY_API_KEY").unwrap());

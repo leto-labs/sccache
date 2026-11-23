@@ -53,8 +53,9 @@ test executable, its shared libraries and fixed system paths. The observer
 checks metadata probes and denials. If a sandboxed run fails or has impure
 evidence, gate reruns it with the original environment and reports that result.
 A passing fallback records an impure entry. A failing fallback records only
-the invocation. Gate logs and runs tests normally if Landlock ABI 6 or newer
-or the observer is unavailable.
+the invocation. Storing requires Landlock ABI 6 or newer and a working
+observer. If either is unavailable on a miss, gate logs the reason and runs
+the test normally.
 
 Gate verifies the first 20 hits in each nextest run (or all hits when there
 are fewer), then selects each remaining hit with a deterministic 5% sample
