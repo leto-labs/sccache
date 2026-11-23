@@ -13,6 +13,43 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn private_temp() {
+        assert!(std::env::var_os("TOY_UNKEYED").is_none());
+        let tmp = std::env::temp_dir();
+        assert!(std::fs::read_dir(&tmp).unwrap().next().is_none());
+        let path = tmp.join("scratch");
+        std::fs::write(&path, b"test").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"test");
+    }
+
+    #[test]
+    #[ignore]
+    fn swallowed_denial() {
+        let _ = std::fs::read("fixture.txt");
+        let _ = TcpListener::bind((Ipv4Addr::LOCALHOST, 0));
+    }
+
+    #[test]
+    #[ignore]
+    fn metadata_only() {
+        assert!(std::fs::metadata("fixture.txt").unwrap().is_file());
+    }
+
+    #[test]
+    #[ignore]
+    fn verification() {
+        println!("{}", std::env::var("TOY_UNKEYED").unwrap_or_default());
+    }
+
+    #[test]
+    #[ignore]
+    fn prints_keyed_values() {
+        println!("{}", std::env::var("AWS_SECRET_ACCESS_KEY").unwrap());
+        eprintln!("{}", std::env::var("ALCHEMY_API_KEY").unwrap());
+    }
+
+    #[test]
     fn ancestor_lookups() {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(std::fs::canonicalize(".").unwrap(), cwd);

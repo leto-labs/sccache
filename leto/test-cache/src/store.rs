@@ -28,11 +28,17 @@ pub fn day(seconds: u64) -> String {
 }
 
 pub fn root() -> io::Result<PathBuf> {
+    root_for("v0")
+}
+
+pub fn root_for(version: &str) -> io::Result<PathBuf> {
     if let Some(path) = std::env::var_os("LETO_TEST_CACHE_DIR") {
         return Ok(path.into());
     }
     let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is unset"))?;
-    Ok(PathBuf::from(home).join(".cache/leto-test-results/v0"))
+    Ok(PathBuf::from(home)
+        .join(".cache/leto-test-results")
+        .join(version))
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -76,7 +82,13 @@ impl Stamp {
     }
 }
 
-pub fn digest(root: &Path, path: &Path, stamp: Stamp, now: Duration) -> io::Result<blake3::Hash> {
+pub fn digest(
+    root: &Path,
+    path: &Path,
+    stamp: Stamp,
+    now: Duration,
+    write_memo: bool,
+) -> io::Result<blake3::Hash> {
     let memo = root.join("digests").join(stamp.id());
     let memoize = !stamp.recent(now);
     if memoize
@@ -98,7 +110,7 @@ pub fn digest(root: &Path, path: &Path, stamp: Stamp, now: Duration) -> io::Resu
         return Err(io::Error::other("digest input changed while reading"));
     }
     let hash = hash.finalize();
-    if memoize {
+    if memoize && write_memo {
         replace(&memo, hash.to_hex().as_bytes())?;
     }
     Ok(hash)
@@ -200,19 +212,19 @@ mod tests {
         fs::write(&file, "abc")?;
         let stamp = Stamp::read(&file)?;
         let now = clock();
-        let first = digest(&root, &file, stamp, now)?;
+        let first = digest(&root, &file, stamp, now, true)?;
         let memo = root.join("digests").join(stamp.id());
         assert!(!memo.exists());
         let later = now + Duration::from_secs(3);
-        assert_eq!(digest(&root, &file, stamp, later)?, first);
+        assert_eq!(digest(&root, &file, stamp, later, true)?, first);
         assert!(memo.exists());
 
         fs::write(&file, "def")?;
         let changed = Stamp::read(&file)?;
         assert_eq!(stamp.size, changed.size);
         assert_ne!(stamp, changed);
-        assert!(digest(&root, &file, stamp, clock()).is_err());
-        assert_ne!(digest(&root, &file, changed, clock())?, first);
+        assert!(digest(&root, &file, stamp, clock(), true).is_err());
+        assert_ne!(digest(&root, &file, changed, clock(), true)?, first);
         assert!(!root.join("digests").join(changed.id()).exists());
         fs::remove_dir_all(root)
     }

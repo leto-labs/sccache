@@ -1,22 +1,28 @@
-use std::io::{self, BufRead, BufReader, Read, Write};
-use std::os::fd::AsRawFd;
+use std::fs::{File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::FileExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use serde_json::{Value, json};
 
 use crate::observer::{self, Rules};
+use crate::sandbox;
 
 const SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGHUP];
 static CHILD: AtomicI32 = AtomicI32::new(0);
+static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
 const LAUNCH_FAILED: i32 = -1;
 const RETRY_UNFILTERED: i32 = -2;
+const SANDBOX_UNAVAILABLE: i32 = -3;
 const FILTER_INSTALLED: u8 = 1;
 const FILTER_UNAVAILABLE: u8 = 2;
 
 extern "C" fn relay(signal: libc::c_int) {
+    INTERRUPTED.store(signal, Ordering::Relaxed);
     let pid = CHILD.load(Ordering::Relaxed);
     if pid > 0 {
         // SAFETY: kill is async-signal-safe and the PID is positive. Preserve
@@ -27,6 +33,79 @@ extern "C" fn relay(signal: libc::c_int) {
             libc::kill(pid, signal);
             *errno = previous;
         }
+    }
+}
+
+pub fn interrupted() -> Option<i32> {
+    let signal = INTERRUPTED.load(Ordering::Relaxed);
+    (signal != 0).then_some(signal)
+}
+
+pub struct Capture {
+    stdout: File,
+    stderr: File,
+}
+
+impl Capture {
+    pub fn new() -> io::Result<Self> {
+        fn stream(name: &std::ffi::CStr) -> io::Result<File> {
+            // SAFETY: the kernel reads the NUL-terminated name and returns a fresh fd.
+            let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: the successful syscall returned a new, owned fd.
+            Ok(unsafe { File::from_raw_fd(fd) })
+        }
+        Ok(Self {
+            stdout: stream(c"leto-test-stdout")?,
+            stderr: stream(c"leto-test-stderr")?,
+        })
+    }
+
+    fn writer(file: &File) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+
+    pub fn redirect(&self, stdin: &File) -> io::Result<()> {
+        let stdout = Self::writer(&self.stdout)?;
+        let stderr = Self::writer(&self.stderr)?;
+        for (file, fd) in [(stdin, 0), (&stdout, 1), (&stderr, 2)] {
+            // SAFETY: every source descriptor is live; the child owns the stdio table.
+            if unsafe { libc::dup2(file.as_raw_fd(), fd) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    pub fn command(&self, command: &mut Command) -> io::Result<()> {
+        command
+            .stdout(Stdio::from(Self::writer(&self.stdout)?))
+            .stderr(Stdio::from(Self::writer(&self.stderr)?));
+        Ok(())
+    }
+
+    pub fn output(&self, limit: usize) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let stdout = self.stdout.metadata()?.len();
+        let stderr = self.stderr.metadata()?.len();
+        if stdout.saturating_add(stderr) > limit as u64 {
+            return Ok(None);
+        }
+        let mut streams = (vec![0; stdout as usize], vec![0; stderr as usize]);
+        self.stdout.read_exact_at(&mut streams.0, 0)?;
+        self.stderr.read_exact_at(&mut streams.1, 0)?;
+        Ok(Some(streams))
+    }
+
+    pub fn emit(mut self) -> io::Result<()> {
+        self.stdout.rewind()?;
+        self.stderr.rewind()?;
+        io::copy(&mut self.stdout, &mut io::stdout().lock())?;
+        io::copy(&mut self.stderr, &mut io::stderr().lock())?;
+        Ok(())
     }
 }
 
@@ -171,12 +250,29 @@ pub fn run(command: &mut Option<Command>, rules: Option<Rules>) -> io::Result<(i
     let Some(rules) = rules else {
         return run_plain(&signals, command, "unsampled");
     };
+    run_observed(command, &signals, rules, None)?
+        .ok_or_else(|| io::Error::other("observer unavailable"))
+}
 
+pub fn run_sandbox(
+    command: &mut Option<Command>,
+    rules: Rules,
+    launch: &sandbox::Launch<'_>,
+) -> io::Result<Option<(i32, Value)>> {
+    run_observed(command, &Signals::new()?, rules, Some(launch))
+}
+
+fn run_observed(
+    command: &mut Option<Command>,
+    signals: &Signals,
+    rules: Rules,
+    launch: Option<&sandbox::Launch<'_>>,
+) -> io::Result<Option<(i32, Value)>> {
     let (send, receive) = UnixStream::pair()?;
     let monitor = signals.fork(false)?;
     if monitor == 0 {
         drop(receive);
-        observe(command.take().unwrap(), &signals, rules, send);
+        observe(command.take().unwrap(), signals, rules, send, launch);
     }
     drop(send);
     let saved = command.take();
@@ -185,16 +281,22 @@ pub fn run(command: &mut Option<Command>, rules: Option<Rules>) -> io::Result<(i
     if let Err(error) = reader.read_exact(&mut raw) {
         let status = wait(monitor, 0)?.1;
         if libc::WIFSIGNALED(status) {
-            return Ok((status, json!("unavailable")));
+            return Ok(Some((status, json!("unavailable"))));
         }
         return Err(error);
     }
     let status = i32::from_ne_bytes(raw);
-    if matches!(status, LAUNCH_FAILED | RETRY_UNFILTERED) {
+    if matches!(
+        status,
+        LAUNCH_FAILED | RETRY_UNFILTERED | SANDBOX_UNAVAILABLE
+    ) {
         *command = saved;
         let _ = wait(monitor, 0);
         if status == RETRY_UNFILTERED {
-            return run_plain(&signals, command, "unavailable");
+            return run_plain(signals, command, "unavailable").map(Some);
+        }
+        if status == SANDBOX_UNAVAILABLE {
+            return Ok(None);
         }
         return Err(io::Error::other("observer could not launch test"));
     }
@@ -206,10 +308,16 @@ pub fn run(command: &mut Option<Command>, rules: Option<Rules>) -> io::Result<(i
         .unwrap_or_else(|| json!("unavailable"));
     // The monitor may still be tracing a descendant. It has closed its test I/O.
     let _ = wait(monitor, libc::WNOHANG);
-    Ok((status, evidence))
+    Ok(Some((status, evidence)))
 }
 
-fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream) -> ! {
+fn observe(
+    command: Command,
+    signals: &Signals,
+    rules: Rules,
+    report: UnixStream,
+    launch: Option<&sandbox::Launch<'_>>,
+) -> ! {
     if let Ok((mut start, mut child)) = UnixStream::pair()
         && let Ok(pid) = signals.fork(true)
     {
@@ -217,12 +325,18 @@ fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream
             drop(report);
             drop(start);
             let mut requested = [0];
-            let mode = if child.read_exact(&mut requested).is_err() || requested[0] == 0 {
-                0
-            } else if observer::install().is_ok() {
-                FILTER_INSTALLED
-            } else {
-                FILTER_UNAVAILABLE
+            let attached = child.read_exact(&mut requested).is_ok() && requested[0] != 0;
+            let mode = match launch {
+                Some(launch) if attached => {
+                    match launch.prepare(&rules).and_then(|()| observer::install()) {
+                        Ok(()) => FILTER_INSTALLED,
+                        Err(_) => FILTER_UNAVAILABLE,
+                    }
+                }
+                Some(_) => FILTER_UNAVAILABLE,
+                None if !attached => 0,
+                None if observer::install().is_ok() => FILTER_INSTALLED,
+                None => FILTER_UNAVAILABLE,
             };
             // SAFETY: write uses a live fd and one initialized byte. It
             // avoids sendto, which the new filter would stop before the
@@ -233,6 +347,9 @@ fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream
                 unsafe { libc::_exit(0) };
             }
             drop(child);
+            if let Some(launch) = launch {
+                launch.exec();
+            }
             exec(command);
         }
         drop(child);
@@ -243,7 +360,7 @@ fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream
             libc::close(libc::STDOUT_FILENO);
             libc::close(libc::STDERR_FILENO);
         }
-        let attached = observer::attach(pid).is_ok();
+        let attached = observer::attach(pid, launch.is_some()).is_ok();
         let _ = start.write_all(&[u8::from(attached)]);
         let mut mode = [0];
         let _ = start.read_exact(&mut mode);
@@ -253,11 +370,16 @@ fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream
                 pid,
                 rules,
                 mode[0] == FILTER_INSTALLED,
+                launch.is_some(),
                 |status, evidence| {
                     // A failed seccomp installation can leave no_new_privs set.
                     // Re-launch from the unfiltered runner before any test code runs.
                     let status = if mode[0] == FILTER_UNAVAILABLE && libc::WIFEXITED(status) {
-                        RETRY_UNFILTERED
+                        if launch.is_some() {
+                            SANDBOX_UNAVAILABLE
+                        } else {
+                            RETRY_UNFILTERED
+                        }
                     } else {
                         status
                     };
@@ -265,6 +387,11 @@ fn observe(command: Command, signals: &Signals, rules: Rules, report: UnixStream
                 },
             );
         } else if let Ok((_, status)) = wait(pid, 0) {
+            let status = if launch.is_some() && libc::WIFEXITED(status) {
+                SANDBOX_UNAVAILABLE
+            } else {
+                status
+            };
             notify(report, status, json!("unavailable"));
         }
     } else {

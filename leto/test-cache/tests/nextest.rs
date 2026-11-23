@@ -230,6 +230,52 @@ fn direct_exec_and_shadow_preserve_output_exit_and_signals() {
     assert!(root.join(".cache/leto-test-results/v0/errors").is_dir());
 }
 
+fn reject_syscall(command: &mut Command, syscall: libc::c_long, option: Option<i32>) {
+    let statement = |code, k| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let equals = |k, jf| libc::sock_filter {
+        code: 0x15,
+        jt: 0,
+        jf,
+        k,
+    };
+    let mut code = vec![statement(0x20, 0)];
+    if let Some(option) = option {
+        code.extend([
+            equals(syscall as u32, 3),
+            statement(0x20, 16),
+            equals(option as u32, 1),
+        ]);
+    } else {
+        code.push(equals(syscall as u32, 1));
+    }
+    code.extend([
+        statement(0x06, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+        statement(0x06, libc::SECCOMP_RET_ALLOW),
+    ]);
+    // SAFETY: the hook passes initialized filter data to libc. It runs
+    // only in the command subprocess before exec.
+    unsafe {
+        command.pre_exec(move || {
+            let filter = code.as_ptr().cast_mut();
+            let program = libc::sock_fprog {
+                len: code.len() as u16,
+                filter,
+            };
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1
+                || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 #[test]
 fn unavailable_observer_runs_the_test_without_observation() {
     let scratch = Scratch::create();
@@ -250,52 +296,10 @@ fn unavailable_observer_runs_the_test_without_observation() {
         (libc::SYS_ptrace, None),
         (libc::SYS_prctl, Some(libc::PR_SET_SECCOMP)),
     ] {
-        let statement = |code, k| libc::sock_filter {
-            code,
-            jt: 0,
-            jf: 0,
-            k,
-        };
-        let equals = |k, jf| libc::sock_filter {
-            code: 0x15,
-            jt: 0,
-            jf,
-            k,
-        };
-        let mut code = vec![statement(0x20, 0)];
-        if let Some(option) = option {
-            code.extend([
-                equals(syscall as u32, 3),
-                statement(0x20, 16),
-                equals(option as u32, 1),
-            ]);
-        } else {
-            code.push(equals(syscall as u32, 1));
-        }
-        code.extend([
-            statement(0x06, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
-            statement(0x06, libc::SECCOMP_RET_ALLOW),
-        ]);
         let mut shadow = Command::new(RUNNER);
         configure(&mut shadow, root, "tests::pure");
         shadow.arg(&binary).args(args);
-        // SAFETY: the hook passes initialized filter data to libc. It runs
-        // only in the command subprocess before exec.
-        unsafe {
-            shadow.pre_exec(move || {
-                let filter = code.as_ptr().cast_mut();
-                let program = libc::sock_fprog {
-                    len: code.len() as u16,
-                    filter,
-                };
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1
-                    || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) == -1
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+        reject_syscall(&mut shadow, syscall, option);
         let shadow = shadow.output().unwrap();
         assert_eq!(plain.status, shadow.status);
         assert_eq!(plain.stdout, shadow.stdout);
@@ -540,10 +544,35 @@ fn keyed_env_values_never_reach_records_errors_or_reports() {
         .unwrap();
     assert!(report.status.success(), "{}", details(&report));
 
+    let secret_test = "tests::prints_keyed_values";
+    let gate = |mode| {
+        stage_command(root, &binary, secret_test, mode, "secrets")
+            .env("LETO_TEST_CACHE_ENV", "AWS_*,ALCHEMY_*")
+            .env("AWS_SECRET_ACCESS_KEY", canaries[0])
+            .env("ALCHEMY_API_KEY", canaries[1])
+            .output()
+            .unwrap()
+    };
+    let stored = gate("gate");
+    assert!(stored.status.success(), "{}", details(&stored));
+    assert_eq!(
+        stage_records(root).last().unwrap()["cache"]["action"],
+        "stored"
+    );
+    let replay = gate("replay");
+    assert!(replay.status.success(), "{}", details(&replay));
+    assert_eq!(
+        stage_records(root).last().unwrap()["cache"]["action"],
+        "replayed"
+    );
+    assert_eq!(replay.stdout, stored.stdout);
+    assert_eq!(replay.stderr, stored.stderr);
+
     let mut checked = 0;
     for path in files_under(&root.join("logs"))
         .into_iter()
         .chain(files_under(&root.join("report")))
+        .chain(files_under(&root.join("stage1")))
     {
         let content = fs::read(&path).unwrap();
         for canary in canaries.iter().chain(&["AKIAsecond-value-0000"]) {
@@ -561,4 +590,246 @@ fn keyed_env_values_never_reach_records_errors_or_reports() {
         checked >= 4,
         "only {checked} store and report files checked"
     );
+}
+
+fn stage_command(root: &Path, binary: &Path, test: &str, mode: &str, run: &str) -> Command {
+    let mut command = Command::new(RUNNER);
+    configure(&mut command, root, test);
+    command
+        .env("LETO_TEST_CACHE_DIR", root.join("stage1"))
+        .env("LETO_TEST_CACHE", mode)
+        .env("NEXTEST_ATTEMPT", "1")
+        .env("NEXTEST_RUN_ID", run)
+        .env_remove("TOY_UNKEYED")
+        .arg(binary)
+        .args(["--exact", test, "--nocapture"]);
+    if matches!(
+        test,
+        "tests::private_temp"
+            | "tests::explicit_exit"
+            | "tests::swallowed_denial"
+            | "tests::metadata_only"
+            | "tests::verification"
+            | "tests::prints_keyed_values"
+    ) {
+        command.arg("--ignored");
+    }
+    command
+}
+
+fn stage_records(root: &Path) -> Vec<Value> {
+    files_under(&root.join("stage1/runs"))
+        .iter()
+        .flat_map(|file| {
+            fs::read_to_string(file)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn stage_entry(root: &Path, record: &Value) -> PathBuf {
+    let key = record["key"].as_str().unwrap();
+    root.join("stage1").join(&key[..2]).join(key)
+}
+
+#[test]
+fn stage_one_stores_replays_expires_and_quarantines() {
+    let scratch = Scratch::create();
+    let root = &scratch.0;
+    let build = cargo(root)
+        .args(["test", "--no-run", "--offline"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", details(&build));
+    let binary = harness(root);
+    let run = |test, mode, id| {
+        stage_command(root, &binary, test, mode, id)
+            .output()
+            .unwrap()
+    };
+    let pure = "tests::pure";
+
+    let miss = run(pure, "replay", "empty");
+    assert!(miss.status.success(), "{}", details(&miss));
+    let last = || stage_records(root).pop().unwrap();
+    assert_eq!(last()["cache"]["action"], "miss");
+    assert!(!root.join("stage1/closures").exists());
+    assert!(!stage_entry(root, &last()).exists());
+
+    let stored = run(pure, "gate", "fill");
+    assert!(stored.status.success(), "{}", details(&stored));
+    assert_eq!(last()["cache"]["action"], "stored", "{}", last());
+    let path = stage_entry(root, &last());
+    let saved = fs::read(&path).unwrap();
+    assert_eq!(last()["observer"]["denied"], false);
+    let replay = run(pure, "replay", "read");
+    assert!(replay.status.success(), "{}", details(&replay));
+    assert_eq!(replay.stdout, stored.stdout);
+    assert_eq!(replay.stderr, stored.stderr);
+    assert_eq!(last()["cache"]["action"], "replayed");
+    assert_eq!(fs::read(&path).unwrap(), saved);
+    let verified = run(pure, "gate", "verify");
+    assert!(verified.status.success(), "{}", details(&verified));
+    assert_eq!(last()["cache"]["verification"], "matched");
+
+    fs::File::open(&path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400))
+        .unwrap();
+    assert!(run(pure, "replay", "expired").status.success());
+    assert_eq!(last()["cache"]["action"], "miss");
+    assert_eq!(fs::read(path).unwrap(), saved);
+
+    for test in [
+        "tests::files",
+        "tests::network",
+        "tests::exec",
+        "tests::swallowed_denial",
+        "tests::other",
+    ] {
+        let impure = run(test, "gate", "fill");
+        assert!(impure.status.success(), "{}", details(&impure));
+        let row = last();
+        assert_eq!(row["cache"]["action"], "impure", "{row}");
+        assert_eq!(row["observer"]["denied"], true, "{row}");
+        let marker = fs::read_to_string(stage_entry(root, &row)).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&marker).unwrap()["status"],
+            "impure"
+        );
+        let replay = run(test, "replay", "read");
+        assert!(replay.status.success(), "{}", details(&replay));
+        assert_eq!(last()["cache"]["action"], "impure");
+    }
+
+    assert!(run("tests::metadata_only", "gate", "fill").status.success());
+    assert_eq!(last()["cache"]["action"], "impure", "{}", last());
+    assert_eq!(last()["observer"]["class"], "files");
+    assert_eq!(last()["observer"]["denied"], false);
+    assert!(stage_entry(root, &last()).exists());
+
+    let temp = stage_command(root, &binary, "tests::private_temp", "gate", "fill")
+        .env("TOY_UNKEYED", "never inherited")
+        .output()
+        .unwrap();
+    assert!(temp.status.success(), "{}", details(&temp));
+    assert_eq!(last()["cache"]["action"], "stored", "{}", last());
+
+    let failure = run("tests::explicit_exit", "gate", "fill");
+    assert_eq!(failure.status.code(), Some(37), "{}", details(&failure));
+    assert!(
+        failure
+            .stdout
+            .windows(b"exit stdout".len())
+            .any(|w| w == b"exit stdout")
+    );
+    assert!(!stage_entry(root, &last()).exists());
+
+    let test = "tests::verification";
+    assert!(run(test, "gate", "fill").status.success());
+    assert_eq!(last()["cache"]["action"], "stored", "{}", last());
+    let path = stage_entry(root, &last());
+    let mismatch = stage_command(root, &binary, test, "gate", "mismatch")
+        .env("TOY_UNKEYED", "uncached output")
+        .output()
+        .unwrap();
+    assert_eq!(mismatch.status.code(), Some(125), "{}", details(&mismatch));
+    assert!(details(&mismatch).contains("verification failed"));
+    assert_eq!(last()["cache"]["verification"], "mismatch");
+    assert_eq!(last()["cache"]["quarantined"], true);
+    assert!(!path.exists());
+    assert_eq!(files_under(&root.join("stage1/quarantine")).len(), 1);
+
+    let retry = stage_command(root, &binary, test, "gate", "mismatch")
+        .env("NEXTEST_ATTEMPT", "2")
+        .output()
+        .unwrap();
+    assert_eq!(retry.status.code(), Some(125), "{}", details(&retry));
+    for mode in ["replay", "gate"] {
+        assert!(run(test, mode, "different-run").status.success());
+        assert_eq!(last()["cache"]["action"], "quarantined");
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn nextest_gate_and_replay_use_the_real_target_runner() {
+    let scratch = Scratch::create();
+    let root = &scratch.0;
+    let available = cargo(root).args(["nextest", "--version"]).output().unwrap();
+    if !available.status.success() {
+        eprintln!("SKIP: cargo-nextest is unavailable");
+        return;
+    }
+    for (mode, action) in [
+        ("gate", "stored"),
+        ("replay", "replayed"),
+        ("gate", "verified"),
+    ] {
+        let output = cargo(root)
+            .env(RUNNER_ENV, RUNNER)
+            .env("LETO_TEST_CACHE", mode)
+            .env("LETO_TEST_CACHE_DIR", root.join("stage1"))
+            .args([
+                "nextest",
+                "run",
+                "--offline",
+                "--profile",
+                "shadow",
+                "-E",
+                "test(=tests::pure)",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", details(&output));
+        let row = stage_records(root).pop().unwrap();
+        assert_eq!(
+            row["cache"]["action"],
+            action,
+            "{row}\n{}",
+            details(&output)
+        );
+    }
+}
+
+#[test]
+fn gate_refuses_to_store_without_landlock_and_replay_still_works() {
+    let scratch = Scratch::create();
+    let root = &scratch.0;
+    let build = cargo(root)
+        .args(["test", "--no-run", "--offline"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", details(&build));
+    let binary = harness(root);
+    let test = "tests::pure";
+    let mut gate = stage_command(root, &binary, test, "gate", "no-landlock");
+    reject_syscall(&mut gate, libc::SYS_landlock_create_ruleset, None);
+    let unavailable = gate.output().unwrap();
+    assert!(unavailable.status.success(), "{}", details(&unavailable));
+    assert!(details(&unavailable).contains("Landlock unavailable"));
+    let row = stage_records(root).pop().unwrap();
+    assert_eq!(row["cache"]["action"], "unavailable");
+    assert!(!stage_entry(root, &row).exists());
+
+    let saved = stage_command(root, &binary, test, "gate", "landlock")
+        .output()
+        .unwrap();
+    assert!(saved.status.success(), "{}", details(&saved));
+    assert_eq!(
+        stage_records(root).pop().unwrap()["cache"]["action"],
+        "stored"
+    );
+    let mut replay = stage_command(root, &binary, test, "replay", "no-landlock");
+    reject_syscall(&mut replay, libc::SYS_landlock_create_ruleset, None);
+    let replayed = replay.output().unwrap();
+    assert_eq!(
+        stage_records(root).pop().unwrap()["cache"]["action"],
+        "replayed"
+    );
+    assert_eq!(replayed.stdout, saved.stdout);
+    assert_eq!(replayed.stderr, saved.stderr);
 }

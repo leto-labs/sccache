@@ -13,7 +13,7 @@ use crate::{
     store::{self, Stamp},
 };
 
-const LOADER: &str = "/lib64/ld-linux-x86-64.so.2";
+pub const LOADER: &str = "/lib64/ld-linux-x86-64.so.2";
 const LOADER_CONFIG: &[&str] = &["/etc/ld.so.cache", "/etc/ld.so.preload"];
 const DEFAULT_ENV: &str = "LANG,LC_*,TZ,RUST_*,PROPTEST_*";
 const PATH_ENV: [&str; 2] = ["CARGO_MANIFEST_DIR", "NEXTEST_WORKSPACE_ROOT"];
@@ -23,6 +23,20 @@ pub struct Identity {
     pub binary_digest: blake3::Hash,
     pub mtime: (i64, i64),
     pub libraries: Vec<PathBuf>,
+}
+
+pub struct StageOne {
+    pub environment: BTreeMap<OsString, OsString>,
+    pub output_key: [u8; 32],
+    pub stamps: Vec<(PathBuf, Stamp)>,
+}
+
+impl StageOne {
+    pub fn unchanged(&self) -> bool {
+        self.stamps
+            .iter()
+            .all(|(path, saved)| Stamp::read(path).is_ok_and(|stamp| stamp == *saved))
+    }
 }
 
 fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
@@ -110,11 +124,37 @@ pub fn build(
     checkout: &Path,
     now: Duration,
 ) -> io::Result<Identity> {
+    build_inner(root, binary, args, checkout, now, None).map(|(identity, _)| identity)
+}
+
+pub fn stage_one(
+    root: &Path,
+    binary: &Path,
+    args: &[OsString],
+    checkout: &Path,
+    now: Duration,
+    write_memo: bool,
+) -> io::Result<(Identity, StageOne)> {
+    let (mut identity, stage) = build_inner(root, binary, args, checkout, now, Some(write_memo))?;
+    identity.key = crate::sandbox::key(identity.key);
+    Ok((identity, stage.unwrap()))
+}
+
+fn build_inner(
+    root: &Path,
+    input: &Path,
+    args: &[OsString],
+    checkout: &Path,
+    now: Duration,
+    stage_one: Option<bool>,
+) -> io::Result<(Identity, Option<StageOne>)> {
     let cwd = std::env::current_dir()?;
-    let binary = fs::canonicalize(cwd.join(binary))?;
+    let binary = fs::canonicalize(cwd.join(input))?;
     let stamp = Stamp::read(&binary)?;
-    let binary_digest = store::digest(root, &binary, stamp, now)?;
-    let libraries = closure(root, &binary, binary_digest, &cwd)?;
+    let write_memo = stage_one.unwrap_or(true);
+    let binary_digest = store::digest(root, &binary, stamp, now, write_memo)?;
+    let loader_env = loader_environment(std::env::vars_os());
+    let libraries = closure(root, &binary, binary_digest, &cwd, &loader_env, write_memo)?;
     let configured = std::env::var("LETO_TEST_CACHE_ENV").unwrap_or_default();
     let mut bases = vec![normalized(checkout)];
     if let Some(value) = std::env::var_os("SCCACHE_BASEDIRS") {
@@ -138,10 +178,15 @@ pub fn build(
     }
     field(&mut profile, DEFAULT_ENV.as_bytes());
     field(&mut profile, configured.as_bytes());
-    let closure = libraries
-        .iter()
-        .map(|path| Ok((path, store::digest(root, path, Stamp::read(path)?, now)?)))
-        .collect::<io::Result<Vec<_>>>()?;
+    let mut linked = Vec::with_capacity(libraries.len());
+    let mut stamps = Vec::new();
+    for path in &libraries {
+        let stamp = Stamp::read(path)?;
+        linked.push((path, store::digest(root, path, stamp, now, write_memo)?));
+        if stage_one.is_some() {
+            stamps.push((path.clone(), stamp));
+        }
+    }
 
     // SAFETY: uname initializes the utsname on success and its fields are NUL-terminated.
     let mut host: libc::utsname = unsafe { std::mem::zeroed() };
@@ -152,7 +197,7 @@ pub fn build(
     let key = compose(
         profile.finalize(),
         binary_digest,
-        &closure,
+        &linked,
         args,
         &environment,
         kernel,
@@ -160,12 +205,52 @@ pub fn build(
     if Stamp::read(&binary)? != stamp {
         return Err(io::Error::other("test binary changed while computing key"));
     }
-    Ok(Identity {
-        key,
-        binary_digest,
-        mtime: stamp.mtime,
-        libraries,
-    })
+    let stage = if stage_one.is_some() {
+        let execution = filtered_env(std::env::vars_os(), &configured, &[]).0;
+        let effective_loader_env = loader_environment(execution.clone());
+        if effective_loader_env != loader_env
+            && closure(
+                root,
+                &binary,
+                binary_digest,
+                &cwd,
+                &effective_loader_env,
+                write_memo,
+            )? != libraries
+        {
+            return Err(io::Error::other(
+                "filtered environment changes the library closure",
+            ));
+        }
+        if execution.keys().any(|name| {
+            name.as_bytes().starts_with(b"LD_") && !effective_loader_env.contains_key(name)
+        }) {
+            return Err(io::Error::other("unsupported keyed dynamic-loader setting"));
+        }
+        stamps.push((cwd.join(input), stamp));
+        let mut output_key = blake3::Hasher::new_derive_key("leto test cache captured output v1");
+        for (name, value) in &environment.0 {
+            field(&mut output_key, name.as_bytes());
+            field(&mut output_key, value.as_bytes());
+        }
+        field(&mut output_key, key.as_bytes());
+        Some(StageOne {
+            environment: execution,
+            output_key: *output_key.finalize().as_bytes(),
+            stamps,
+        })
+    } else {
+        None
+    };
+    Ok((
+        Identity {
+            key,
+            binary_digest,
+            mtime: stamp.mtime,
+            libraries,
+        },
+        stage,
+    ))
 }
 
 fn compose(
@@ -274,11 +359,26 @@ fn config_stamp(path: &Path) -> io::Result<Option<String>> {
     }
 }
 
+fn loader_environment(
+    env: impl IntoIterator<Item = (OsString, OsString)>,
+) -> BTreeMap<OsString, OsString> {
+    env.into_iter()
+        .filter(|(name, _)| {
+            matches!(
+                name.to_str(),
+                Some("LD_LIBRARY_PATH" | "LD_HWCAP_MASK" | "LD_ORIGIN_PATH" | "GLIBC_TUNABLES")
+            )
+        })
+        .collect()
+}
+
 fn closure(
     root: &Path,
     binary: &Path,
     digest: blake3::Hash,
     cwd: &Path,
+    loader_env: &BTreeMap<OsString, OsString>,
+    write_memo: bool,
 ) -> io::Result<Vec<PathBuf>> {
     // Let the system loader resolve transitive RUNPATH, hwcaps and the cache in its normal order.
     if ["LD_AUDIT", "LD_PRELOAD"]
@@ -290,20 +390,12 @@ fn closure(
             "cannot shadow with loader audit or preload",
         ));
     }
-    let loader_env: BTreeMap<_, _> = std::env::vars_os()
-        .filter(|(name, _)| {
-            matches!(
-                name.to_str(),
-                Some("LD_LIBRARY_PATH" | "LD_HWCAP_MASK" | "LD_ORIGIN_PATH" | "GLIBC_TUNABLES")
-            )
-        })
-        .collect();
     let mut context = blake3::Hasher::new();
     field(&mut context, b"loader-list-v1");
     field(&mut context, digest.as_bytes());
     field(&mut context, binary.as_os_str().as_bytes());
     field(&mut context, cwd.as_os_str().as_bytes());
-    for (name, value) in &loader_env {
+    for (name, value) in loader_env {
         field(&mut context, name.as_bytes());
         field(&mut context, value.as_bytes());
     }
@@ -393,7 +485,9 @@ fn closure(
         .iter()
         .map(|path| path.as_os_str().as_bytes())
         .collect();
-    store::replace(&memo, &serde_json::to_vec(&(libraries, stamp))?)?;
+    if write_memo {
+        store::replace(&memo, &serde_json::to_vec(&(libraries, stamp))?)?;
+    }
     Ok(objects.into_iter().collect())
 }
 

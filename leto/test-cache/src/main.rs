@@ -1,6 +1,9 @@
 mod key;
 mod observer;
 mod process;
+mod results;
+mod sandbox;
+mod stage_one;
 mod store;
 
 use std::env;
@@ -29,6 +32,17 @@ fn main() {
     };
     let binary = Path::new(&binary);
     let start = Instant::now();
+    if let Some(mode) = stage_one::Mode::selected() {
+        let status = stage_one::run(&mut command, binary, &args, &test, mode, start)
+            .unwrap_or_else(|error| {
+                eprintln!("leto test cache: {error}");
+                if let Some(command) = command.take() {
+                    process::exec(command);
+                }
+                125 << 8
+            });
+        process::finish(status);
+    }
     let root = match store::root() {
         Ok(root) => root,
         Err(error) => {
@@ -126,6 +140,7 @@ fn shadow(
         duration,
         every,
         evidence,
+        None,
     ) {
         store::error(Some(root), binary, &error);
     }
@@ -152,6 +167,7 @@ impl RunRecord<'_> {
         duration: Duration,
         rate: u64,
         evidence: serde_json::Value,
+        cache: Option<serde_json::Value>,
     ) -> io::Result<()> {
         let env = |key| env::var(key).unwrap_or_default();
         let project = env("LETO_TEST_CACHE_PROJECT");
@@ -176,6 +192,9 @@ impl RunRecord<'_> {
             "setup_ns": setup.as_nanos() as u64, "observe_every": rate,
             "outcome": process::outcome(status), "observer": evidence,
         });
+        if let Some(cache) = cache {
+            record["cache"] = cache;
+        }
         for limit in [None, Some(180), Some(32)] {
             if let Some(limit) = limit {
                 for field in [

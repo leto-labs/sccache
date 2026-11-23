@@ -151,7 +151,10 @@ pub fn filter() -> Vec<c::sock_filter> {
 }
 
 pub fn install() -> io::Result<()> {
-    let mut code = filter();
+    install_filter(filter())
+}
+
+pub fn install_filter(mut code: Vec<c::sock_filter>) -> io::Result<()> {
     let mut program = c::sock_fprog {
         len: code.len() as u16,
         filter: code.as_mut_ptr(),
@@ -175,13 +178,16 @@ fn ptrace(operation: c::c_uint, pid: c::pid_t, data: *mut c::c_void) -> io::Resu
     Ok(())
 }
 
-pub fn attach(pid: c::pid_t) -> io::Result<()> {
-    let options = c::PTRACE_O_TRACESECCOMP
+pub fn attach(pid: c::pid_t, sandboxed: bool) -> io::Result<()> {
+    let mut options = c::PTRACE_O_TRACESECCOMP
         | c::PTRACE_O_TRACESYSGOOD
         | c::PTRACE_O_TRACECLONE
         | c::PTRACE_O_TRACEVFORK
         | c::PTRACE_O_TRACEFORK
         | c::PTRACE_O_TRACEEXEC;
+    if sandboxed {
+        options |= c::PTRACE_O_EXITKILL;
+    }
     ptrace(c::PTRACE_SEIZE, pid, options as usize as *mut _)
 }
 
@@ -272,6 +278,7 @@ struct Trace {
     loader_budget: usize,
     system_budget: usize,
     truncated: bool,
+    denied: bool,
 }
 
 impl Trace {
@@ -284,7 +291,15 @@ impl Trace {
         }
     }
 
-    fn record_path(&mut self, access: Access, result: i64, rules: &Rules) {
+    fn record_path(&mut self, access: Access, result: i64, rules: &Rules, sandboxed: bool) {
+        if sandboxed
+            && [c::EACCES, c::EPERM, c::EXDEV]
+                .iter()
+                .any(|&errno| result == -i64::from(errno))
+        {
+            self.denied = true;
+            self.reason.get_or_insert("sandbox access denied");
+        }
         let path = access.path;
         let absent = result == -i64::from(c::ENOENT) || result == -i64::from(c::ENOTDIR);
         let proc_path = ["/proc/self", "/proc/thread-self"]
@@ -295,6 +310,9 @@ impl Trace {
                     .map(|tail| PathBuf::from(format!("/proc/{}", access.pid)).join(tail))
             });
         let resolved = resolve(proc_path.as_deref().unwrap_or(&path));
+        if sandboxed && resolved.starts_with(&rules.temp) {
+            return;
+        }
         if access.kind == Lookup && !absent && rules.is_ancestor(&resolved) {
             insert(
                 &mut self.ancestor_lookups,
@@ -689,7 +707,13 @@ fn loader_text(pid: c::pid_t) -> Option<std::ops::Range<u64>> {
     Some(u64::from_str_radix(start, 16).ok()?..u64::from_str_radix(end, 16).ok()?)
 }
 
-pub fn collect(root: c::pid_t, mut rules: Rules, filtered: bool, notify: impl FnOnce(i32, Value)) {
+pub fn collect(
+    root: c::pid_t,
+    mut rules: Rules,
+    filtered: bool,
+    sandboxed: bool,
+    notify: impl FnOnce(i32, Value),
+) {
     rules.canonicalize();
     let mut trace = Trace::new();
     let mut notify = Some(notify);
@@ -702,15 +726,31 @@ pub fn collect(root: c::pid_t, mut rules: Rules, filtered: bool, notify: impl Fn
             pending.remove(&pid);
             loaders.remove(&pid);
             descendants.remove(&pid);
+            if sandboxed && c::WIFSIGNALED(status) && c::WTERMSIG(status) == c::SIGSYS {
+                trace.denied = true;
+                trace.reason.get_or_insert("sandbox syscall denied");
+            }
             if pid == root
                 && let Some(notify) = notify.take()
             {
+                if sandboxed && !exec_started {
+                    trace.reason.get_or_insert("sandboxed test did not start");
+                }
                 if !descendants.is_empty() {
                     trace
                         .reason
                         .get_or_insert("descendants still running after test exit");
                 }
-                notify(status, trace.evidence(filtered));
+                let mut evidence = trace.evidence(filtered);
+                if sandboxed && filtered {
+                    evidence["denied"] = json!(trace.denied);
+                    evidence["started"] = json!(exec_started);
+                }
+                notify(status, evidence);
+                if sandboxed {
+                    // EXITKILL reaps any tracees that outlived the test.
+                    return;
+                }
             }
             continue;
         }
@@ -732,6 +772,12 @@ pub fn collect(root: c::pid_t, mut rules: Rules, filtered: bool, notify: impl Fn
                     if !in_loader {
                         loaders.remove(&pid);
                     }
+                    if sandboxed && matches!(kind, ExecAt | Exec) && exec_started {
+                        trace.executable(None);
+                        trace.denied = true;
+                        kill_tracee(pid);
+                        return Ok(Vec::new());
+                    }
                     decode(
                         pid,
                         kind,
@@ -743,7 +789,18 @@ pub fn collect(root: c::pid_t, mut rules: Rules, filtered: bool, notify: impl Fn
                 });
                 match decoded {
                     Ok(paths) if !paths.is_empty() => {
-                        pending.insert(pid, paths);
+                        if sandboxed
+                            && paths.iter().any(|access| {
+                                access.kind == Mutate
+                                    && !resolve(&access.path).starts_with(&rules.temp)
+                            })
+                        {
+                            trace.denied = true;
+                            trace.reason.get_or_insert("sandbox write outside TMPDIR");
+                            kill_tracee(pid);
+                        } else {
+                            pending.insert(pid, paths);
+                        }
                     }
                     Ok(_) => {}
                     Err(_) => {
@@ -781,13 +838,35 @@ pub fn collect(root: c::pid_t, mut rules: Rules, filtered: bool, notify: impl Fn
                 if let Some(paths) = pending.remove(&pid) {
                     if let Ok(regs) = registers(pid) {
                         for access in paths {
-                            trace.record_path(access, regs.rax as i64, &rules);
+                            trace.record_path(access, regs.rax as i64, &rules, sandboxed);
                         }
                     } else {
                         trace
                             .reason
                             .get_or_insert("could not read a syscall result");
                     }
+                }
+            }
+            0 if sandboxed && signal == c::SIGSYS => {
+                if let Ok(mut regs) = registers(pid)
+                    && regs.orig_rax == c::SYS_socket as u64
+                {
+                    // RET_TRAP takes precedence over RET_TRACE. Return EACCES
+                    // ourselves so a swallowed socket denial is still recorded.
+                    trace.socket(regs.rdi as i32, None);
+                    trace.denied = true;
+                    regs.rax = (-i64::from(c::EACCES)) as u64;
+                    if ptrace(
+                        c::PTRACE_SETREGS,
+                        pid,
+                        (&mut regs as *mut c::user_regs_struct).cast(),
+                    )
+                    .is_err()
+                    {
+                        kill_tracee(pid);
+                    }
+                } else {
+                    deliver = signal;
                 }
             }
             0 => deliver = signal,
@@ -800,6 +879,11 @@ pub fn collect(root: c::pid_t, mut rules: Rules, filtered: bool, notify: impl Fn
         };
         let _ = ptrace(request, pid, deliver as usize as *mut _);
     }
+}
+
+fn kill_tracee(pid: c::pid_t) {
+    // SAFETY: the positive PID is a live, stopped tracee.
+    unsafe { c::kill(pid, c::SIGKILL) };
 }
 
 #[cfg(test)]
@@ -821,9 +905,14 @@ mod tests {
             kind: ReadContent,
             loader: false,
         };
-        trace.record_path(read("/etc/leto-missing"), -i64::from(c::ENOENT), &rules);
+        trace.record_path(
+            read("/etc/leto-missing"),
+            -i64::from(c::ENOENT),
+            &rules,
+            false,
+        );
         assert_eq!(trace.evidence(true)["class"], "pure");
-        trace.record_path(read("/fake-checkout/fixture"), 0, &rules);
+        trace.record_path(read("/fake-checkout/fixture"), 0, &rules, false);
         assert_eq!(trace.evidence(true)["class"], "files");
         trace.budget = 0;
         trace.record_path(
@@ -835,6 +924,7 @@ mod tests {
             },
             0,
             &rules,
+            false,
         );
         assert_eq!(trace.evidence(true)["class"], "other");
         assert_eq!(trace.evidence(true)["truncated"], true);
