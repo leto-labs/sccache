@@ -269,6 +269,24 @@ class HealthReportTest(unittest.TestCase):
         self.assertFalse(any("tracked size" in warning for warning in warnings), warnings)
         self.assertTrue(any("of cap on disk" in warning for warning in warnings), warnings)
 
+    def test_old_warm_with_nothing_to_warm_is_not_stale(self):
+        # An "unchanged tip" run leaves the marker's age as is; with no commits
+        # to warm that is not a stale pre-warm.
+        repo = self.root / "canonical repo"
+        tip = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+        state = self.root / "prewarm" / "fairfill"
+        status = json.loads((state / "status.json").read_text())
+        status["last_warmed_commit"] = tip
+        (state / "status.json").write_text(json.dumps(status))
+        marker = state / "last-warmed"
+        marker.write_text(tip + "\n")
+        os.utime(marker, (NOW.timestamp() - 5 * 3600,) * 2)
+        report = self.report()
+        prewarm = report["prewarm"]["fairfill"]
+        self.assertEqual(prewarm["lag_commits"], 0)
+        self.assertGreater(prewarm["lag_minutes"], 180)
+        self.assertFalse(any("over 3 hours" in warning for warning in report["warnings"]), report["warnings"])
+
     def test_default_fast_mode_reads_only_bounded_sources(self):
         report = self.report("--miss-log-tail", "4096")
         self.assertEqual(report["mode"], "fast")

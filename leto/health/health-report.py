@@ -576,8 +576,6 @@ def prewarm_report(args, now, warnings):
         if last_warmed_at:
             minutes = max(0, (now - last_warmed_at).total_seconds() / 60)
             project["lag_minutes"] = round(minutes, 1)
-            if minutes > 180:
-                warnings.append(f"Pre-warm {name} last succeeded over 3 hours ago ({minutes:.0f} min)")
 
         try:
             settings = read_prewarm_config(args.prewarm_config / f"{name}.conf")
@@ -592,6 +590,12 @@ def prewarm_report(args, now, warnings):
             warnings.append(f"Cannot determine pre-warm branch lag for {name}: {error}")
         if project["lag_commits"] is not None and project["lag_commits"] > 10:
             warnings.append(f"Pre-warm {name} is {project['lag_commits']} commits behind")
+        # A run that finds the tip already warmed leaves the marker untouched, so
+        # its age alone says nothing; it is stale only with commits to warm.
+        minutes = project["lag_minutes"]
+        if minutes is not None and minutes > 180 and project["lag_commits"] != 0:
+            warnings.append(f"Pre-warm {name} last succeeded over 3 hours ago ({minutes:.0f} min) "
+                            f"with {display(project['lag_commits'])} commits to warm")
     return projects
 
 
