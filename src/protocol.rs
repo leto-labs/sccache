@@ -253,14 +253,19 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                         token_waits_over_10s: queue.token_waits_over_10s,
                         stages: queue.stages,
                         tokens_in_use: None,
-                        tokens_restored: 0,
+                        stalled_for: None,
                     });
+                    let queue = info.stats.compile_queue.as_mut().unwrap();
+                    // Each later field is appended; older daemons stop sooner.
                     if !remaining.is_empty() {
-                        let queue = info.stats.compile_queue.as_mut().unwrap();
-                        let (in_use, remaining) = decode_frame::<usize>(remaining)?;
-                        queue.tokens_in_use = Some(in_use);
+                        let (tokens_in_use, remaining) = decode_frame(remaining)?;
+                        queue.tokens_in_use = Some(tokens_in_use);
+                        // -11 sent a restored-token count here; later daemons send 0.
                         if !remaining.is_empty() {
-                            queue.tokens_restored = bincode::deserialize(remaining)?;
+                            let (_, remaining) = decode_frame::<u64>(remaining)?;
+                            if !remaining.is_empty() {
+                                queue.stalled_for = Some(bincode::deserialize(remaining)?);
+                            }
                         }
                     }
                 }
@@ -351,7 +356,10 @@ fn encode_stats_extension(
         if let Some(tokens_in_use) = queue.tokens_in_use {
             bincode::serialize_into(&mut *frame, &tokens_in_use)?;
             // Older decoders read tokens_in_use as the last field and ignore the rest.
-            bincode::serialize_into(frame, &queue.tokens_restored)?;
+            if let Some(stalled_for) = queue.stalled_for {
+                bincode::serialize_into(&mut *frame, &0_u64)?;
+                bincode::serialize_into(frame, &stalled_for)?;
+            }
         }
     }
     Ok(())
@@ -543,7 +551,7 @@ mod tests {
             token_waits_over_10s: 1,
             stages: BTreeMap::from([(CompileStage::CacheLookup, WaitStats::default())]),
             tokens_in_use: None,
-            tokens_restored: 0,
+            stalled_for: None,
         };
         info.stats.compile_queue = Some(queue.clone());
         let old_json = serde_json::to_value(&info).unwrap();
@@ -560,16 +568,41 @@ mod tests {
         };
         assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
 
+        // A -10 daemon: the frame ends at tokens_in_use, and stalled_for
+        // stays absent, also in the JSON that the health report reads.
+        let tens_queue = CompileQueueStats {
+            tokens_in_use: Some(8),
+            ..queue.clone()
+        };
+        let mut tens_frame = old_queue_frame.clone();
+        tens_frame.extend_from_slice(&8_u64.to_le_bytes());
+        let Response::Stats(decoded) = decode_response(&tens_frame).unwrap() else {
+            panic!("expected stats response");
+        };
+        assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&tens_queue));
+        let tens_json = serde_json::to_value(&decoded).unwrap();
+        assert!(
+            tens_json["stats"]["compile_queue"]
+                .get("stalled_for")
+                .is_none()
+        );
+        // A -11 daemon also sent its restored-token count.
+        let mut elevens_frame = tens_frame.clone();
+        elevens_frame.extend_from_slice(&3_u64.to_le_bytes());
+        let Response::Stats(decoded) = decode_response(&elevens_frame).unwrap() else {
+            panic!("expected stats response");
+        };
+        assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&tens_queue));
+
         let queue = CompileQueueStats {
             tokens_in_use: Some(8),
-            tokens_restored: 3,
+            stalled_for: Some(Duration::from_secs(61)),
             ..queue
         };
         info.stats.compile_queue = Some(queue.clone());
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["stats"]["compile_queue"]["token_wait"]["active"], 2);
         assert_eq!(json["stats"]["compile_queue"]["tokens_in_use"], 8);
-        assert_eq!(json["stats"]["compile_queue"]["tokens_restored"], 3);
         let decoded: ServerInfo = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
 
@@ -595,10 +628,13 @@ mod tests {
             assert_eq!(legacy_queue.running, 7);
             assert_eq!(legacy_queue.stages, queue.stages);
             if matches!(response, Response::Stats(_)) {
-                let previous = frame.strip_suffix(&3_u64.to_le_bytes()).unwrap();
+                // -11's restored-token slot, then the stall.
+                let mut stalled = 0_u64.to_le_bytes().to_vec();
+                stalled.extend_from_slice(&61_u64.to_le_bytes());
+                stalled.extend_from_slice(&0_u32.to_le_bytes());
                 assert_eq!(
-                    previous.strip_suffix(&8_u64.to_le_bytes()),
-                    Some(old_queue_frame.as_slice())
+                    frame.strip_suffix(stalled.as_slice()),
+                    Some(tens_frame.as_slice())
                 );
                 // The previous decoder: tokens_in_use last, the rest ignored.
                 let (_, rest) =

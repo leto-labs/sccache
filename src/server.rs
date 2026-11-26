@@ -722,15 +722,6 @@ impl ShutdownSignals {
     }
 }
 
-/// Aborts a background task when the server stops.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
 pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = ProcessCommandCreator> {
     runtime: Runtime,
     listener: A,
@@ -872,13 +863,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         } = self;
 
         let connections = Arc::new(());
-        let reconcile = service.compile_queue.clone().map(|queue| async move {
-            let mut tick = tokio::time::interval(Duration::from_secs(5));
-            loop {
-                tick.tick().await;
-                queue.reconcile(tokio::time::Instant::now());
-            }
-        });
+        let stalls = service.compile_queue.clone();
         let accept = {
             let connections = connections.clone();
             async move {
@@ -908,13 +893,20 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
             .await;
         };
 
+        let stall_log = async move {
+            match stalls {
+                Some(queue) => queue.log_stalls().await,
+                None => future::pending().await,
+            }
+        };
+
         runtime.block_on(async {
-            let _reconcile = reconcile.map(tokio::spawn).map(AbortOnDrop);
             tokio::select! {
                 biased;
                 _ = signals.recv() => info!("shutting down due to a Unix signal"),
                 _ = shutdown => info!("shutting down due to explicit signal"),
                 _ = shutdown_idle => info!("shutting down due to being idle or request"),
+                () = stall_log => {}
                 result = accept => return result,
             }
             Ok::<_, io::Error>(())
@@ -2890,10 +2882,11 @@ impl ServerStats {
             if let Some(in_use) = queue.tokens_in_use {
                 writer.write(&format!("{:<33} {:>8}", "Tokens in use now", in_use));
             }
-            if queue.tokens_restored > 0 {
+            if let Some(stalled) = queue.stalled_for.filter(|stalled| !stalled.is_zero()) {
                 writer.write(&format!(
                     "{:<33} {:>8}",
-                    "Lost tokens restored", queue.tokens_restored
+                    "Stalled, none running, for",
+                    fmt_duration_as_secs(&stalled)
                 ));
             }
             for (name, value) in [

@@ -134,14 +134,13 @@ class HealthReportTest(unittest.TestCase):
         report = self.report("--stats-json", str(path))
         parsed = report["server"]["stats"]["compile_queue"]
         self.assertEqual(parsed, {
-            "waiting": 2, "running": 0, "capacity": 4, "tokens_in_use": 4, "tokens_restored": 0,
+            "waiting": 2, "running": 0, "capacity": 4, "tokens_in_use": 4, "stalled_seconds": None,
             "total_wait_seconds": 205,
             "max_wait_seconds": 61.5, "oldest_wait_seconds": 61.5, "waits_over_10s": 5,
             "stages": {"cache_lookup": {"active": 3, "total_seconds": 80, "max_seconds": 42, "oldest_seconds": 10}},
         })
         self.assertIn("Maximum compiler token wait exceeds 60 s (61.500 s)", report["warnings"])
-        self.assertIn("2 waiting for compiler tokens with none running for over 60 s (stalled daemon)",
-                      report["warnings"])
+        self.assertIn("2 waiting for compiler tokens with none running (possible stuck daemon)", report["warnings"])
         host_text = REPORT["markdown"](report)
         self.assertIn("| Queue (waiting/running, tokens in use) |", host_text)
         self.assertIn("| 2/0, 4 | 4 | 61.500 s | 61.500 s | 205.000 s | 5 |", host_text)
@@ -163,14 +162,18 @@ class HealthReportTest(unittest.TestCase):
         self.assertEqual(FLEET["headline"](legacy)[1], "2/4, —, 60.000 s")
         self.assertFalse(any("compiler token" in warning for warning in legacy["warnings"]))
 
-        queue.update(running=0, tokens_in_use=1, tokens_restored=3)
-        queue["token_wait"].update(max=duration(5), oldest=duration(5))
+        # A -12 daemon times the stall: a long wait sampled between compiles is not one.
+        queue.update(running=0, tokens_in_use=4, stalled_for=duration(3))
+        queue["token_wait"].update(max=duration(70), oldest=duration(70))
         path.write_text(json.dumps(stats))
-        healed = self.report("--stats-json", str(path))
-        self.assertEqual(healed["server"]["stats"]["compile_queue"]["tokens_restored"], 3)
-        self.assertIn("Daemon restored 3 jobserver tokens lost by killed compilers", healed["warnings"])
-        self.assertFalse(any("none running" in warning for warning in healed["warnings"]))
-        self.assertIn("| 2/0, 1 (3 restored) | 4 |", REPORT["markdown"](healed))
+        timed = self.report("--stats-json", str(path))
+        self.assertEqual(timed["server"]["stats"]["compile_queue"]["stalled_seconds"], 3)
+        self.assertFalse(any("none running" in warning for warning in timed["warnings"]))
+        queue["stalled_for"] = duration(90)
+        path.write_text(json.dumps(stats))
+        stalled = self.report("--stats-json", str(path))
+        self.assertIn("2 waiting for compiler tokens with none running for 90 s "
+                      "(stalled daemon; restart it, see the build-bench runbook)", stalled["warnings"])
 
     def test_host_aggregates_and_warnings(self):
         report = self.report("--deep")

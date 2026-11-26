@@ -30,8 +30,10 @@ pub struct CompileQueueStats {
     pub stages: BTreeMap<CompileStage, WaitStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in_use: Option<usize>,
-    /// Jobserver tokens written back after compilers died holding them.
-    pub tokens_restored: u64,
+    /// How long compiles have waited with none running. Older daemons do not
+    /// report it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stalled_for: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,15 +122,21 @@ struct QueueState {
     last_warning: Option<Instant>,
     stages: BTreeMap<CompileStage, Timing>,
     last_stage_warning: BTreeMap<CompileStage, Instant>,
-    /// Since when no compiler has held a token while some were missing from
-    /// the pipe, and how many were missing then.
-    deficit: Option<(Instant, usize)>,
-    tokens_restored: u64,
     stalled_since: Option<Instant>,
     last_stall_error: Option<Instant>,
 }
 
 impl QueueState {
+    /// Called whenever `running` or the number waiting changes, so a stall is
+    /// one unbroken stretch with waiters and nothing running.
+    fn note_transition(&mut self, now: Instant) {
+        if self.running == 0 && self.token_wait.active > 0 {
+            self.stalled_since.get_or_insert(now);
+        } else {
+            self.stalled_since = None;
+        }
+    }
+
     fn reserve_stage_warning(&mut self, stage: CompileStage, now: Instant) -> bool {
         if self
             .last_stage_warning
@@ -160,21 +168,19 @@ impl QueueState {
         let warning = self.reserve_warning(now, elapsed);
         self.token_wait.finish(start, elapsed);
         self.token_waits_over_10s += u64::from(elapsed > Duration::from_secs(10));
+        self.note_transition(now);
         warning
     }
 }
+
+/// How long compiles may wait with none running before that is logged as an error.
+pub(crate) const STALL_ERROR_AFTER: Duration = Duration::from_secs(60);
 
 fn log_token_warning(warning: Option<(usize, usize)>) {
     if let Some((waiting, running)) = warning {
         warn!("Compiler token wait exceeded 30 s ({waiting} waiting, {running} running)");
     }
 }
-
-/// How long the pool must stay short with no compiler running before the
-/// missing tokens are written back.
-pub(crate) const RECONCILE_AFTER: Duration = Duration::from_secs(30);
-/// How long compiles may wait with none running before that is logged as an error.
-pub(crate) const STALL_ERROR_AFTER: Duration = Duration::from_secs(60);
 
 pub(crate) struct CompileQueue {
     capacity: usize,
@@ -196,13 +202,18 @@ impl CompileQueue {
             .jobserver
             .as_ref()
             .and_then(|client| client.available().ok())
-            .and_then(|available| self.capacity.checked_sub(available));
+            .map(|available| self.capacity.saturating_sub(available));
         let state = self.state.lock().unwrap();
         let now = Instant::now();
         CompileQueueStats {
             token_capacity: self.capacity,
             tokens_in_use,
-            tokens_restored: state.tokens_restored,
+            // The wire carries it after the gauge, so both come or neither.
+            stalled_for: tokens_in_use.map(|_| {
+                state
+                    .stalled_since
+                    .map_or(Duration::ZERO, |since| now - since)
+            }),
             running: state.running,
             token_wait: state.token_wait.snapshot(now),
             token_waits_over_10s: state.token_waits_over_10s,
@@ -230,73 +241,48 @@ impl CompileQueue {
         }
     }
 
-    /// Run periodically. Compilers we spawn share our jobserver pipe, and
-    /// rustc takes extra tokens from it for its codegen threads. A compiler
-    /// killed while holding them (its client went away and `kill_on_drop`
-    /// fired, or it was OOM-killed) never writes them back, so the pool
-    /// shrinks until no compile can start. Every compiler holds one of our
-    /// tokens while it runs, so once none has been running for
-    /// [`RECONCILE_AFTER`] and the same number of tokens is still missing,
-    /// they can only have been lost, and are written back.
-    pub(crate) fn reconcile(&self, now: Instant) -> usize {
-        let Some(client) = &self.jobserver else {
-            return 0;
-        };
-        let mut state = self.state.lock().unwrap();
-        let (running, waiting) = (state.running, state.token_wait.active);
-        if running == 0 && waiting > 0 {
-            let since = *state.stalled_since.get_or_insert(now);
-            if now - since >= STALL_ERROR_AFTER
-                && state
-                    .last_stall_error
-                    .is_none_or(|last| now - last >= STALL_ERROR_AFTER)
-            {
-                state.last_stall_error = Some(now);
-                error!(
-                    "{waiting} compiles waiting for a jobserver token with none running for {}s",
-                    (now - since).as_secs()
-                );
-            }
-        } else {
-            state.stalled_since = None;
-        }
-        let missing = client
-            .available()
-            .ok()
-            .map_or(0, |available| self.capacity.saturating_sub(available));
-        if running != 0 || missing == 0 {
-            state.deficit = None;
-            return 0;
-        }
-        // A token in flight to a waiting compile also looks missing for a
-        // moment; requiring the same count across samples rules it out.
-        match state.deficit {
-            Some((since, seen)) if seen == missing && now - since >= RECONCILE_AFTER => {}
-            Some((_, seen)) if seen == missing => return 0,
-            _ => {
-                state.deficit = Some((now, missing));
-                return 0;
-            }
-        }
-        let mut restored = 0;
-        while restored < missing && client.release_raw().is_ok() {
-            restored += 1;
-        }
-        state.tokens_restored += restored as u64;
-        state.deficit = None;
-        drop(state);
-        error!(
-            "restored {restored} jobserver tokens lost by compilers that exited holding them \
-             ({waiting} compiles were waiting)"
-        );
-        restored
-    }
-
     pub(crate) fn start_token(self: &Arc<Self>) -> TokenUse {
-        let start = self.state.lock().unwrap().token_wait.start();
+        let mut state = self.state.lock().unwrap();
+        let start = state.token_wait.start();
+        state.note_transition(start);
         TokenUse {
             queue: self.clone(),
             waiting_since: Some(start),
+        }
+    }
+
+    /// Logs an error, at most once a minute, while compiles have waited
+    /// longer than [`STALL_ERROR_AFTER`] with none running.
+    fn check_stall(&self, now: Instant) {
+        let mut state = self.state.lock().unwrap();
+        let Some(since) = state.stalled_since else {
+            return;
+        };
+        let stalled = now - since;
+        if stalled >= STALL_ERROR_AFTER
+            && state
+                .last_stall_error
+                .is_none_or(|last| now - last >= STALL_ERROR_AFTER)
+        {
+            state.last_stall_error = Some(now);
+            let waiting = state.token_wait.active;
+            drop(state);
+            error!(
+                "{waiting} compiles waiting for a jobserver token with none running for {}s",
+                stalled.as_secs()
+            );
+        }
+    }
+
+    /// Compilers killed while holding tokens from our pipe (their client went
+    /// away, or the OOM killer) never give them back. The pool cannot be
+    /// repaired in place while their descendants may still hold tokens, so
+    /// this only reports the stall; restarting the daemon recovers it.
+    pub(crate) async fn log_stalls(self: Arc<Self>) {
+        let mut tick = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            tick.tick().await;
+            self.check_stall(Instant::now());
         }
     }
 }
@@ -449,6 +435,7 @@ impl TokenUse {
         let mut state = self.queue.state.lock().unwrap();
         let warning = state.finish_token_wait(self.waiting_since.take().unwrap());
         state.running += 1;
+        state.note_transition(Instant::now());
         drop(state);
         log_token_warning(warning);
     }
@@ -463,6 +450,7 @@ impl Drop for TokenUse {
             log_token_warning(warning);
         } else {
             state.running -= 1;
+            state.note_transition(Instant::now());
         }
     }
 }
@@ -543,45 +531,56 @@ mod tests {
         assert!(counters.total_blocking_work.load(Relaxed) > 0);
     }
 
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn lost_tokens_are_restored_only_when_idle_and_steady() {
-        let client = jobserver::Client::new(2).unwrap();
-        let queue = Arc::new(CompileQueue::new(2, Some(client.clone())));
-        client.acquire_raw().unwrap();
-        client.acquire_raw().unwrap();
+    #[tokio::test(start_paused = true)]
+    async fn stall_is_one_unbroken_stretch_with_waiters_and_nothing_running() {
+        let queue = Arc::new(CompileQueue::new(1, None));
+        let stalled_for = || {
+            let since = queue.state.lock().unwrap().stalled_since;
+            since.map_or(Duration::ZERO, |since| Instant::now() - since)
+        };
+        // Without the gauge, the stats leave it out.
+        assert_eq!(queue.snapshot().stalled_for, None);
+        assert_eq!(stalled_for(), Duration::ZERO);
         let waiter = queue.start_token();
-        let t0 = Instant::now();
+        tokio::time::advance(Duration::from_secs(50)).await;
+        assert_eq!(stalled_for(), Duration::from_secs(50));
 
-        assert_eq!(queue.reconcile(t0), 0);
-        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER / 2), 0);
-        // A changed count starts the wait again.
-        client.release_raw().unwrap();
-        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER), 0);
-        assert_eq!(
-            queue.reconcile(t0 + RECONCILE_AFTER * 2 - Duration::from_secs(1)),
-            0
-        );
-        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER * 2), 1);
-        assert_eq!(client.available().unwrap(), 2);
-        assert_eq!(queue.snapshot().tokens_restored, 1);
-        assert_eq!(queue.state.lock().unwrap().stalled_since, Some(t0));
+        // A short compile between two watchdog ticks ends the stretch.
+        let mut short = queue.start_token();
+        short.acquired();
+        assert_eq!(stalled_for(), Duration::ZERO);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        drop(short);
+        tokio::time::advance(Duration::from_secs(50)).await;
+        assert_eq!(stalled_for(), Duration::from_secs(50));
+
         drop(waiter);
-        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER * 3), 0);
-        assert_eq!(queue.state.lock().unwrap().stalled_since, None);
+        assert_eq!(stalled_for(), Duration::ZERO);
+    }
 
-        // A running compiler may hold any number of tokens.
-        client.acquire_raw().unwrap();
+    #[tokio::test(start_paused = true)]
+    async fn stall_error_is_logged_after_a_minute_and_at_most_once_a_minute() {
+        let queue = Arc::new(CompileQueue::new(1, None));
+        let logger = tokio::spawn(queue.clone().log_stalls());
+        let last_error = || queue.state.lock().unwrap().last_stall_error;
         let mut running = queue.start_token();
         running.acquired();
-        let t1 = Instant::now();
-        assert_eq!(queue.reconcile(t1), 0);
-        assert_eq!(queue.reconcile(t1 + RECONCILE_AFTER * 2), 0);
-        assert_eq!(client.available().unwrap(), 1);
+        let waiter = queue.start_token();
+        tokio::time::sleep(STALL_ERROR_AFTER * 2).await;
+        assert_eq!(last_error(), None);
+
         drop(running);
-        assert_eq!(queue.reconcile(t1 + RECONCILE_AFTER * 3), 0);
-        assert_eq!(queue.reconcile(t1 + RECONCILE_AFTER * 4), 1);
-        assert_eq!(queue.snapshot().tokens_restored, 2);
+        let tick = Duration::from_secs(5);
+        tokio::time::sleep(STALL_ERROR_AFTER - tick).await;
+        assert_eq!(last_error(), None);
+        tokio::time::sleep(tick * 2).await;
+        let first = last_error().unwrap();
+        tokio::time::sleep(STALL_ERROR_AFTER - tick * 2).await;
+        assert_eq!(last_error(), Some(first));
+        tokio::time::sleep(tick * 2).await;
+        assert!(last_error().unwrap() >= first + STALL_ERROR_AFTER);
+        drop(waiter);
+        logger.abort();
     }
 
     #[tokio::test(start_paused = true)]

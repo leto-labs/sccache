@@ -138,14 +138,20 @@ def compile_queue_report(queue, warnings):
     waiting, running = wait["active"], queue["running"]
     if maximum > 60:
         warnings.append(f"Maximum compiler token wait exceeds 60 s ({maximum:.3f} s)")
-    if waiting > 0 and running == 0 and oldest > 60:
-        warnings.append(f"{waiting} waiting for compiler tokens with none running for over 60 s (stalled daemon)")
-    restored = queue.get("tokens_restored", 0)
-    if restored:
-        # The daemon writes back tokens that killed compilers took with them; any is worth a look.
-        warnings.append(f"Daemon restored {restored} jobserver tokens lost by killed compilers")
+    # Daemons from -12 time the stall themselves. For older ones a
+    # sample with waiters and none running is the best sign, though it can fall in a gap
+    # between compiles.
+    if "stalled_for" in queue:
+        stalled = duration_seconds(queue["stalled_for"])
+        if stalled > 60:
+            warnings.append(f"{waiting} waiting for compiler tokens with none running for {stalled:.0f} s "
+                            "(stalled daemon; restart it, see the build-bench runbook)")
+    else:
+        stalled = None
+        if waiting > 0 and running == 0:
+            warnings.append(f"{waiting} waiting for compiler tokens with none running (possible stuck daemon)")
     return {"waiting": waiting, "running": running, "capacity": queue["token_capacity"],
-            "tokens_in_use": queue.get("tokens_in_use"), "tokens_restored": restored,
+            "tokens_in_use": queue.get("tokens_in_use"), "stalled_seconds": stalled,
             "total_wait_seconds": duration_seconds(wait["total"]),
             "max_wait_seconds": maximum, "oldest_wait_seconds": oldest,
             "waits_over_10s": queue["token_waits_over_10s"],
@@ -825,13 +831,10 @@ def markdown(report):
     queue_table = ""
     if queue:
         tokens = queue.get("tokens_in_use")
-        tokens = "—" if tokens is None else tokens
-        if queue.get("tokens_restored"):
-            tokens = f"{tokens} ({queue['tokens_restored']} restored)"
         queue_table = "\n" + table(
             ["Queue (waiting/running, tokens in use)", "Token capacity", "Max token wait", "Oldest current wait",
              "Total token wait", "Waits over 10 s"], [[
-                f"{queue['waiting']}/{queue['running']}, {tokens}", queue["capacity"],
+                f"{queue['waiting']}/{queue['running']}, {tokens if tokens is not None else '—'}", queue["capacity"],
                 f"{queue['max_wait_seconds']:.3f} s", f"{queue['oldest_wait_seconds']:.3f} s",
                 f"{queue['total_wait_seconds']:.3f} s", queue["waits_over_10s"]]])
         if queue["stages"]:
