@@ -533,13 +533,19 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stall_is_one_unbroken_stretch_with_waiters_and_nothing_running() {
-        let queue = Arc::new(CompileQueue::new(1, None));
+        assert_eq!(CompileQueue::new(1, None).snapshot().stalled_for, None);
+        let jobserver = cfg!(unix).then(|| jobserver::Client::new(1).unwrap());
+        let gauged = jobserver.is_some();
+        let queue = Arc::new(CompileQueue::new(1, jobserver));
         let stalled_for = || {
             let since = queue.state.lock().unwrap().stalled_since;
-            since.map_or(Duration::ZERO, |since| Instant::now() - since)
+            let stalled = since.map_or(Duration::ZERO, |since| Instant::now() - since);
+            // The stats report the same, where the gauge is.
+            if gauged {
+                assert_eq!(queue.snapshot().stalled_for, Some(stalled));
+            }
+            stalled
         };
-        // Without the gauge, the stats leave it out.
-        assert_eq!(queue.snapshot().stalled_for, None);
         assert_eq!(stalled_for(), Duration::ZERO);
         let waiter = queue.start_token();
         tokio::time::advance(Duration::from_secs(50)).await;
