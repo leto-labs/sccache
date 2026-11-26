@@ -113,6 +113,15 @@ jobserver. This includes extra tokens acquired by rustc's codegen threads.
 The gauge is omitted for inherited jobservers such as Cargo's FIFO because
 their total capacity is unknown. It is also omitted on Windows.
 
+A compiler killed while it holds tokens from that jobserver, because its
+client disconnected or the kernel's OOM killer ended it, never returns them.
+Every compiler the daemon runs holds one of the daemon's tokens, so when none
+is running, tokens in use can only be lost ones. Every 5 seconds the daemon
+checks this, and once the same number has been missing with none running for
+30 seconds it writes them back, logs an error and counts them under "Lost
+tokens restored". It also logs an error, at most once a minute, while compiles
+have waited for a token with none running for over 60 seconds.
+
 The same stats show active work and elapsed time for request dispatch, compiler
 and task setup, hashing and preprocessing, cache lookup and restore, waits for
 pending writes, Rust miss logging, and distributed job setup. Cache lookup

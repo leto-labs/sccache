@@ -722,6 +722,15 @@ impl ShutdownSignals {
     }
 }
 
+/// Aborts a background task when the server stops.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 pub struct SccacheServer<A: crate::net::Acceptor, C: CommandCreatorSync = ProcessCommandCreator> {
     runtime: Runtime,
     listener: A,
@@ -863,6 +872,13 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         } = self;
 
         let connections = Arc::new(());
+        let reconcile = service.compile_queue.clone().map(|queue| async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                queue.reconcile(tokio::time::Instant::now());
+            }
+        });
         let accept = {
             let connections = connections.clone();
             async move {
@@ -893,6 +909,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         };
 
         runtime.block_on(async {
+            let _reconcile = reconcile.map(tokio::spawn).map(AbortOnDrop);
             tokio::select! {
                 biased;
                 _ = signals.recv() => info!("shutting down due to a Unix signal"),
@@ -2872,6 +2889,12 @@ impl ServerStats {
             writer.write("\nCompiler token queue (since daemon start)");
             if let Some(in_use) = queue.tokens_in_use {
                 writer.write(&format!("{:<33} {:>8}", "Tokens in use now", in_use));
+            }
+            if queue.tokens_restored > 0 {
+                writer.write(&format!(
+                    "{:<33} {:>8}",
+                    "Lost tokens restored", queue.tokens_restored
+                ));
             }
             for (name, value) in [
                 ("Token capacity", queue.token_capacity.to_string()),

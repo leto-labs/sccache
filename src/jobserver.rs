@@ -238,4 +238,65 @@ mod test {
         drop(token);
         assert_eq!(queue.snapshot().tokens_in_use, Some(0));
     }
+
+    /// The worker-01 stall: a client goes away, `kill_on_drop` kills its
+    /// compiler while that holds a token taken from our pipe, and the token
+    /// is gone for good.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn token_held_by_a_killed_compiler_is_restored() {
+        use std::time::Duration;
+        use tokio::io::AsyncBufReadExt;
+        use tokio::time::{Instant, timeout};
+
+        use crate::compile_queue::RECONCILE_AFTER;
+
+        let client = Client::new_num(2).with_compile_queue();
+        let queue = client.compile_queue().unwrap();
+        let token = client.acquire_for_command().await.unwrap();
+        // Takes one more token, as rustc does for a codegen thread.
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c").arg(
+            r#"fd=${CARGO_MAKEFLAGS##*--jobserver-auth=}; fd=${fd%%,*}
+               eval "dd bs=1 count=1 status=none <&$fd" >/dev/null && echo taken && exec sleep 60"#,
+        );
+        cmd.stdout(std::process::Stdio::piped());
+        client.configure(&mut cmd);
+        let mut child = tokio::process::Command::from(cmd)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, "taken\n");
+        drop(child);
+        drop(token);
+        assert_eq!(queue.snapshot().tokens_in_use, Some(1));
+
+        let first = client.acquire_for_command().await.unwrap();
+        let second = client.acquire_for_command();
+        tokio::pin!(second);
+        let blocked = timeout(Duration::from_millis(200), &mut second).await;
+        assert!(blocked.is_err(), "only one token should be left");
+        drop(first);
+        drop(second.await.unwrap());
+        let stats = queue.snapshot();
+        assert_eq!((stats.running, stats.tokens_in_use), (0, Some(1)));
+
+        let now = Instant::now();
+        assert_eq!(queue.reconcile(now), 0);
+        assert_eq!(queue.reconcile(now + RECONCILE_AFTER), 1);
+        assert_eq!(queue.snapshot().tokens_in_use, Some(0));
+        let both = timeout(Duration::from_secs(5), async {
+            (
+                client.acquire_for_command().await.unwrap(),
+                client.acquire_for_command().await.unwrap(),
+            )
+        })
+        .await;
+        assert!(both.is_ok(), "both tokens should be back");
+    }
 }

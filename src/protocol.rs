@@ -252,12 +252,17 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                         token_wait: queue.token_wait,
                         token_waits_over_10s: queue.token_waits_over_10s,
                         stages: queue.stages,
-                        tokens_in_use: if remaining.is_empty() {
-                            None
-                        } else {
-                            Some(bincode::deserialize(remaining)?)
-                        },
+                        tokens_in_use: None,
+                        tokens_restored: 0,
                     });
+                    if !remaining.is_empty() {
+                        let queue = info.stats.compile_queue.as_mut().unwrap();
+                        let (in_use, remaining) = decode_frame::<usize>(remaining)?;
+                        queue.tokens_in_use = Some(in_use);
+                        if !remaining.is_empty() {
+                            queue.tokens_restored = bincode::deserialize(remaining)?;
+                        }
+                    }
                 }
             }
             Response::StorageHandshake(info) => {
@@ -344,7 +349,9 @@ fn encode_stats_extension(
             },
         )?;
         if let Some(tokens_in_use) = queue.tokens_in_use {
-            bincode::serialize_into(frame, &tokens_in_use)?;
+            bincode::serialize_into(&mut *frame, &tokens_in_use)?;
+            // Older decoders read tokens_in_use as the last field and ignore the rest.
+            bincode::serialize_into(frame, &queue.tokens_restored)?;
         }
     }
     Ok(())
@@ -536,6 +543,7 @@ mod tests {
             token_waits_over_10s: 1,
             stages: BTreeMap::from([(CompileStage::CacheLookup, WaitStats::default())]),
             tokens_in_use: None,
+            tokens_restored: 0,
         };
         info.stats.compile_queue = Some(queue.clone());
         let old_json = serde_json::to_value(&info).unwrap();
@@ -554,12 +562,14 @@ mod tests {
 
         let queue = CompileQueueStats {
             tokens_in_use: Some(8),
+            tokens_restored: 3,
             ..queue
         };
         info.stats.compile_queue = Some(queue.clone());
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["stats"]["compile_queue"]["token_wait"]["active"], 2);
         assert_eq!(json["stats"]["compile_queue"]["tokens_in_use"], 8);
+        assert_eq!(json["stats"]["compile_queue"]["tokens_restored"], 3);
         let decoded: ServerInfo = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
 
@@ -585,10 +595,16 @@ mod tests {
             assert_eq!(legacy_queue.running, 7);
             assert_eq!(legacy_queue.stages, queue.stages);
             if matches!(response, Response::Stats(_)) {
+                let previous = frame.strip_suffix(&3_u64.to_le_bytes()).unwrap();
                 assert_eq!(
-                    frame.strip_suffix(&8_u64.to_le_bytes()),
+                    previous.strip_suffix(&8_u64.to_le_bytes()),
                     Some(old_queue_frame.as_slice())
                 );
+                // The previous decoder: tokens_in_use last, the rest ignored.
+                let (_, rest) =
+                    decode_frame::<CompileQueueWire<BTreeMap<CompileStage, WaitStats>>>(remaining)
+                        .unwrap();
+                assert_eq!(bincode::deserialize::<usize>(rest).unwrap(), 8);
             }
         }
 

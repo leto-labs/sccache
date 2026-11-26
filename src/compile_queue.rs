@@ -30,6 +30,8 @@ pub struct CompileQueueStats {
     pub stages: BTreeMap<CompileStage, WaitStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens_in_use: Option<usize>,
+    /// Jobserver tokens written back after compilers died holding them.
+    pub tokens_restored: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,6 +120,12 @@ struct QueueState {
     last_warning: Option<Instant>,
     stages: BTreeMap<CompileStage, Timing>,
     last_stage_warning: BTreeMap<CompileStage, Instant>,
+    /// Since when no compiler has held a token while some were missing from
+    /// the pipe, and how many were missing then.
+    deficit: Option<(Instant, usize)>,
+    tokens_restored: u64,
+    stalled_since: Option<Instant>,
+    last_stall_error: Option<Instant>,
 }
 
 impl QueueState {
@@ -162,6 +170,12 @@ fn log_token_warning(warning: Option<(usize, usize)>) {
     }
 }
 
+/// How long the pool must stay short with no compiler running before the
+/// missing tokens are written back.
+pub(crate) const RECONCILE_AFTER: Duration = Duration::from_secs(30);
+/// How long compiles may wait with none running before that is logged as an error.
+pub(crate) const STALL_ERROR_AFTER: Duration = Duration::from_secs(60);
+
 pub(crate) struct CompileQueue {
     capacity: usize,
     jobserver: Option<jobserver::Client>,
@@ -188,6 +202,7 @@ impl CompileQueue {
         CompileQueueStats {
             token_capacity: self.capacity,
             tokens_in_use,
+            tokens_restored: state.tokens_restored,
             running: state.running,
             token_wait: state.token_wait.snapshot(now),
             token_waits_over_10s: state.token_waits_over_10s,
@@ -213,6 +228,68 @@ impl CompileQueue {
             stage,
             start,
         }
+    }
+
+    /// Run periodically. Compilers we spawn share our jobserver pipe, and
+    /// rustc takes extra tokens from it for its codegen threads. A compiler
+    /// killed while holding them (its client went away and `kill_on_drop`
+    /// fired, or it was OOM-killed) never writes them back, so the pool
+    /// shrinks until no compile can start. Every compiler holds one of our
+    /// tokens while it runs, so once none has been running for
+    /// [`RECONCILE_AFTER`] and the same number of tokens is still missing,
+    /// they can only have been lost, and are written back.
+    pub(crate) fn reconcile(&self, now: Instant) -> usize {
+        let Some(client) = &self.jobserver else {
+            return 0;
+        };
+        let mut state = self.state.lock().unwrap();
+        let (running, waiting) = (state.running, state.token_wait.active);
+        if running == 0 && waiting > 0 {
+            let since = *state.stalled_since.get_or_insert(now);
+            if now - since >= STALL_ERROR_AFTER
+                && state
+                    .last_stall_error
+                    .is_none_or(|last| now - last >= STALL_ERROR_AFTER)
+            {
+                state.last_stall_error = Some(now);
+                error!(
+                    "{waiting} compiles waiting for a jobserver token with none running for {}s",
+                    (now - since).as_secs()
+                );
+            }
+        } else {
+            state.stalled_since = None;
+        }
+        let missing = client
+            .available()
+            .ok()
+            .map_or(0, |available| self.capacity.saturating_sub(available));
+        if running != 0 || missing == 0 {
+            state.deficit = None;
+            return 0;
+        }
+        // A token in flight to a waiting compile also looks missing for a
+        // moment; requiring the same count across samples rules it out.
+        match state.deficit {
+            Some((since, seen)) if seen == missing && now - since >= RECONCILE_AFTER => {}
+            Some((_, seen)) if seen == missing => return 0,
+            _ => {
+                state.deficit = Some((now, missing));
+                return 0;
+            }
+        }
+        let mut restored = 0;
+        while restored < missing && client.release_raw().is_ok() {
+            restored += 1;
+        }
+        state.tokens_restored += restored as u64;
+        state.deficit = None;
+        drop(state);
+        error!(
+            "restored {restored} jobserver tokens lost by compilers that exited holding them \
+             ({waiting} compiles were waiting)"
+        );
+        restored
     }
 
     pub(crate) fn start_token(self: &Arc<Self>) -> TokenUse {
@@ -464,6 +541,47 @@ mod tests {
         assert_eq!(counters.bytes.load(Relaxed), 128);
         assert!(counters.max_blocking_wait.load(Relaxed) > 0);
         assert!(counters.total_blocking_work.load(Relaxed) > 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn lost_tokens_are_restored_only_when_idle_and_steady() {
+        let client = jobserver::Client::new(2).unwrap();
+        let queue = Arc::new(CompileQueue::new(2, Some(client.clone())));
+        client.acquire_raw().unwrap();
+        client.acquire_raw().unwrap();
+        let waiter = queue.start_token();
+        let t0 = Instant::now();
+
+        assert_eq!(queue.reconcile(t0), 0);
+        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER / 2), 0);
+        // A changed count starts the wait again.
+        client.release_raw().unwrap();
+        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER), 0);
+        assert_eq!(
+            queue.reconcile(t0 + RECONCILE_AFTER * 2 - Duration::from_secs(1)),
+            0
+        );
+        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER * 2), 1);
+        assert_eq!(client.available().unwrap(), 2);
+        assert_eq!(queue.snapshot().tokens_restored, 1);
+        assert_eq!(queue.state.lock().unwrap().stalled_since, Some(t0));
+        drop(waiter);
+        assert_eq!(queue.reconcile(t0 + RECONCILE_AFTER * 3), 0);
+        assert_eq!(queue.state.lock().unwrap().stalled_since, None);
+
+        // A running compiler may hold any number of tokens.
+        client.acquire_raw().unwrap();
+        let mut running = queue.start_token();
+        running.acquired();
+        let t1 = Instant::now();
+        assert_eq!(queue.reconcile(t1), 0);
+        assert_eq!(queue.reconcile(t1 + RECONCILE_AFTER * 2), 0);
+        assert_eq!(client.available().unwrap(), 1);
+        drop(running);
+        assert_eq!(queue.reconcile(t1 + RECONCILE_AFTER * 3), 0);
+        assert_eq!(queue.reconcile(t1 + RECONCILE_AFTER * 4), 1);
+        assert_eq!(queue.snapshot().tokens_restored, 2);
     }
 
     #[tokio::test(start_paused = true)]
