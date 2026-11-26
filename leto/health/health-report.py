@@ -552,6 +552,16 @@ def prewarm_failure(name, project, now):
     return f"Pre-warm {name} failing at {tip[:12]} ({failures} {times}{next_try}){line}"
 
 
+def timer_active(name):
+    try:
+        output = command(["systemctl", "--user", "show", f"leto-prewarm@{name}.timer", "-p", "ActiveState"],
+                         timeout=5, env=dict(os.environ, LC_ALL="C")).decode()
+    except (OSError, subprocess.SubprocessError):
+        return True
+    state = dict(line.split("=", 1) for line in output.splitlines() if "=" in line).get("ActiveState")
+    return state in (None, "active", "activating")
+
+
 def prewarm_report(args, now, warnings):
     projects = {}
     try:
@@ -566,11 +576,20 @@ def prewarm_report(args, now, warnings):
         state = args.prewarm_state / name
         project = dict.fromkeys((*status_keys, "last_error", "branch", "lag_commits", "lag_minutes"))
         projects[name] = project
+        # A project whose timer is off (paused, e.g. Longbow on worker-01) keeps its
+        # state and conf; its lag is expected and not worth a warning.
+        if not timer_active(name):
+            project["result"] = "timer disabled"
+            continue
         try:
             status = json.loads((state / "status.json").read_bytes())
             if not isinstance(status, dict):
                 raise ValueError("expected a JSON object")
             project.update({key: status.get(key) for key in status_keys})
+        except FileNotFoundError:
+            # Configured, but its timer has not fired yet.
+            project["result"] = "not yet run"
+            continue
         except (OSError, ValueError) as error:
             warnings.append(f"Cannot read pre-warm status for {name}: {error}")
             continue

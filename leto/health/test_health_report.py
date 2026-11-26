@@ -57,6 +57,8 @@ class HealthReportTest(unittest.TestCase):
         mock_bin.mkdir()
         systemctl = mock_bin / "systemctl"
         systemctl.write_text("#!/bin/sh\n"
+                             "case \"$3\" in \"leto-prewarm@${PAUSED_TIMER:-none}.timer\") "
+                             "echo ActiveState=inactive; exit 0;; esac\n"
                              "printf '%s\\n' ActiveState=\"${UNIT_STATE:-active}\" "
                              "'ActiveEnterTimestamp=Sat 2026-10-10 11:58:00 UTC' MainPID=42\n")
         systemctl.chmod(0o755)
@@ -313,6 +315,14 @@ class HealthReportTest(unittest.TestCase):
         status_path.write_text(json.dumps(status))
         self.assertTrue(any("(1 time, retry due): data-root guard" in warning
                             for warning in self.report()["warnings"]))
+
+    def test_project_with_a_disabled_timer_is_reported_without_lag_warnings(self):
+        with patch.dict(os.environ, PAUSED_TIMER="fairfill"):
+            report = self.report()
+        prewarm = report["prewarm"]["fairfill"]
+        self.assertEqual(prewarm["result"], "timer disabled")
+        self.assertIsNone(prewarm["lag_commits"])
+        self.assertFalse(any("Pre-warm fairfill" in warning for warning in report["warnings"]), report["warnings"])
 
     def test_default_fast_mode_reads_only_bounded_sources(self):
         report = self.report("--miss-log-tail", "4096")

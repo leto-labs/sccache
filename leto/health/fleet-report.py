@@ -67,6 +67,7 @@ def headline(report):
     lags = ", ".join(
         f"{project} ({with_suffix(values['lag_commits'], ' commits')}, {with_suffix(values['lag_minutes'], ' min')})"
         for project, values in report.get("prewarm", {}).items()
+        if values.get("result") != "timer disabled"
     )
     return [
         with_suffix(stats.get("hit_rate_pct", {}).get("rust"), "%"),
