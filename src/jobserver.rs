@@ -42,6 +42,9 @@ pub struct Client {
     fifo: bool,
     capacity: usize,
     compile_queue: Option<Arc<CompileQueue>>,
+    /// Whether children are started in process groups of their own, to be
+    /// killed whole (see `mock_command::GroupKill`).
+    pub(crate) process_groups: bool,
 }
 
 pub struct Acquired {
@@ -114,6 +117,7 @@ impl Client {
             fifo,
             capacity,
             compile_queue: None,
+            process_groups: false,
         }
     }
 
@@ -121,6 +125,10 @@ impl Client {
         // Windows would have to acquire and release a token to sample the semaphore.
         let jobserver = (cfg!(unix) && !self.fifo).then(|| self.inner.clone());
         self.compile_queue = Some(Arc::new(CompileQueue::new(self.capacity, jobserver)));
+        // Only the daemon runs compiles for clients that can go away. Run in
+        // the foreground at a terminal, it keeps one group: a child in a
+        // background group that read the terminal would stop.
+        self.process_groups = cfg!(unix) && !std::io::IsTerminal::is_terminal(&std::io::stdin());
         self
     }
 

@@ -122,6 +122,19 @@ Restarting the daemon recovers the pool. It is not repaired in place, because
 the killed compiler's descendants may still hold its tokens and return them
 later.
 
+On Unix the daemon, unless it runs in the foreground at a terminal, starts
+each compiler in its own process group. It kills that group before reaping the
+compiler when a compile is cancelled (for example, because its client
+disconnected), and on Linux before reaping it on normal exit too (using a
+`pidfd`), so nothing the compiler started outlives it. A linker or other helper
+therefore cannot keep jobserver tokens, or write its output after a retry has
+written the same file. Any background daemon a wrapped tool spawns without
+calling `setsid` (so it remains in the compiler's process group) is also killed
+when the compiler exits; a process that moves itself into another group or
+session escapes this. Compilers and linkers do not do that. Compiles that a
+client runs itself, locally or in client-side mode, stay in the client's
+process group, so a Ctrl-C at the terminal still reaches them.
+
 The same stats show active work and elapsed time for request dispatch, compiler
 and task setup, hashing and preprocessing, cache lookup and restore, waits for
 pending writes, Rust miss logging, and distributed job setup. Cache lookup

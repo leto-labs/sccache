@@ -156,8 +156,164 @@ pub trait CommandCreatorSync: Clone + Send + Sync + 'static {
 }
 
 pub struct Child {
+    // Dropped first: the group is killed before Tokio can reap the leader and
+    // before the token goes back.
+    group: GroupKill,
+    #[cfg(target_os = "linux")]
+    pidfd: Option<tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>>,
     inner: tokio::process::Child,
-    token: CommandToken,
+    _token: CommandToken,
+}
+
+/// The daemon's children each lead their own process group. When a compile is
+/// cancelled because its client went away, `kill_on_drop` alone would kill
+/// only the compiler, and a linker or other helper it started would keep
+/// running: holding jobserver tokens taken from the daemon's pipe, and writing
+/// its output after a retry has written it.
+///
+/// The group is always killed before the leader is reaped so its PGID is still
+/// pinned by the leader (running or zombie) and cannot be reused by another
+/// process:
+/// - on drop/cancellation, `GroupKill::drop` runs before `inner` is dropped;
+/// - on normal exit on Linux, a `pidfd` notifies us when the leader enters
+///   zombie state (verified with `WNOWAIT`), so we kill the group before
+///   calling `inner.wait()` to reap it.
+struct GroupKill(Option<u32>);
+
+impl GroupKill {
+    fn kill(&mut self) {
+        let pgid = self.0.take();
+        #[cfg(unix)]
+        if let Some(pgid) = pgid
+            .and_then(|pgid| i32::try_from(pgid).ok())
+            .filter(|&pgid| pgid > 1)
+        {
+            // SAFETY: plain syscall on a group whose leader is not yet reaped.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = pgid;
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn warn_pidfd_open_failed(pid: u32, err: &io::Error) {
+    use std::sync::OnceLock;
+    use std::time::{Duration, Instant};
+
+    static LAST_WARN: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+    let mut last = LAST_WARN.get_or_init(Default::default).lock().unwrap();
+    let now = Instant::now();
+    if last.is_none_or(|prev| now.duration_since(prev) >= Duration::from_secs(60)) {
+        *last = Some(now);
+        drop(last);
+        warn!(
+            "pidfd_open failed for child {pid}: {err}; normal-exit process-group cleanup \
+             disabled for this compile"
+        );
+    } else {
+        drop(last);
+        debug!("pidfd_open failed for child {pid}: {err}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_pidfd(pid: u32) -> io::Result<tokio::io::unix::AsyncFd<std::os::unix::io::OwnedFd>> {
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "pid out of range"))?;
+    // SAFETY: `pid` is an unreaped child we just spawned; `pidfd_open` sets
+    // `O_CLOEXEC` and returns a new owned file descriptor. Flags are `0`
+    // (`PIDFD_NONBLOCK` requires Linux 5.10, while `AsyncFd` uses epoll and
+    // `waitid` already passes `WNOHANG`).
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0 as libc::c_uint) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `pidfd_open` returned a valid, newly allocated descriptor.
+    let owned = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    // SAFETY: `owned` is a valid open file descriptor owned exclusively by the
+    // returned `AsyncFd` and is never replaced or closed while registered.
+    unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(owned, tokio::io::Interest::READABLE)
+    }
+    .map_err(|err| err.into_parts().1)
+}
+
+#[cfg(target_os = "linux")]
+fn pidfd_exited(fd: std::os::unix::io::RawFd) -> io::Result<bool> {
+    loop {
+        // SAFETY: zeroed `siginfo_t` is valid as an out-param for `waitid`.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: `fd` is our live pidfd; `WNOWAIT` inspects exit state
+        // without reaping the zombie, keeping the PGID pinned.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PIDFD,
+                fd as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            // SAFETY: `si_pid` is populated by `waitid` when a waitable child
+            // matched, and zeroed by the kernel when `WNOHANG` found none.
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+impl Child {
+    async fn wait_and_kill_group(&mut self) -> io::Result<ExitStatus> {
+        #[cfg(target_os = "linux")]
+        if let Some(pidfd) = self.pidfd.take() {
+            use std::os::unix::io::AsRawFd;
+            let raw_fd = pidfd.as_raw_fd();
+            loop {
+                let mut guard = match pidfd.readable().await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        debug!("pidfd readability wait failed: {err}");
+                        break;
+                    }
+                };
+                match pidfd_exited(raw_fd) {
+                    Ok(true) => {
+                        self.group.kill();
+                        break;
+                    }
+                    Ok(false) => {
+                        guard.clear_ready();
+                    }
+                    Err(err) => {
+                        debug!("waitid(P_PIDFD, WNOWAIT) failed: {err}");
+                        break;
+                    }
+                }
+            }
+            drop(pidfd);
+        }
+        let result = self.inner.wait().await;
+        // Once the leader is reaped, never send a post-reap kill(-pgid).
+        self.group.disarm();
+        result
+    }
 }
 
 /// Trivial implementation of `CommandChild` for `std::process::Child`.
@@ -177,17 +333,31 @@ impl CommandChild for Child {
         self.inner.stderr.take()
     }
 
-    async fn wait(self) -> io::Result<ExitStatus> {
-        let Child { mut inner, token } = self;
-        inner.wait().await.inspect(|_ret| {
-            drop(token);
-        })
+    async fn wait(mut self) -> io::Result<ExitStatus> {
+        // `self` stays whole, so a cancelled wait drops the fields in order.
+        self.wait_and_kill_group().await
     }
 
-    async fn wait_with_output(self) -> io::Result<Output> {
-        let Child { inner, token } = self;
-        inner.wait_with_output().await.inspect(|_ret| {
-            drop(token);
+    async fn wait_with_output(mut self) -> io::Result<Output> {
+        use tokio::io::AsyncReadExt;
+        async fn read_all<R: AsyncRead + Unpin>(pipe: Option<R>) -> io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                pipe.read_to_end(&mut buf).await?;
+            }
+            Ok(buf)
+        }
+        let stdout = read_all(self.inner.stdout.take());
+        let stderr = read_all(self.inner.stderr.take());
+        drop(self.inner.stdin.take());
+        // Kill the group before the leader is reaped (via pidfd on Linux), so
+        // a helper still holding the pipes cannot keep the reads alive.
+        let status = self.wait_and_kill_group();
+        let (status, stdout, stderr) = futures::future::try_join3(status, stdout, stderr).await?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
         })
     }
 }
@@ -319,6 +489,15 @@ impl RunCommand for AsyncCommand {
         // The token is acquired either way: it rate-limits how many children
         // *we* run, which is separate from whether the child can acquire
         // tokens of its own.
+        // Compiles run by a client stay in its group, so that a Ctrl-C at the
+        // terminal still reaches them.
+        let own_group = self.jobserver.process_groups;
+        #[cfg(unix)]
+        if own_group {
+            use std::os::unix::process::CommandExt;
+            inner.process_group(0);
+        }
+
         let token = self.jobserver.acquire_for_command().await?;
         let mut inner = tokio::process::Command::from(inner);
         let child = {
@@ -327,9 +506,22 @@ impl RunCommand for AsyncCommand {
         }
         .with_context(|| format!("failed to spawn {:?}", inner))?;
 
+        let pgid = child.id().filter(|_| own_group);
+        #[cfg(target_os = "linux")]
+        let pidfd = pgid.and_then(|pid| match open_pidfd(pid) {
+            Ok(pidfd) => Some(pidfd),
+            Err(err) => {
+                warn_pidfd_open_failed(pid, &err);
+                None
+            }
+        });
+
         Ok(Child {
+            group: GroupKill(pgid),
+            #[cfg(target_os = "linux")]
+            pidfd,
             inner: child,
-            token,
+            _token: token,
         })
     }
 }
@@ -873,5 +1065,151 @@ mod test {
             ("CARGO_MAKEFLAGS", "--jobserver-auth=3,4"),
             ("MAKEFLAGS", "--jobserver-auth=fifo:/dev/x"),
         ]));
+    }
+
+    /// The daemon's cancelled compile: its client went away, so the child is
+    /// dropped. A helper it started (a linker, say) must die with it, not
+    /// write its output later, whether the child was never waited for or its
+    /// wait was cancelled. A helper that outlives its leader dies when the
+    /// leader is reaped, even while it holds the output pipes. A client's own
+    /// children stay in its process group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_child_leaves_nothing_behind() {
+        use std::time::Duration;
+        use tokio::io::AsyncBufReadExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let marker = |name: &str| dir.path().join(name);
+        // The helper writes the marker after a second unless it is killed.
+        let command = |client: &Client, name: &str, leader: &str| {
+            let mut cmd =
+                <ProcessCommandCreator as CommandCreatorSync>::new(client).new_command_sync("bash");
+            cmd.arg("-c")
+                .arg(format!(
+                    "(sleep 1; touch {}; sleep 30) & echo started; {leader}",
+                    marker(name).display()
+                ))
+                .stdout(Stdio::piped());
+            cmd
+        };
+        async fn started(child: &mut Child) {
+            let mut line = String::new();
+            let mut stdout = tokio::io::BufReader::new(child.take_stdout().unwrap());
+            stdout.read_line(&mut line).await.unwrap();
+            assert_eq!(line, "started\n");
+            child.inner.stdout = Some(stdout.into_inner());
+        }
+        let settle = || tokio::time::sleep(Duration::from_secs(2));
+
+        let mut daemon = Client::new_num(2).with_compile_queue();
+        daemon.process_groups = true;
+        let mut child = command(&daemon, "dropped", "exec sleep 30")
+            .spawn()
+            .await
+            .unwrap();
+        let pid = child.inner.id().unwrap() as i32;
+        // SAFETY: plain syscalls on our own children.
+        assert_eq!(unsafe { libc::getpgid(pid) }, pid);
+        started(&mut child).await;
+        drop(child);
+
+        let mut child = command(&daemon, "cancelled", "exec sleep 30")
+            .spawn()
+            .await
+            .unwrap();
+        started(&mut child).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), child.wait())
+                .await
+                .is_err()
+        );
+
+        // The leader exits at once; its helper still holds stdout. On Linux a
+        // pidfd notifies us before reaping so the group is killed while the
+        // zombie still pins the PGID.
+        #[cfg(target_os = "linux")]
+        {
+            let mut child = command(&daemon, "outlived", "exit 0")
+                .spawn()
+                .await
+                .unwrap();
+            assert!(child.pidfd.is_some());
+            started(&mut child).await;
+            let begun = std::time::Instant::now();
+            let output = child.wait_with_output().await.unwrap();
+            assert!(output.status.success());
+            assert!(
+                begun.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                begun.elapsed()
+            );
+
+            // Same pre-reap kill on plain `wait()`.
+            let mut child = command(&daemon, "outlived-wait", "exit 0")
+                .spawn()
+                .await
+                .unwrap();
+            started(&mut child).await;
+            assert!(child.wait().await.unwrap().success());
+
+            // Fallback when `pidfd` is unavailable: drop/cancel still kills the
+            // group before reaping, while normal `wait()` disarms without a
+            // post-reap kill(-pgid).
+            let mut child = command(&daemon, "no-pidfd-drop", "exec sleep 30")
+                .spawn()
+                .await
+                .unwrap();
+            child.pidfd = None;
+            started(&mut child).await;
+            drop(child);
+
+            let mut child = command(&daemon, "no-pidfd-wait", "exit 0")
+                .spawn()
+                .await
+                .unwrap();
+            child.pidfd = None;
+            started(&mut child).await;
+            assert!(child.wait().await.unwrap().success());
+        }
+
+        // Normal exit with no background helper is unaffected.
+        let mut normal =
+            <ProcessCommandCreator as CommandCreatorSync>::new(&daemon).new_command_sync("bash");
+        normal.args(&["-c", "printf ok"]).stdout(Stdio::piped());
+        let output = normal
+            .spawn()
+            .await
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"ok");
+
+        settle().await;
+        for name in ["dropped", "cancelled"] {
+            assert!(!marker(name).exists(), "{name}");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            for name in ["outlived", "outlived-wait", "no-pidfd-drop"] {
+                assert!(!marker(name).exists(), "{name}");
+            }
+            assert!(marker("no-pidfd-wait").exists());
+        }
+
+        let client = Client::new_num(2);
+        let mut child = command(&client, "client", "exec sleep 30")
+            .spawn()
+            .await
+            .unwrap();
+        let pid = child.inner.id().unwrap() as i32;
+        assert_eq!(unsafe { libc::getpgid(pid) }, unsafe { libc::getpgid(0) });
+        started(&mut child).await;
+        drop(child);
+        settle().await;
+        // Outside the daemon only the leader is killed, as before.
+        assert!(marker("client").exists());
     }
 }
