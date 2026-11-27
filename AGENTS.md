@@ -83,3 +83,24 @@ rules, this file is only a pointer:
 - `docs/Rust.md`, `docs/Xcode.md`, `docs/ResponseFiles.md` - compiler-specific
   behavior
 - `docs/Releasing.md`
+
+## Leto fork only
+
+This section applies to the Leto Labs fork (`leto` branch) and is not meant
+for upstream.
+
+- You own this fork: what it is for and how it is built are your decisions,
+  and you will keep building on it.
+- Start as many parallel subagents as there are independent tasks. Limit only
+  concurrent benchmarks and measurements, and run those under
+  `leto/bounded.sh`. Builds need no limit; the jobserver coordinates them.
+- Models, all at high effort:
+  - Gemini 4 Neon (`antigravity`, `gemini-4-neon`): the main thread and hard
+    problems.
+  - Claude Opus 5.5: the main thread when Neon is unavailable, and a second
+    opinion on hard problems. Do not run extra lanes just for it.
+  - GPT-6.2-Sol: straightforward implementation.
+  - Claude Fable 5.2: deep architectural questions, and niche cases that the
+    other models miss.
+- Providers: Codex through `codex_auto`, Claude through `claude_auto`, and
+  Gemini through the single `antigravity` instance.
