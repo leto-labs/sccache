@@ -1,6 +1,6 @@
-# Jobserver pool swap on a confirmed stall (leto-4ehq)
+# Jobserver pool swap after killed compilers (leto-4ehq)
 
-Status: design, not implemented.
+Status: design, revised after one review round (2026-11-27). Not implemented.
 
 ## Problem
 
@@ -17,115 +17,177 @@ on worker-01 (36 tokens), 14 tokens were lost about 5 h after a restart
 (2026-11-27). The only recovery today is a SIGTERM restart (build-bench
 runbook), which Core applies every 2 h.
 
-Rejected in review:
+There is a second problem. `kill_on_drop` kills only the direct child. A
+linker or build helper that the killed rustc started keeps running, keeps its
+tokens, and can still write its output after a retry has written the same
+path. Restarts have the same exposure.
+
+Rejected in earlier review rounds:
 - Repairing the pipe in place. Tokens in flight, and tokens that surviving
-  descendants still hold, cannot be told from lost ones, so a refill can push
-  the pool above capacity, and that can compound.
-- Not killing the compilers of disconnected clients. A cancelled compile can
-  finish after a newer one and leave a stale artifact.
-- Exiting the daemon on a stall. A cache restore that outlasts the drain can
-  overwrite a local retry, and a client-side preprocessor lookup fails
-  (leto-vk2f).
-
-## Idea
-
-Never repair a pipe. On a confirmed stall, give new compiles a fresh pipe with
-full capacity, and abandon the old one. Every token goes back to the pipe it
-came from, so each pipe's accounting stays consistent. Nothing has to tell a
-lost token from a borrowed one.
+  descendants hold, cannot be told from lost ones.
+- Not killing the compilers of disconnected clients. This leaves a stale
+  artifact.
+- A daemon self-exit. A cache restore can outlast the drain, and a
+  client-side lookup fails (leto-vk2f).
 
 ## Design
 
-1. **Pool generations.** `jobserver::Client` keeps
-   `current: Arc<Mutex<Arc<Pool>>>`. Each `Pool` holds its own
-   `jobserver::Client`, its helper thread, its request channel, its capacity
-   and a generation number. Clones of `Client`, held by `ProcessCommandCreator`
-   and the service, share `current`. A `tokio::sync::watch<u64>` announces the
-   generation.
+### 0. Kill the whole compiler process group (prerequisite)
 
-2. **Acquire, then configure from the same pool.**
-   - `acquire_for_command` reads the current pool, then waits for either:
-     - its helper hands over a token: the result is a `CommandToken` that
-       keeps `Arc<Pool>`; or
-     - the generation changes: drop the request and retry on the new pool,
-       keeping the same `TokenUse`, so the wait time and stats carry over.
-   - `AsyncCommand::spawn` today calls `configure` before it acquires. It will
-     acquire first, then `token.configure(&mut cmd)`, so a child always gets
-     the fds of the pool its token came from.
-   - Callers that spawn without sharing are unchanged.
+Spawn compilers in their own process group with `CommandExt::process_group(0)`,
+stable since 1.64 and below our MSRV, which keeps `posix_spawn`. Replace
+`kill_on_drop` with a guard. If the child has not been reaped, it sends
+`SIGKILL` to `-pgid`, then lets tokio reap the child.
 
-3. **Swap trigger.** The existing 5 s stall check (`log_stalls`) swaps when
-   `stalled_for >= 120 s`: `running == 0` and `waiting > 0`, as one unbroken
-   stretch timed on queue transitions. It does this under the queue lock, and
-   checks the condition again under that lock.
-   - Swap: build `Pool::new(capacity)` (a pipe plus a helper thread). If that
-     fails, for example from fd exhaustion, log an error and keep the old pool.
-   - Store it in `current` and bump the generation.
-   - Log an error naming the old pool's tokens in use and its age.
-   - Count `pool_swaps` in the stats.
+After that, nothing a killed compiler started survives, except processes that
+call `setsid` themselves, which compilers and linkers do not. So nothing holds
+old tokens, and nothing writes outputs late. This alone removes the
+stale-output exposure, with or without a swap.
 
-4. **The old pool.** It is dropped when its last `Arc` goes. Holders of that
-   `Arc`:
-   - `CommandToken`s still out. A compile admitted just before the swap runs
-     on the old pool and returns its token there.
-   - The old helper thread, which a cancelled request may still use for one
-     read.
+### 1. Pool generations (Linux only at first)
 
-   `HelperThread`'s Drop interrupts and joins its thread. That runs from
-   `spawn_blocking`, never on an async worker. Once the daemon has closed its
-   fds, the pipe lives on only in surviving descendants, whose tokens go back
-   into a pipe nobody reads.
+Split each generation into two parts:
+- `Pipe`: a `jobserver::Client`. `Acquired` tokens and `configure` hold it.
+- `Helper`: a `HelperThread` and its request channel. Only the `Client`
+  holds it.
 
-5. **Gauge and stats.**
-   - `tokens_in_use` reads the current pool.
-   - `pool_swaps: u64` is appended to the stats wire after `stalled_for`, and
-     is absent from older daemons.
-   - The health report warns when `pool_swaps` grows: the leak rate. The
-     runbook restart is still there if swaps loop.
+`Client` keeps `current: Mutex<Generation { id, pipe: Arc<Pipe>, helper: Arc<Helper> }>`
+and a `watch<u64>` of the id.
 
-## Why it is safe
+On macOS, jobserver creates the pipe with `pipe()` followed by `fcntl`, so a
+concurrent fork can inherit it. macOS keeps a single pool.
 
-- **No accounting race.** Nothing reads a pipe's counts to decide how many
-  tokens to write. A swap only redirects future acquisitions.
-- **Bounded overrun.** At the swap nothing runs (`running == 0`). Extra
-  parallelism comes from two sources:
-  - descendants of killed compilers still holding old tokens, which run
-    anyway;
-  - compiles admitted on the old pool in the instant before the swap.
+### 2. Atomic admission
 
-  Neither grows across swaps. An old pool is never refilled, and each swap
-  needs a new 120 s stall.
-- **No compile is cut off,** and no client sees a disconnect. Waiters move to
-  the new pool, and the daemon keeps running.
-- **No artifact risk.** Kill-on-drop is unchanged, so outputs are written only
-  by live compiles, exactly as today.
+`acquire_for_command` loops with one `TokenUse` for the whole wait. Each pass:
+1. Subscribe to the id first, then snapshot the generation.
+2. Request a token from that generation's helper.
+3. Wait for either the token or a change of id.
+4. On a token: take `current`'s mutex. If the id is unchanged, mark the
+   command running (`TokenUse::acquired`) inside that critical section and
+   return a `CommandToken` holding the token and its `Arc<Pipe>`. Otherwise
+   drop the token, which returns it to its own old pipe, and loop again.
+5. On a change of id: drop the request and loop again. If the old helper later
+   fills the dropped oneshot, that token goes back to the old pipe.
 
-## Limits
+The swap publishes under the same mutex, so no command can be admitted on a
+stale generation after the swap.
 
-- Fresh tokens can oversubscribe the CPUs while an orphan that holds many old
-  tokens keeps running. That is the same as today without the swap, where
-  those processes run too.
-- A partial leak (pool short, but never fully stalled) is not repaired. It
-  costs throughput until the next stall or restart. A lower trigger, such as
-  swapping when tokens in use stay above half of capacity with nothing running
-  for 10 min, would cover it with the same mechanism. Proposed as a later
-  setting, off at first.
-- Linux and macOS only, where the pool is a private pipe. Fifo and Windows
-  pools are unchanged.
+Waiters lose their FIFO position at a swap. That is acceptable: swaps are rare
+and every waiter re-requests at once.
+
+### 3. Spawn order
+
+The order becomes: acquire, then configure the child with the token's `Pipe`
+(only on the existing private-sharing branch), then spawn. The `Arc<Pipe>`
+lives through `spawn()` because `pre_exec` captures raw fds.
+
+The rest stays as it is:
+- the FIFO paths: a forwarded named FIFO still takes a daemon admission token;
+  `from_env_fifo` takes none but is still configured;
+- non-sharing spawns;
+- the spawn guard, which still covers only the OS spawn, never the token wait.
+
+### 4. Triggers and swap
+
+The existing 5 s stall check evaluates the triggers off the run loop. It
+never returns from its `select!` branch, on success or on failure.
+
+Two triggers, each with its own state, not `stalled_for`:
+- **Hard stall:** the current pipe is empty, `running == 0` and
+  `waiting > 0`, continuously for 120 s within the current generation.
+- **Idle deficit:** `running == 0` and `waiting == 0`, and the pipe is short
+  of capacity by at least a quarter, by the same count, for 10 min within the
+  current generation. This covers the partial loss on worker-01, where 22 of
+  36 slots are left and progress continues. It can be switched off with
+  `[server] jobserver_swap = "stall"`, and `"off"` disables both. The default
+  is "stall,idle".
+
+Why a false positive is harmless:
+- After the process-group kill, at `running == 0` nothing outside the daemon
+  holds pipe tokens. A deficit can only be lost tokens, or a token in flight
+  in our own helper.
+- An unneeded swap only redirects future acquisitions to a full new pool.
+  Tokens in flight return to the old pipe.
+- Nothing is ever written into a pipe by count.
+
+The swap itself:
+1. On a trigger, build a candidate (a pipe and a helper) in `spawn_blocking`,
+   outside every lock.
+2. Under `current`'s mutex, check the trigger condition and the id again, then
+   publish.
+3. If creation fails, for example from fd exhaustion, log an error, keep the
+   old pool, and back off for 10 min.
+
+### 5. Retiring the old helper
+
+At the swap, the old `Helper` is taken out of `current`. Its request channel
+is closed, so it serves no new requests, and it is handed to a dedicated
+retirement thread: a plain `std::thread`, never a tokio worker. That thread
+drops it, which interrupts and joins the helper.
+
+jobserver gives up the join after about 1 s and detaches a stuck helper.
+Retirements that were not confirmed are counted. Above 4, swapping stops,
+with an error log and a health warning. Recovery then falls back to the
+runbook restart.
+
+The old `Pipe` closes when its last token is dropped.
+
+### 6. Gauge, stats, logs
+
+- `tokens_in_use` samples the current generation's pipe. `CompileQueue` holds
+  a handle to `current`, not a pipe clone.
+- Each swap logs at error level: the generation, the trigger, the old pipe's
+  tokens in use, and its age.
+- `pool_swaps: Option<u64>` and `retire_pending: Option<u64>` are appended to
+  the stats wire after `stalled_for`, keeping the -11 placeholder. They are
+  absent from older daemons.
+- The health report warns when swaps rise. A swap count measures recoveries,
+  not the leak, so the report keeps showing tokens in use with nothing
+  running.
+
+## Bounds
+
+- **No accounting race.** No decision writes tokens by count.
+- **No compounding overrun.** A process-group kill leaves no holders of old
+  tokens, and an old pipe is never refilled. Compiles admitted on the old
+  generation just before a swap finish normally and return their tokens there.
+- **No cut-off compile, no client error.** Waiters move to the new pool, and
+  the daemon keeps running.
+- **Fd and thread use stay bounded:** at most one live helper per generation
+  that still has holders, plus at most 4 unconfirmed retirements.
 
 ## Tests
 
-- Unit (paused time):
-  - with leaked tokens, a waiter stalls for 120 s, the swap happens, and the
-    waiter gets a token from the new pool;
-  - a token taken before the swap returns to the old pool, and the new pool
-    stays at capacity;
-  - the generation retry keeps the `TokenUse` wait time.
-- Spawn: a child configured after a swap gets the new pool's fds. A child
-  spawned before it keeps the old ones.
-- A real-child reproduction: a child takes a token from the pipe and is killed
-  while holding it, until the pool stalls. The swap restores throughput, and
-  the old pipe's later returns do not reach the new one.
-- Wire: `pool_swaps` appended, and -10, -11 and -12 frames read both ways.
-- No self-exit, so the run loop is unchanged apart from the existing stall
-  task.
+- **Process group:**
+  - a compiler that starts a grandchild, a "linker" that sleeps and then
+    writes a file, is killed by drop; the grandchild is gone and never writes;
+  - normal exit is unaffected.
+- **Admission races (paused time, with injected hooks):**
+  - a swap published between the snapshot and the subscribe;
+  - a token and the swap ready at once;
+  - a cancellation after delivery.
+  In each case: exactly one admission, the old token back in the old pipe, and
+  one `TokenUse` throughout.
+- **Retirement:** repeated swaps with an empty old pipe; a helper that does
+  not exit; the cap reached.
+- **Triggers:**
+  - a hard stall with real killed children (a child takes a token from the
+    pipe and is killed, repeatedly) recovers;
+  - a partial loss swaps at idle;
+  - no swap while a compile runs;
+  - creation failure keeps the old pool;
+  - shutdown during preparation.
+- **Spawn:**
+  - a child after a swap reads tokens from the new pipe's advertised fds;
+  - both FIFO paths and a non-sharing child are unchanged;
+  - the spawn-guard scope is unchanged.
+- **Wire:** `pool_swaps` and `retire_pending` both ways against -10, -11 and
+  -12, for both response kinds and without a gauge.
+
+## Rollout
+
+Ship the process-group kill first, as its own release, because it is smaller
+and independently valuable. Then the swap, with `jobserver_swap = "stall"` on
+worker-01 for a day, then "stall,idle", then the other hosts. Each step needs
+a review round.
