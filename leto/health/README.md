@@ -98,3 +98,18 @@ The default run is fast and bounded, for the 2-hourly check:
 - the host script ends itself after 25 s (`--time-limit`), and `collect.sh` gives each host 30 s.
 
 `--deep` (`collect.sh --deep`) adds du, compsize, the entry count, cache entries written in the last hour, the full miss logs and the incremental-session scan. It refuses to run when the 1-minute load exceeds half the CPUs or memory PSI exceeds 2%, runs at nice 19 and idle I/O priority, and stops after 900 s. Run it at most once a day.
+
+## Cancelled compiles
+
+`killtrace.py` samples `/proc` (read-only) to find which callers make the
+shared daemon kill a running compiler: a client that goes away mid-compile.
+It logs each such event with the client's ancestor chain (agent shell,
+timeout, nextest, ...), and the queue gauge every 10 s, so the leaked-token
+level at idle can be followed. Run it bounded on one host:
+
+```sh
+nice -n 19 ionice -c3 timeout 1000 python3 -I - 900 ~/.cache/leto-maintenance/killtrace/run < leto/health/killtrace.py
+```
+
+It writes `run.jsonl` and prints a summary. It costs about 1 s of CPU per
+minute.
