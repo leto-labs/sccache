@@ -1314,4 +1314,71 @@ mod test {
         );
         drop(held2);
     }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_fifo_uses_semaphore_admission_and_forwards_fifo_path() {
+        use std::time::Duration;
+        let host_path = std::path::PathBuf::from("/run/user/1000/nonexistent-host-jobserver");
+        let client = Client::new_host_fifo(1, host_path.clone()).with_compile_queue();
+        let queue = client.compile_queue().unwrap();
+
+        // Admission succeeds even when the host FIFO path does not exist (never
+        // opens or acquires from the host FIFO, avoiding cargo<->sccache deadlock).
+        let held = client.acquire_for_command().await.unwrap();
+        let snap = queue.snapshot();
+        assert_eq!(snap.token_capacity, 1);
+        assert_eq!(snap.running, 1);
+        assert_eq!(snap.tokens_in_use, Some(1));
+        assert_eq!(snap.pool_swaps, None);
+
+        // Second spawn waits on the in-process semaphore, then receives
+        // `--jobserver-auth=fifo:<host_path>` in CARGO_MAKEFLAGS when released.
+        let mut cmd =
+            <ProcessCommandCreator as CommandCreatorSync>::new(&client).new_command_sync("bash");
+        cmd.args(&["-c", "printf '%s|%s' \"$MAKEFLAGS\" \"$CARGO_MAKEFLAGS\""])
+            .env_clear()
+            .env("CARGO_MAKEFLAGS", "-j8 --jobserver-auth=99,100")
+            .stdout(Stdio::piped())
+            .share_jobserver();
+        let waiter = tokio::spawn(async move {
+            let child = cmd.spawn().await.unwrap();
+            child.wait_with_output().await.unwrap()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while queue.snapshot().token_wait.active == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.snapshot().token_wait.active, 1);
+        drop(held);
+
+        let output = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("host_fifo child timed out after semaphore release")
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("|-j --jobserver-auth=fifo:{}", host_path.display())
+        );
+        assert_eq!(queue.snapshot().tokens_in_use, Some(0));
+
+        // Without share_jobserver(), flags are still stripped.
+        let mut no_share =
+            <ProcessCommandCreator as CommandCreatorSync>::new(&client).new_command_sync("bash");
+        no_share
+            .args(&["-c", "printf '%s|%s' \"$MAKEFLAGS\" \"$CARGO_MAKEFLAGS\""])
+            .env_clear()
+            .env("CARGO_MAKEFLAGS", "-j8 --jobserver-auth=99,100")
+            .stdout(Stdio::piped());
+        let output = no_share
+            .spawn()
+            .await
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"|");
+    }
 }

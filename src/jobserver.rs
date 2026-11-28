@@ -1,10 +1,12 @@
+use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant as StdInstant};
 
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 use crate::compile_queue::{CompileQueue, TokenUse};
 use crate::config::JobserverSwap;
@@ -522,7 +524,8 @@ impl Pool {
                                         _usage: usage,
                                         token: Acquired {
                                             _token: Some(acquired),
-                                            pipe: Some(pipe),
+                                            _permit: None,
+                                            target: TokenTarget::Pipe(pipe),
                                         },
                                     });
                                 }
@@ -571,6 +574,10 @@ impl Pool {
 enum ClientKind {
     Fifo(Arc<Pipe>),
     Pool(Arc<Pool>),
+    HostFifo {
+        semaphore: Arc<Semaphore>,
+        fifo_path: Arc<PathBuf>,
+    },
 }
 
 #[derive(Clone)]
@@ -583,9 +590,25 @@ pub struct Client {
     pub(crate) process_groups: bool,
 }
 
+enum TokenTarget {
+    Pipe(Arc<Pipe>),
+    HostFifo(Arc<PathBuf>),
+}
+
 pub struct Acquired {
     _token: Option<jobserver::Acquired>,
-    pipe: Option<Arc<Pipe>>,
+    _permit: Option<OwnedSemaphorePermit>,
+    target: TokenTarget,
+}
+
+#[cfg(test)]
+impl Acquired {
+    fn pipe(&self) -> Option<&Arc<Pipe>> {
+        match &self.target {
+            TokenTarget::Pipe(pipe) => Some(pipe),
+            TokenTarget::HostFifo(_) => None,
+        }
+    }
 }
 
 pub(crate) struct CommandToken {
@@ -595,8 +618,13 @@ pub(crate) struct CommandToken {
 
 impl CommandToken {
     pub(crate) fn configure(&self, cmd: &mut Command) {
-        if let Some(pipe) = &self.token.pipe {
-            pipe.configure(cmd);
+        match &self.token.target {
+            TokenTarget::Pipe(pipe) => pipe.configure(cmd),
+            TokenTarget::HostFifo(path) => {
+                let mut flags = OsString::from("-j --jobserver-auth=fifo:");
+                flags.push(path.as_os_str());
+                cmd.env("CARGO_MAKEFLAGS", flags);
+            }
         }
     }
 }
@@ -645,21 +673,39 @@ impl Client {
         }
     }
 
+    /// Use an in-process semaphore for daemon admission (avoiding deadlocks
+    /// with callers holding a host token, and immune to child-kill leaks) and
+    /// forward `fifo_path` to `share_jobserver` children via `CARGO_MAKEFLAGS`.
+    pub fn new_host_fifo(num: usize, fifo_path: PathBuf) -> Client {
+        let capacity = num.max(1);
+        Client {
+            kind: ClientKind::HostFifo {
+                semaphore: Arc::new(Semaphore::new(capacity)),
+                fifo_path: Arc::new(fifo_path),
+            },
+            capacity,
+            compile_queue: None,
+            process_groups: false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn with_compile_queue(self) -> Self {
         self.with_compile_queue_swap(JobserverSwap::default())
     }
 
     pub(crate) fn with_compile_queue_swap(mut self, swap_policy: JobserverSwap) -> Self {
-        let pool = match &self.kind {
-            ClientKind::Pool(pool) => Some(pool.clone()),
-            ClientKind::Fifo(_) => None,
+        let queue = match &self.kind {
+            ClientKind::Pool(pool) => {
+                CompileQueue::new(self.capacity, Some(pool.clone()), swap_policy)
+            }
+            ClientKind::HostFifo { semaphore, .. } => {
+                CompileQueue::new(self.capacity, None, swap_policy)
+                    .with_semaphore(semaphore.clone())
+            }
+            ClientKind::Fifo(_) => CompileQueue::new(self.capacity, None, swap_policy),
         };
-        self.compile_queue = Some(Arc::new(CompileQueue::new(
-            self.capacity,
-            pool,
-            swap_policy,
-        )));
+        self.compile_queue = Some(Arc::new(queue));
         // Only the daemon runs compiles for clients that can go away. Run in
         // the foreground at a terminal, it keeps one group: a child in a
         // background group that read the terminal would stop.
@@ -675,7 +721,7 @@ impl Client {
     pub(crate) fn pool(&self) -> Option<Arc<Pool>> {
         match &self.kind {
             ClientKind::Pool(pool) => Some(pool.clone()),
-            ClientKind::Fifo(_) => None,
+            ClientKind::Fifo(_) | ClientKind::HostFifo { .. } => None,
         }
     }
 
@@ -691,11 +737,51 @@ impl Client {
                     _usage: usage,
                     token: Acquired {
                         _token: None,
-                        pipe: Some(pipe.clone()),
+                        _permit: None,
+                        target: TokenTarget::Pipe(pipe.clone()),
                     },
                 })
             }
             ClientKind::Pool(pool) => pool.acquire_inner(self.compile_queue.as_ref()).await,
+            ClientKind::HostFifo {
+                semaphore,
+                fifo_path,
+            } => {
+                let mut usage = self.compile_queue.as_ref().map(|q| q.start_token());
+                let mut warn_sleep = usage
+                    .as_ref()
+                    .map(|u| Box::pin(tokio::time::sleep_until(u.warning_deadline())));
+                let acquire = semaphore.clone().acquire_owned();
+                tokio::pin!(acquire);
+                let permit = loop {
+                    tokio::select! {
+                        res = &mut acquire => {
+                            break res.context("jobserver admission semaphore closed")?;
+                        }
+                        () = async {
+                            if let Some(sleep) = warn_sleep.as_mut() {
+                                sleep.await;
+                            }
+                        }, if warn_sleep.is_some() => {
+                            warn_sleep = None;
+                            if let Some(u) = usage.as_ref() {
+                                u.warn_if_slow();
+                            }
+                        }
+                    }
+                };
+                if let Some(u) = usage.as_mut() {
+                    u.acquired();
+                }
+                Ok(CommandToken {
+                    _usage: usage,
+                    token: Acquired {
+                        _token: None,
+                        _permit: Some(permit),
+                        target: TokenTarget::HostFifo(fifo_path.clone()),
+                    },
+                })
+            }
         }
     }
 
@@ -714,9 +800,25 @@ impl Client {
         match &self.kind {
             ClientKind::Fifo(pipe) => Ok(Acquired {
                 _token: None,
-                pipe: Some(pipe.clone()),
+                _permit: None,
+                target: TokenTarget::Pipe(pipe.clone()),
             }),
             ClientKind::Pool(pool) => Ok(pool.acquire_inner(None).await?.token),
+            ClientKind::HostFifo {
+                semaphore,
+                fifo_path,
+            } => {
+                let permit = semaphore
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .context("jobserver admission semaphore closed")?;
+                Ok(Acquired {
+                    _token: None,
+                    _permit: Some(permit),
+                    target: TokenTarget::HostFifo(fifo_path.clone()),
+                })
+            }
         }
     }
 }
@@ -969,7 +1071,7 @@ mod test {
         wait_until_available(&old_pipe, 1);
         assert_eq!(pool.current_pipe_for_test().available().unwrap(), 0);
         assert!(Arc::ptr_eq(
-            token.token.pipe.as_ref().unwrap(),
+            token.token.pipe().unwrap(),
             &pool.current_pipe_for_test()
         ));
         drop(token);
@@ -1010,7 +1112,7 @@ mod test {
         wait_until_available(&old_pipe, 1);
         assert_eq!(pool.current_pipe_for_test().available().unwrap(), 0);
         assert!(Arc::ptr_eq(
-            token.token.pipe.as_ref().unwrap(),
+            token.token.pipe().unwrap(),
             &pool.current_pipe_for_test()
         ));
         let stats = queue.snapshot();
@@ -1106,7 +1208,7 @@ mod test {
         assert_eq!(stats.token_wait.active, 0);
         assert_eq!(stats.pool_swaps, Some(1));
         assert!(Arc::ptr_eq(
-            token.token.pipe.as_ref().unwrap(),
+            token.token.pipe().unwrap(),
             &pool.current_pipe_for_test()
         ));
         // Any token the old helper may have grabbed for the dropped request must

@@ -939,6 +939,10 @@ pub struct ServerConfig {
     /// When to swap the daemon's private jobserver pipe on Linux after killed
     /// compilers leak tokens: `"stall,idle"`, `"stall"`, or `"off"`.
     pub jobserver_swap: JobserverSwap,
+    /// Host `fifo:` jobserver path (such as a `leto-jobserver` FUSE stream
+    /// mount) forwarded to compiler children while daemon admission uses an
+    /// in-process semaphore instead of a private pipe.
+    pub jobserver_fifo: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -950,6 +954,7 @@ impl Default for ServerConfig {
             put_raw_max_in_flight_bytes: 1024 * 1024 * 1024,
             allow_client_shutdown: true,
             jobserver_swap: JobserverSwap::default(),
+            jobserver_fifo: None,
         }
     }
 }
@@ -962,6 +967,7 @@ struct ServerEnvConfig {
     put_raw_max_in_flight_bytes: Option<u64>,
     allow_client_shutdown: Option<bool>,
     jobserver_swap: Option<JobserverSwap>,
+    jobserver_fifo: Option<PathBuf>,
 }
 
 // TODO: fields only pub for tests
@@ -1559,6 +1565,7 @@ fn config_from_env() -> Result<EnvConfig> {
             .transpose()?,
             allow_client_shutdown: bool_from_env_var("SCCACHE_SERVER_ALLOW_CLIENT_SHUTDOWN")?,
             jobserver_swap,
+            jobserver_fifo: env::var_os("SCCACHE_SERVER_JOBSERVER_FIFO").map(PathBuf::from),
         },
         miss_explain: env::var_os("SCCACHE_MISS_EXPLAIN").map(PathBuf::from),
         rust_incremental,
@@ -1766,7 +1773,27 @@ impl Config {
             jobserver_swap: env_server
                 .jobserver_swap
                 .unwrap_or(file_server.jobserver_swap),
+            jobserver_fifo: match env_server.jobserver_fifo {
+                Some(path) if path.as_os_str().is_empty() => None,
+                Some(path) => Some(path),
+                None => file_server.jobserver_fifo,
+            },
         };
+        if let Some(path) = &server.jobserver_fifo {
+            if !path.is_absolute() {
+                bail!(
+                    "server.jobserver_fifo (SCCACHE_SERVER_JOBSERVER_FIFO) must be an absolute path: {path:?}"
+                );
+            }
+            if path
+                .to_str()
+                .is_none_or(|s| s.bytes().any(|b| b.is_ascii_whitespace() || b == 0))
+            {
+                bail!(
+                    "server.jobserver_fifo (SCCACHE_SERVER_JOBSERVER_FIFO) must be valid UTF-8 without whitespace: {path:?}"
+                );
+            }
+        }
         let miss_explain = match env_miss_explain {
             Some(path) if path.as_os_str().is_empty() => None,
             Some(path) => Some(path),
@@ -4619,4 +4646,64 @@ fn test_server_jobserver_swap_config() {
     )
     .unwrap();
     assert_eq!(merged.server.jobserver_swap, JobserverSwap::Stall);
+}
+
+#[test]
+fn test_server_jobserver_fifo_config() {
+    let default: FileConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.jobserver_fifo, None);
+
+    let abs = if cfg!(windows) {
+        r"C:\run\build-jobserver"
+    } else {
+        "/run/user/1000/build-jobserver"
+    };
+    let parsed: FileConfig =
+        toml::from_str(&format!("[server]\njobserver_fifo = {:?}\n", abs)).unwrap();
+    assert_eq!(parsed.server.jobserver_fifo, Some(PathBuf::from(abs)));
+
+    // Empty env clears file setting.
+    let cleared = Config::from_env_and_file_configs(
+        EnvConfig {
+            server: ServerEnvConfig {
+                jobserver_fifo: Some(PathBuf::new()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        parsed,
+    )
+    .unwrap();
+    assert_eq!(cleared.server.jobserver_fifo, None);
+
+    // Relative path rejected.
+    let rel = Config::from_env_and_file_configs(
+        EnvConfig::default(),
+        FileConfig {
+            server: ServerConfig {
+                jobserver_fifo: Some(PathBuf::from("relative/fifo")),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(rel.is_err());
+
+    // Whitespace in path rejected because CARGO_MAKEFLAGS splits on whitespace.
+    let space_path = if cfg!(windows) {
+        PathBuf::from(r"C:\run\build jobserver")
+    } else {
+        PathBuf::from("/run/user/1000/build jobserver")
+    };
+    let ws = Config::from_env_and_file_configs(
+        EnvConfig::default(),
+        FileConfig {
+            server: ServerConfig {
+                jobserver_fifo: Some(space_path),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert!(ws.is_err());
 }

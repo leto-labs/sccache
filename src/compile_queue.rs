@@ -230,6 +230,7 @@ fn log_token_warning(warning: Option<(usize, usize)>) {
 pub(crate) struct CompileQueue {
     capacity: usize,
     pool: Option<Arc<Pool>>,
+    semaphore: Option<Arc<tokio::sync::Semaphore>>,
     swap_policy: JobserverSwap,
     state: Mutex<QueueState>,
 }
@@ -243,9 +244,15 @@ impl CompileQueue {
         Self {
             capacity,
             pool,
+            semaphore: None,
             swap_policy,
             state: Mutex::default(),
         }
+    }
+
+    pub(crate) fn with_semaphore(mut self, semaphore: Arc<tokio::sync::Semaphore>) -> Self {
+        self.semaphore = Some(semaphore);
+        self
     }
 
     pub(crate) fn snapshot(&self) -> CompileQueueStats {
@@ -280,6 +287,9 @@ impl CompileQueue {
                 let tokens_in_use = available.map(|avail| self.capacity.saturating_sub(avail));
                 build(tokens_in_use, pool.pool_swaps(), pool.retire_pending())
             })
+        } else if let Some(semaphore) = &self.semaphore {
+            let tokens_in_use = Some(self.capacity.saturating_sub(semaphore.available_permits()));
+            build(tokens_in_use, None, None)
         } else {
             build(None, None, None)
         }

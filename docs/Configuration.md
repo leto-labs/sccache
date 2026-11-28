@@ -74,6 +74,10 @@ allow_client_shutdown = true
 # Swap the daemon's private jobserver pipe on Linux after killed compilers leak tokens:
 # "stall,idle" (default), "stall", or "off".
 jobserver_swap = "stall,idle"
+# Optional host `fifo:` jobserver path (such as a `leto-jobserver` FUSE stream
+# mount) handed to compiler children while daemon admission uses an in-process
+# semaphore instead of a private pipe.
+# jobserver_fifo = "/run/user/1000/build-jobserver"
 
 [dist]
 # where to find the scheduler
@@ -248,6 +252,7 @@ Note that some env variables may need sccache server restart to take effect.
 * `SCCACHE_SERVER_PUT_RAW_MAX_IN_FLIGHT_BYTES` overrides `server.put_raw_max_in_flight_bytes`. The daemon reads this setting at startup. See [raw IPC stores](Local.md#reflink-cache-hits).
 * `SCCACHE_SERVER_ALLOW_CLIENT_SHUTDOWN` overrides `server.allow_client_shutdown`. With `false`, the server refuses `--stop-server` and other shutdown requests from clients, logs a warning and returns an error to the client; SIGTERM (for example from systemd) still drains and stops it. Set it on shared servers that a service manager runs. The default is `true`. The server reads this setting at startup.
 * `SCCACHE_SERVER_JOBSERVER_SWAP` overrides `server.jobserver_swap`. Controls when the daemon replaces a depleted private jobserver pipe on Linux: `stall,idle` (default; swap after a 120 s hard stall with no compiles running, or after 10 min idle with at least a quarter of tokens missing), `stall` (hard stall only), or `off`. The server reads this setting at startup.
+* `SCCACHE_SERVER_JOBSERVER_FIFO` overrides `server.jobserver_fifo`. Must be an absolute UTF-8 path without whitespace (empty clears the file setting). When set, the daemon bounds concurrent compiles with an in-process semaphore instead of a private jobserver pipe and forwards `--jobserver-auth=fifo:<path>` to compiler children that request jobserver sharing (unless the caller already passed a `fifo:` jobserver). Because daemon admission never acquires from the host FIFO, `cargo` holding a host token cannot deadlock against `sccache`. The server reads this setting at startup.
 * `SCCACHE_CONF` configuration file path
 * `SCCACHE_BASEDIRS` base directory (or directories) to strip from paths for cache key computation. This is similar to ccache's `CCACHE_BASEDIR` and enables cache hits across different absolute paths when compiling the same source code. Multiple directories can be separated by `;` on Windows hosts and by `:` on any other operating system. When multiple directories are specified, the longest matching prefix is used. Path matching is **case-insensitive** on Windows and **case-sensitive** on other operating systems. Environment variable takes precedence over file configuration. Only absolute paths are supported; relative paths, or a value that is not valid UTF-8, will cause an error and prevent the server from start. The variable is also read from the environment of each compile, where it takes precedence over both for that compile: an empty value turns base directories off, and a relative path or a value that is not valid UTF-8 is ignored with a warning.
 * `SCCACHE_BASEDIRS_VERBATIM_ENV_DEPS` comma-separated names of variables that a Rust crate reads with `env!` or `option_env!` whose values are hashed without stripping `SCCACHE_BASEDIRS`, e.g. `CARGO_MANIFEST_DIR,CARGO_MANIFEST_PATH`. Read from the environment of each compile; empty or not valid UTF-8 means none. Names are case-insensitive on Windows. See [Rust caveats](Rust.md)

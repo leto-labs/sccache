@@ -125,7 +125,11 @@ tokens (`server.jobserver_swap = "stall,idle"` by default; `"stall"` or
 `"off"`). Waiters move to the new pipe and old tokens drain back to the old
 pipe; unconfirmed helper retirements are bounded (`retire_pending`, capped at
 4) and reported alongside `pool_swaps`. On other platforms, restarting the
-daemon recovers the pool.
+daemon recovers the pool. Alternatively, configuring `server.jobserver_fifo`
+(or `SCCACHE_SERVER_JOBSERVER_FIFO`) replaces the private pipe with an
+in-process admission semaphore and forwards `--jobserver-auth=fifo:<path>`
+to `rustc` (without acquiring from that host FIFO), avoiding both token leaks
+in the daemon and `cargo`-to-`sccache` admission deadlocks.
 
 On Unix the daemon, unless it runs in the foreground at a terminal, starts
 each compiler in its own process group. It kills that group before reaping the
