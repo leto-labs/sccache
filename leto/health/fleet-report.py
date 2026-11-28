@@ -84,6 +84,40 @@ def headline(report):
     ]
 
 
+def jobserver_rows(fleet):
+    rows = []
+    for host, report in fleet["hosts"].items():
+        js = report.get("jobserver")
+        if not isinstance(js, dict) or not js.get("ok"):
+            continue
+        psi = js.get("psi") or {}
+        if psi.get("enabled"):
+            io_v = psi.get("io_smoothed")
+            mem_v = psi.get("memory_some_avg10")
+            io_s = f"{io_v:.2f}%" if isinstance(io_v, (int, float)) else "—"
+            mem_s = f"{mem_v:.2f}%" if isinstance(mem_v, (int, float)) else "—"
+            psi_text = f"io {io_s} / mem {mem_s}"
+        else:
+            psi_text = "disabled"
+        holders = js.get("holders") or []
+        top_holders = ", ".join(
+            f"{h.get('comm') or 'pid'}:{h.get('tgid')} ({h.get('held')})"
+            for h in holders[:5] if (h.get("held") or 0) > 0
+        ) or "—"
+        cap_text = str(js.get("max_per_owner") or "unlimited")
+        rows.append([
+            host,
+            f"{js.get('effective_capacity')} / {js.get('capacity')} ({js.get('withheld')})",
+            f"{js.get('held')} / {js.get('available')}",
+            cap_text,
+            f"{js.get('waiters')} / {js.get('pollers')}",
+            str(js.get("reclaimed_total", 0)),
+            psi_text,
+            top_holders,
+        ])
+    return rows
+
+
 def markdown(fleet):
     lines = ["# Fleet build health", "", fleet["generated_at"], "",
              "| Host | Rust hit rate | Queue (waiting/running, tokens in use, max wait) | Misses (log tail, ≤24 h) | Top miss cause | Cache | Cache written, last hour | Disk writes incl. compiles | Pre-warm lag | Warnings | Runtime |",
@@ -94,6 +128,15 @@ def markdown(fleet):
         lines.append("| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |")
         for warning in report["warnings"]:
             warnings.append(f"- **{host}** · " + " ".join(warning.splitlines()))
+    js_rows = jobserver_rows(fleet)
+    if js_rows:
+        lines.extend([
+            "", "## Jobserver", "",
+            "| Host | Effective / Cap (Withheld) | Held / Avail | Per-owner cap | Waiters / Pollers | Reclaimed | PSI | Top holders |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+        ])
+        for row in js_rows:
+            lines.append("| " + " | ".join(cell.replace("|", "\\|") for cell in row) + " |")
     if warnings:
         lines.extend(["", "## Warnings", "", *warnings])
     return "\n".join(lines) + "\n"

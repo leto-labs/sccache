@@ -523,7 +523,14 @@ class FleetTest(unittest.TestCase):
     def test_remote_script_and_latest_links(self):
         report = {"schema": "leto-build-health/1", "host": "worker-01",
                   "runtime_seconds": 1.23, "warnings": [], "misses": {
-                      "total": 7, "classifications": {"new": 2, "dependency": 5}}}
+                      "total": 7, "classifications": {"new": 2, "dependency": 5}},
+                  "jobserver": {
+                      "ok": True, "capacity": 48, "withheld": 0, "effective_capacity": 48,
+                      "held": 12, "available": 36, "max_per_owner": 16, "waiters": 0,
+                      "pollers": 0, "reclaimed_total": 2,
+                      "psi": {"enabled": True, "io_smoothed": 0.25, "memory_some_avg10": 0.1},
+                      "holders": [{"tgid": 123, "comm": "rustc", "held": 12}],
+                  }}
         with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess(
                 [], 0, json.dumps(report).encode(), b"")) as run:
             self.assertEqual(FLEET["collect"]("worker-01", b"host script", 60), report)
@@ -542,6 +549,8 @@ class FleetTest(unittest.TestCase):
             self.assertEqual(json.loads((directory / "latest.json").read_text()), fleet)
             text = (directory / "latest.md").read_text()
             self.assertIn("| worker-01 | — | — | 7 | dependency (5) | — | — | — | — | 0 | 1.23 s |", text)
+            self.assertIn("## Jobserver", text)
+            self.assertIn("| worker-01 | 48 / 48 (0) | 12 / 36 | 16 | 0 / 0 | 2 | io 0.25% / mem 0.10% | rustc:123 (12) |", text)
             self.assertIn("worker-02** · unavailable", text)
             self.assertTrue((directory / "first.md").exists())
 
