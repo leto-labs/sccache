@@ -370,6 +370,9 @@ impl Trace {
             || resolved == Path::new("/dev/urandom")
             || resolved.starts_with("/proc")
             || resolved.starts_with("/sys/fs/cgroup")
+            // Shadow mode preserves ambient TERM (whereas Stage 1 strips it),
+            // so Rust libtest probes terminfo databases on every run.
+            || (!sandboxed && is_terminfo(&resolved))
             || (system && absent)
         {
             if system && !absent {
@@ -881,6 +884,17 @@ pub fn collect(
     }
 }
 
+fn is_terminfo(path: &Path) -> bool {
+    [
+        "/etc/terminfo",
+        "/usr/share/terminfo",
+        "/lib/terminfo",
+        "/usr/lib/terminfo",
+    ]
+    .iter()
+    .any(|base| path.starts_with(base))
+}
+
 fn kill_tracee(pid: c::pid_t) {
     // SAFETY: the positive PID is a live, stopped tracee.
     unsafe { c::kill(pid, c::SIGKILL) };
@@ -932,5 +946,56 @@ mod tests {
         assert_eq!(trace.evidence(true)["class"], "exec");
         trace.socket(c::AF_INET, Some(true));
         assert_eq!(trace.evidence(true)["class"], "network");
+    }
+
+    #[test]
+    fn shadow_mode_allows_readonly_terminfo_but_stage1_and_writes_stay_impure() {
+        let rules = Rules {
+            checkout: "/fake-checkout".into(),
+            temp: "/tmp".into(),
+            binary: "/fake-checkout/bin".into(),
+            libraries: vec![],
+        };
+        let access = |p: &str, kind| Access {
+            pid: 0,
+            path: p.into(),
+            kind,
+            loader: false,
+        };
+
+        // Shadow mode: read-only terminfo lookups stay pure.
+        let mut shadow = Trace::new();
+        for path in [
+            "/etc/terminfo",
+            "/usr/share/terminfo",
+            "/usr/share/terminfo/d/dumb",
+            "/lib/terminfo/x/xterm-256color",
+            "/usr/lib/terminfo/x/xterm",
+        ] {
+            shadow.record_path(access(path, ReadContent), 0, &rules, false);
+        }
+        let ev = shadow.evidence(true);
+        assert_eq!(ev["class"], "pure");
+        assert!(ev["reason"].is_null());
+
+        // Shadow mode: writing to terminfo is still impure.
+        shadow.record_path(
+            access("/usr/share/terminfo/d/dumb", Mutate),
+            0,
+            &rules,
+            false,
+        );
+        assert_eq!(shadow.evidence(true)["class"], "other");
+        assert_eq!(shadow.evidence(true)["reason"], "write outside TMPDIR");
+
+        // Stage 1 (sandboxed): terminfo reads remain impure.
+        let mut stage1 = Trace::new();
+        stage1.record_path(
+            access("/usr/share/terminfo/d/dumb", ReadContent),
+            0,
+            &rules,
+            true,
+        );
+        assert_eq!(stage1.evidence(true)["class"], "other");
     }
 }
