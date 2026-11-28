@@ -546,5 +546,86 @@ class FleetTest(unittest.TestCase):
             self.assertTrue((directory / "first.md").exists())
 
 
+class JobserverSocketTest(unittest.TestCase):
+    def test_missing_socket_returns_none_without_warning(self):
+        import types
+
+        with TemporaryDirectory() as temp:
+            args = types.SimpleNamespace(jobserver_socket=Path(temp) / "absent.sock")
+            warnings = []
+            self.assertIsNone(REPORT["jobserver_report"](args, warnings))
+            self.assertEqual(warnings, [])
+
+    def test_status_query_and_markdown_rendering(self):
+        import socket as sock_mod
+        import threading
+        import types
+
+        payload = {
+            "ok": True,
+            "pid": 4242,
+            "uptime_secs": 120,
+            "capacity": 48,
+            "withheld": 4,
+            "effective_capacity": 44,
+            "held": 10,
+            "available": 34,
+            "max_per_owner": 16,
+            "waiters": 0,
+            "pollers": 1,
+            "reclaimed_total": 3,
+            "psi": {"enabled": True, "io_smoothed": 12.5, "memory_some_avg10": 0.4},
+            "holders": [{"tgid": 9001, "comm": "cargo", "held": 6}, {"tgid": 9002, "comm": "rustc", "held": 4}],
+        }
+        with TemporaryDirectory() as temp:
+            sock_path = Path(temp) / "leto-jobserver.sock"
+            srv = sock_mod.socket(sock_mod.AF_UNIX, sock_mod.SOCK_STREAM)
+            srv.bind(str(sock_path))
+            srv.listen(1)
+
+            def serve_once():
+                conn, _ = srv.accept()
+                with conn:
+                    req = conn.recv(1024)
+                    if b'"status"' in req:
+                        conn.sendall((json.dumps(payload) + "\n").encode())
+                srv.close()
+
+            t = threading.Thread(target=serve_once)
+            t.start()
+            args = types.SimpleNamespace(jobserver_socket=sock_path)
+            warnings = []
+            got = REPORT["jobserver_report"](args, warnings)
+            t.join(timeout=5)
+            self.assertEqual(warnings, [])
+            self.assertEqual(got["effective_capacity"], 44)
+            self.assertEqual(got["reclaimed_total"], 3)
+
+            # Minimal report dict to check markdown section rendering.
+            md = REPORT["markdown"]({
+                "host": "devbox",
+                "generated_at": NOW.isoformat(),
+                "runtime_seconds": 0.1,
+                "config": {"reflink": True, "rust_cache_linked": "tests",
+                           "rust_cache_linked_max_entry_bytes": 134217728,
+                           "shutdown_drain_secs": 300, "autostart": False, "connect_wait_secs": 30},
+                "server": {"unit_state": "active", "main_pid": 1, "version": "0.20.0", "sha256": "abc",
+                           "uptime_seconds": 10, "rss_bytes": 1024, "disk_write_bytes": 0,
+                           "disk_write_gib_per_hour": 0, "stats": None},
+                "jobserver": got,
+                "cache": {"dir": "/cache", "cap_bytes": 1024, "apparent_bytes": 0, "allocated_bytes": 0,
+                          "btrfs_extent_bytes": None, "entry_count": 0, "fill_pct": 0, "disk_pct": 0},
+                "misses": {"hours": 24, "projects": {}},
+                "miss_log": {},
+                "prewarm": {},
+                "incremental": {"projects": {}},
+                "warnings": [],
+            })
+            self.assertIn("## Jobserver", md)
+            self.assertIn("44 / 48 (4)", md)
+            self.assertIn("io 12.50% / mem 0.40%", md)
+            self.assertIn("cargo:9001 (6), rustc:9002 (4)", md)
+
+
 if __name__ == "__main__":
     unittest.main()

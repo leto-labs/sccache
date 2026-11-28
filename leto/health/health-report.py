@@ -806,22 +806,63 @@ def rotate_misses(path):
         os.close(directory)
 
 
+def jobserver_report(args, warnings):
+    sock_path = getattr(args, "jobserver_socket", None)
+    if sock_path is None or not sock_path.exists():
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(2.0)
+            conn.connect(str(sock_path))
+            conn.sendall(b'{"cmd":"status"}\n')
+            chunks = []
+            total = 0
+            while total < 256 * 1024:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if b"\n" in chunk:
+                    break
+        raw = b"".join(chunks).split(b"\n", 1)[0]
+        data = json.loads(raw.decode("utf-8"))
+    except (OSError, ValueError) as error:
+        warnings.append(f"Host jobserver status unavailable at {sock_path}: {error}")
+        return {"socket": str(sock_path), "error": str(error)}
+    if not isinstance(data, dict) or not data.get("ok"):
+        err = data.get("error", "unexpected reply") if isinstance(data, dict) else "unexpected reply"
+        warnings.append(f"Host jobserver status error at {sock_path}: {err}")
+        return {"socket": str(sock_path), "error": str(err)}
+    waiters = data.get("waiters") or 0
+    held = data.get("held") or 0
+    withheld = data.get("withheld") or 0
+    capacity = data.get("capacity") or 0
+    if waiters > 0 and held == 0 and withheld < capacity:
+        warnings.append(f"Host jobserver has {waiters} waiter(s) with 0 held tokens")
+    return data
+
+
 def make_report(args, *, now=None):
     started = time.monotonic()
     now = now or datetime.now(timezone.utc)
     warnings = []
     config = load_config(args, warnings)
     server, info = server_report(args, now, warnings)
+    jobserver = jobserver_report(args, warnings)
     cache = cache_report(config, info, warnings, deep=args.deep)
     misses, log = miss_log_report(Path(config["miss_explain"]), now, args.hours, warnings,
                                   max_bytes=None if args.deep else args.miss_log_tail)
     prewarm = prewarm_report(args, now, warnings)
     incremental = (incremental_report(args, warnings) if args.deep
                    else {"skipped": "fast mode", "projects": {}})
-    return {"schema": "leto-build-health/1", "host": socket.gethostname(), "mode": "deep" if args.deep else "fast",
-            "generated_at": now.isoformat(), "runtime_seconds": round(time.monotonic() - started, 3),
-            "config": config, "server": server, "cache": cache, "misses": misses,
-            "miss_log": log, "prewarm": prewarm, "incremental": incremental, "warnings": warnings}
+    result = {"schema": "leto-build-health/1", "host": socket.gethostname(), "mode": "deep" if args.deep else "fast",
+              "generated_at": now.isoformat(), "runtime_seconds": round(time.monotonic() - started, 3),
+              "config": config, "server": server, "cache": cache, "misses": misses,
+              "miss_log": log, "prewarm": prewarm, "incremental": incremental, "warnings": warnings}
+    if jobserver is not None:
+        result["jobserver"] = jobserver
+    return result
 
 
 def display(value, suffix=""):
@@ -870,6 +911,39 @@ def markdown(report):
     misses = report["misses"]
     prewarm = report["prewarm"]
     incremental = report["incremental"]
+    jobserver = report.get("jobserver")
+    jobserver_sections = []
+    if isinstance(jobserver, dict) and jobserver.get("ok"):
+        psi = jobserver.get("psi") or {}
+        psi_text = "disabled"
+        if psi.get("enabled"):
+            io_v = psi.get("io_smoothed")
+            mem_v = psi.get("memory_some_avg10")
+            io_s = f"{io_v:.2f}%" if isinstance(io_v, (int, float)) else "—"
+            mem_s = f"{mem_v:.2f}%" if isinstance(mem_v, (int, float)) else "—"
+            psi_text = f"io {io_s} / mem {mem_s}"
+        holders = jobserver.get("holders") or []
+        top_holders = ", ".join(
+            f"{h.get('comm') or 'pid'}:{h.get('tgid')} ({h.get('held')})"
+            for h in holders[:5] if h.get("held", 0) > 0
+        ) or None
+        jobserver_sections = [
+            "## Jobserver",
+            table(
+                ["PID", "Effective / Cap (Withheld)", "Held / Avail", "Per-owner cap",
+                 "Waiters / Pollers", "Reclaimed", "PSI", "Top holders"],
+                [[
+                    jobserver.get("pid"),
+                    f"{jobserver.get('effective_capacity')} / {jobserver.get('capacity')} ({jobserver.get('withheld')})",
+                    f"{jobserver.get('held')} / {jobserver.get('available')}",
+                    jobserver.get("max_per_owner") or "unlimited",
+                    f"{jobserver.get('waiters')} / {jobserver.get('pollers')}",
+                    jobserver.get("reclaimed_total"),
+                    psi_text,
+                    top_holders,
+                ]],
+            ),
+        ]
     sections = [f"# Build health · {report['host']}",
                 f"{report['generated_at']} · {report['runtime_seconds']} s",
                 "## Server",
@@ -888,6 +962,7 @@ def markdown(report):
                     f"{display(stats.get('rust_incremental_not_stored'))} / "
                     f"{display(stats.get('rust_linked_entry_too_large'))}", summarize(stats.get("miss_explain", {}))]])
                 + queue_table,
+                *jobserver_sections,
                 "## Cache",
                 table(["Directory", "Cap", "Apparent", "Allocated", "btrfs extents", "Entries", "Fill", "On disk",
                        "Entries written in last hour", "Reflink"], [[
@@ -981,6 +1056,8 @@ def parse_args(argv=None):
     parser.add_argument("--prewarm-config", type=Path, default=config / "leto-prewarm")
     parser.add_argument("--worktrees", type=Path, default=home / ".t3/worktrees")
     parser.add_argument("--checkouts", type=Path, default=home / "workspaces/leto-labs")
+    runtime = Path(os.getenv("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    parser.add_argument("--jobserver-socket", type=Path, default=runtime / "leto-jobserver.sock")
     parser.set_defaults(default_cache_dir=cache / "sccache", default_miss_log=cache / "sccache/explain/misses.jsonl")
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
