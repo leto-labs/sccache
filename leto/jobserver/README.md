@@ -19,7 +19,7 @@ with `FOPEN_DIRECT_IO | FOPEN_NONSEEKABLE | FOPEN_STREAM | FOPEN_PARALLEL_DIRECT
   keeps the descriptor open, the kernel defers `FUSE_RELEASE` until the child
   also closes it; `jobserver-rs` opens with `O_CLOEXEC`.
 - **Arrival-ordered fairness & per-TGID cap:** blocking readers (`rustc`) and
-  poll clients (`cc-rs`, GNU `make`) share one arrival-ordered queue with
+  poll clients (`jobserver-rs`, GNU `make`) share one arrival-ordered queue with
   short-lived poll reservations (50 ms) so poll clients do not starve behind
   blocking readers. `--max-per-owner N` (or live `set-cap N`) caps concurrent
   tokens per process without head-of-line blocking uncapped waiters or spinning

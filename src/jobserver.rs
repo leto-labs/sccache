@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -570,41 +570,72 @@ impl Pool {
     }
 }
 
+struct ProbeGuard<'a>(&'a AtomicBool);
+impl Drop for ProbeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 struct HostFifoProbe {
     path: PathBuf,
     // Cached `(checked_at, reachable, last_warn)` so we probe at most once per
-    // second and avoid spamming logs or injecting a broken `--jobserver-auth`
-    // that would cache `rustc`'s "failed to connect to jobserver" warning.
+    // second off the Tokio worker threads via bounded `spawn_blocking`.
     state: Mutex<(Option<StdInstant>, bool, Option<StdInstant>)>,
+    in_flight: AtomicBool,
 }
 
 impl HostFifoProbe {
     const CACHE_TTL: Duration = Duration::from_secs(1);
+    const PROBE_TIMEOUT: Duration = Duration::from_millis(200);
     const WARN_INTERVAL: Duration = Duration::from_secs(60);
 
     fn new(path: PathBuf) -> Self {
         Self {
             path,
             state: Mutex::new((None, false, None)),
+            in_flight: AtomicBool::new(false),
         }
     }
 
-    fn is_reachable(&self) -> bool {
+    async fn is_reachable(&self) -> bool {
         let now = StdInstant::now();
-        {
+        let cached = {
             let guard = self.state.lock().unwrap();
             if let (Some(checked), ok, _) = *guard
                 && now.saturating_duration_since(checked) < Self::CACHE_TTL
             {
                 return ok;
             }
+            guard.1
+        };
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return cached;
         }
-        let probe_res = probe_host_fifo(&self.path);
+        let _guard = ProbeGuard(&self.in_flight);
+        let path = self.path.clone();
+        let probe_res = match tokio::time::timeout(
+            Self::PROBE_TIMEOUT,
+            tokio::task::spawn_blocking(move || probe_host_fifo(&path)),
+        )
+        .await
+        {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(io::Error::other("host jobserver probe task failed")),
+            Err(_) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "host jobserver probe timed out",
+            )),
+        };
         let ok = probe_res.is_ok();
         let mut should_warn = None;
         {
             let mut guard = self.state.lock().unwrap();
-            guard.0 = Some(now);
+            guard.0 = Some(StdInstant::now());
             guard.1 = ok;
             if let Err(err) = probe_res
                 && guard
@@ -668,7 +699,7 @@ pub struct Client {
 
 enum TokenTarget {
     Pipe(Arc<Pipe>),
-    HostFifo(Arc<HostFifoProbe>),
+    HostFifo { path: PathBuf, reachable: bool },
 }
 
 pub struct Acquired {
@@ -682,7 +713,7 @@ impl Acquired {
     fn pipe(&self) -> Option<&Arc<Pipe>> {
         match &self.target {
             TokenTarget::Pipe(pipe) => Some(pipe),
-            TokenTarget::HostFifo(_) => None,
+            TokenTarget::HostFifo { .. } => None,
         }
     }
 }
@@ -696,10 +727,10 @@ impl CommandToken {
     pub(crate) fn configure(&self, cmd: &mut Command) {
         match &self.token.target {
             TokenTarget::Pipe(pipe) => pipe.configure(cmd),
-            TokenTarget::HostFifo(probe) => {
-                if probe.is_reachable() {
+            TokenTarget::HostFifo { path, reachable } => {
+                if *reachable {
                     let mut flags = OsString::from("-j --jobserver-auth=fifo:");
-                    flags.push(probe.path.as_os_str());
+                    flags.push(path.as_os_str());
                     cmd.env("CARGO_MAKEFLAGS", flags);
                 }
             }
@@ -848,12 +879,16 @@ impl Client {
                 if let Some(u) = usage.as_mut() {
                     u.acquired();
                 }
+                let reachable = probe.is_reachable().await;
                 Ok(CommandToken {
                     _usage: usage,
                     token: Acquired {
                         _token: None,
                         _permit: Some(permit),
-                        target: TokenTarget::HostFifo(probe.clone()),
+                        target: TokenTarget::HostFifo {
+                            path: probe.path.clone(),
+                            reachable,
+                        },
                     },
                 })
             }
@@ -888,7 +923,10 @@ impl Client {
                 Ok(Acquired {
                     _token: None,
                     _permit: Some(permit),
-                    target: TokenTarget::HostFifo(probe.clone()),
+                    target: TokenTarget::HostFifo {
+                        path: probe.path.clone(),
+                        reachable: false,
+                    },
                 })
             }
         }

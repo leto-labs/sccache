@@ -487,3 +487,54 @@ fn second_instance_cannot_hijack_socket() {
         "original daemon socket must stay healthy"
     );
 }
+
+#[test]
+fn unclaimed_poll_reservation_expires_and_wakes_blocking_reader() {
+    let d = TestDaemon::start(1, 0, false);
+    let mut holder = open_rw(&d.link_path, false);
+    let mut b = [0u8; 1];
+    assert_eq!(holder.read(&mut b).unwrap(), 1);
+
+    // Register a poller that wakes but intentionally never calls read().
+    let poller = open_rw(&d.link_path, true);
+    let poller_fd = poller.as_raw_fd();
+    let poll_thread = std::thread::spawn(move || {
+        let mut pfd = libc::pollfd {
+            fd: poller_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let rc = unsafe { libc::poll(&mut pfd, 1, 2000) };
+        assert_eq!(rc, 1);
+        assert_ne!(pfd.revents & libc::POLLIN, 0);
+        // Keep fd open briefly without reading so the 50 ms reservation must expire.
+        std::thread::sleep(Duration::from_millis(250));
+    });
+    d.wait_status("poller registered", |s| s["pollers"] == 1);
+
+    // Park a blocking reader behind the poller.
+    let token_path = d.link_path.clone();
+    let reader = std::thread::spawn(move || {
+        let mut r = open_rw(&token_path, false);
+        let mut buf = [0u8; 1];
+        let t0 = Instant::now();
+        assert_eq!(r.read(&mut buf).unwrap(), 1);
+        assert_eq!(buf[0], b'+');
+        let elapsed = t0.elapsed();
+        assert_eq!(r.write(b"+").unwrap(), 1);
+        elapsed
+    });
+    d.wait_status("reader parked behind poller", |s| s["waiters"] == 1);
+
+    // Release the token; poller gets notified and ignores it; within ~50-150 ms
+    // the reservation expires and the blocking reader gets the token.
+    assert_eq!(holder.write(b"+").unwrap(), 1);
+    let elapsed = reader.join().unwrap();
+    assert!(
+        elapsed >= Duration::from_millis(40) && elapsed < Duration::from_secs(2),
+        "unexpected wake latency: {elapsed:?}"
+    );
+    poll_thread.join().unwrap();
+    drop(poller);
+    drop(holder);
+}

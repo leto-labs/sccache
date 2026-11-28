@@ -184,6 +184,18 @@ impl JobserverState {
         !self.reservations.is_empty()
     }
 
+    pub fn excess_writes_total(&self) -> u64 {
+        self.excess_writes_total
+    }
+
+    pub fn psi_snapshot(&self) -> PsiSnapshot {
+        self.psi.snapshot(self.capacity)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn effective_capacity(&self) -> usize {
         self.capacity.saturating_sub(self.psi.withheld())
     }
@@ -315,8 +327,7 @@ impl JobserverState {
             return vec![Effect::ReplyByte { unique, owner }];
         }
         let mut effects = self.expire_reservations(now);
-        // Only bypass the queue when no eligible waiter is already ahead, or
-        // when this owner has no waiting peers ahead of it.
+        // Only bypass the queue when no eligible waiter is already ahead.
         let eligible_waiting = self
             .wait_queue
             .iter()
@@ -332,6 +343,10 @@ impl JobserverState {
             });
             return effects;
         }
+        // Drop any stale Poll waiter on this same fh so an abandoned poll
+        // cannot later consume an idle 50 ms reservation behind this read.
+        self.wait_queue
+            .retain(|w| !matches!(w, WaitEntry::Poll { fh: pfh, .. } if *pfh == fh));
         self.wait_queue
             .push_back(WaitEntry::Read { unique, fh, owner });
         effects.extend(self.wake_eligible(now));
@@ -363,8 +378,8 @@ impl JobserverState {
         schedule_notify: bool,
         events: u32,
         now: Instant,
-    ) -> u32 {
-        self.reservations.retain(|r| r.expires > now);
+    ) -> (u32, Vec<Effect>) {
+        let effects = self.expire_reservations(now);
         let mut revents: u32 = libc::POLLOUT as u32;
         if let Some(&owner) = self.fh_to_owner.get(&fh) {
             let eligible_waiting = self
@@ -387,7 +402,7 @@ impl JobserverState {
         if events != 0 {
             revents &= events;
         }
-        revents
+        (revents, effects)
     }
 
     pub fn on_interrupt(&mut self, target_unique: u64) -> Option<Effect> {
@@ -741,6 +756,7 @@ mod tests {
         let now = Instant::now();
         let mut st = make_state(4, 2);
         let a = st.on_open(Some((10, 1)), "rustc".into());
+        let a_poll = st.on_open(Some((10, 1)), "rustc".into());
         let b = st.on_open(Some((20, 1)), "rustc".into());
 
         assert_eq!(
@@ -766,7 +782,7 @@ mod tests {
                 errno: -libc::EAGAIN
             }]
         );
-        let rev = st.on_poll(a, 777, true, libc::POLLIN as u32, now);
+        let (rev, _) = st.on_poll(a_poll, 777, true, libc::POLLIN as u32, now);
         assert_eq!(rev, 0);
 
         assert!(st.on_read(4, a, 1, false, now).is_empty());
@@ -798,9 +814,9 @@ mod tests {
 
         let (_, _, eff) = st.on_write(a, 1, now);
         assert_eq!(eff, vec![Effect::NotifyPoll { kh: 777 }]);
-        // Consuming reservation via read(a) grants A its token.
+        // Consuming reservation via read(a_poll) grants A its token.
         assert_eq!(
-            st.on_read(8, a, 1, true, now),
+            st.on_read(8, a_poll, 1, true, now),
             vec![Effect::ReplyByte {
                 unique: 8,
                 owner: proc_owner(10)
@@ -828,10 +844,10 @@ mod tests {
 
         assert_eq!(st.on_read(1, holder, 1, false, now).len(), 1);
         // Poller registers first, then blocking reader parks behind it.
-        assert_eq!(st.on_poll(poller, 555, true, libc::POLLIN as u32, now), 0);
+        assert_eq!(st.on_poll(poller, 555, true, libc::POLLIN as u32, now).0, 0);
         assert!(st.on_read(2, reader, 1, false, now).is_empty());
 
-        // Returning the token reserves it for the earlier poller, not the later reader!
+        // Returning the token reserves it for the earlier poller, not the later reader.
         let (_, _, eff) = st.on_write(holder, 1, now);
         assert_eq!(eff, vec![Effect::NotifyPoll { kh: 555 }]);
         assert_eq!(st.available(), 0);
@@ -843,13 +859,33 @@ mod tests {
             }]
         );
 
-        // If a reservation expires unclaimed, the blocking reader behind it gets woken.
+        // When poller returns the token, blocking reader behind it gets woken.
         let (_, _, eff) = st.on_write(poller, 1, now);
         assert_eq!(
             eff,
             vec![Effect::ReplyByte {
                 unique: 2,
                 owner: proc_owner(3)
+            }]
+        );
+
+        // Verify reservation expiry: poller wakes but never reads; after TTL,
+        // expire_reservations hands the token to the blocking reader behind it.
+        assert_eq!(st.on_poll(poller, 556, true, libc::POLLIN as u32, now).0, 0);
+        assert!(st.on_read(4, holder, 1, false, now).is_empty());
+        let (_, _, eff) = st.on_write(reader, 1, now);
+        assert_eq!(eff, vec![Effect::NotifyPoll { kh: 556 }]);
+        assert_eq!(st.available(), 0);
+        assert!(
+            st.expire_reservations(now + Duration::from_millis(10))
+                .is_empty()
+        );
+        let eff = st.expire_reservations(now + POLL_RESERVATION_TTL + Duration::from_millis(1));
+        assert_eq!(
+            eff,
+            vec![Effect::ReplyByte {
+                unique: 4,
+                owner: proc_owner(1)
             }]
         );
     }

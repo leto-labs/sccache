@@ -844,6 +844,11 @@ def jobserver_report(args, config, warnings):
     held = data.get("held") or 0
     withheld = data.get("withheld") or 0
     capacity = data.get("capacity") or 0
+    if data.get("draining"):
+        warnings.append(
+            f"Host jobserver is draining ({data.get('open_fhs', 0)} open handles); "
+            "new builds have no host-wide jobserver until it exits and restarts"
+        )
     if waiters > 0 and held == 0 and withheld < capacity:
         warnings.append(f"Host jobserver has {waiters} waiter(s) with 0 held tokens")
     return data

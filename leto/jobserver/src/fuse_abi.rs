@@ -369,10 +369,7 @@ pub fn mount_fusermount3(mountpoint: &Path) -> io::Result<OwnedFd> {
     if !status.success() {
         return Err(io::Error::other(format!("fusermount3 exited {status}")));
     }
-    if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
-        return Err(io::Error::other("fusermount3 control message truncated"));
-    }
-
+    let truncated = (msg.msg_flags & libc::MSG_CTRUNC) != 0;
     let mut received: Option<RawFd> = None;
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
@@ -385,7 +382,7 @@ pub fn mount_fusermount3(mountpoint: &Path) -> io::Result<OwnedFd> {
                 for i in 0..count {
                     let fd =
                         ptr::read_unaligned(base.add(i * mem::size_of::<RawFd>()).cast::<RawFd>());
-                    if received.is_none() {
+                    if !truncated && received.is_none() {
                         received = Some(fd);
                     } else {
                         libc::close(fd);
@@ -394,6 +391,9 @@ pub fn mount_fusermount3(mountpoint: &Path) -> io::Result<OwnedFd> {
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
+    }
+    if truncated {
+        return Err(io::Error::other("fusermount3 control message truncated"));
     }
     let fd = received.ok_or_else(|| io::Error::other("fusermount3 sent no /dev/fuse fd"))?;
     // Set O_NONBLOCK so a cancelled FUSE request between poll() and read() can

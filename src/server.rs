@@ -520,11 +520,11 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     let client = match &config.server.jobserver_fifo {
         Some(path) => {
             match std::fs::metadata(path) {
-                Ok(meta) => {
+                Ok(_meta) => {
                     #[cfg(unix)]
                     {
                         use std::os::unix::fs::FileTypeExt;
-                        if meta.file_type().is_fifo() {
+                        if _meta.file_type().is_fifo() {
                             warn!(
                                 "server.jobserver_fifo {} is a plain FIFO rather than a FUSE stream jobserver; killed compilers can leak tokens in a plain FIFO",
                                 path.display()

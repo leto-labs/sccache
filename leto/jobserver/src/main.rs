@@ -21,6 +21,7 @@ use crate::psi::{PsiAction, PsiConfig, PsiGovernor, read_avg10};
 use crate::state::{Effect, JobserverState, resolve_open_identity};
 
 const LOG_RATE_LIMIT: Duration = Duration::from_secs(60);
+const MAX_FUSE_BATCH: usize = 64;
 
 fn log_line(msg: &str) {
     let mut stderr = io::stderr().lock();
@@ -28,10 +29,14 @@ fn log_line(msg: &str) {
 }
 
 fn make_stderr_nonblocking() {
+    // Only set O_NONBLOCK on non-tty stderr (e.g. systemd journal pipe) so
+    // interactive shells sharing a controlling tty do not inherit EAGAIN.
     unsafe {
-        let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
-        if flags >= 0 {
-            libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        if libc::isatty(libc::STDERR_FILENO) == 0 {
+            let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+            if flags >= 0 {
+                libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            }
         }
     }
 }
@@ -510,7 +515,7 @@ fn handle_fuse_request(
                 log_line(&format!(
                     "leto-jobserver: ignored {excess} excess token write(s) from pid={} (total excess={})",
                     hdr.pid,
-                    state.status().excess_writes_total
+                    state.excess_writes_total()
                 ));
             }
             let out = FuseWriteOut {
@@ -526,12 +531,14 @@ fn handle_fuse_request(
                 return false;
             };
             let schedule = (poll_in.flags & FUSE_POLL_SCHEDULE_NOTIFY) != 0;
-            let revents = state.on_poll(poll_in.fh, poll_in.kh, schedule, poll_in.events, now);
+            let (revents, effects) =
+                state.on_poll(poll_in.fh, poll_in.kh, schedule, poll_in.events, now);
             let out = FusePollOut {
                 revents,
                 padding: 0,
             };
             let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+            apply_effects(fuse_fd, state, effects, now);
         }
         FUSE_INTERRUPT => {
             if let Some(int_in) = read_struct::<FuseInterruptIn>(body)
@@ -780,7 +787,10 @@ fn run_serve(mut cfg: ServeArgs) -> io::Result<()> {
                         if let Some(link) = &cfg.path {
                             cleanup_symlink(link, &tokens_target);
                         }
-                        drain_deadline = Some(now + drain_timeout);
+                        drain_deadline = Some(
+                            now.checked_add(drain_timeout)
+                                .unwrap_or_else(|| now + Duration::from_secs(86400)),
+                        );
                         log_line(&format!(
                             "leto-jobserver: draining {} open handle(s) for up to {}s (second signal forces exit)",
                             state.open_fhs(),
@@ -793,7 +803,9 @@ fn run_serve(mut cfg: ServeArgs) -> io::Result<()> {
         }
 
         if (pollfds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP)) != 0 {
-            loop {
+            // Bound each /dev/fuse batch so a flood of non-blocking reads cannot
+            // starve signals, control socket queries, PSI ticks, or expiry.
+            for _ in 0..MAX_FUSE_BATCH {
                 let n = unsafe { libc::read(fuse_raw, buf.as_mut_ptr().cast(), buf.len()) };
                 if n < 0 {
                     let err = io::Error::last_os_error();
@@ -851,28 +863,28 @@ fn run_serve(mut cfg: ServeArgs) -> io::Result<()> {
                     delta,
                     new_withheld,
                 } => {
-                    let snap = state.status();
+                    let psi = state.psi_snapshot();
                     log_line(&format!(
                         "leto-jobserver: PSI withheld {delta} token(s) (withheld={new_withheld}, effective={}/{}, io={:.2}, smoothed={:.2}, mem={:.2})",
-                        snap.effective_capacity,
-                        snap.capacity,
-                        snap.psi.io_full_avg10.unwrap_or(-1.0),
-                        snap.psi.io_smoothed.unwrap_or(-1.0),
-                        snap.psi.memory_some_avg10.unwrap_or(-1.0),
+                        state.effective_capacity(),
+                        state.capacity(),
+                        psi.io_full_avg10.unwrap_or(-1.0),
+                        psi.io_smoothed.unwrap_or(-1.0),
+                        psi.memory_some_avg10.unwrap_or(-1.0),
                     ));
                 }
                 PsiAction::Released {
                     delta,
                     new_withheld,
                 } => {
-                    let snap = state.status();
+                    let psi = state.psi_snapshot();
                     log_line(&format!(
                         "leto-jobserver: PSI released {delta} token(s) (withheld={new_withheld}, effective={}/{}, io={:.2}, smoothed={:.2}, mem={:.2})",
-                        snap.effective_capacity,
-                        snap.capacity,
-                        snap.psi.io_full_avg10.unwrap_or(-1.0),
-                        snap.psi.io_smoothed.unwrap_or(-1.0),
-                        snap.psi.memory_some_avg10.unwrap_or(-1.0),
+                        state.effective_capacity(),
+                        state.capacity(),
+                        psi.io_full_avg10.unwrap_or(-1.0),
+                        psi.io_smoothed.unwrap_or(-1.0),
+                        psi.memory_some_avg10.unwrap_or(-1.0),
                     ));
                 }
                 PsiAction::Unchanged => {}
