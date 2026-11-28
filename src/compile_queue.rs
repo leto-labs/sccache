@@ -10,6 +10,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::config::JobserverSwap;
+use crate::jobserver::{MAX_RETIRE_PENDING, Pool};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -34,6 +36,12 @@ pub struct CompileQueueStats {
     /// report it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stalled_for: Option<Duration>,
+    /// Number of times the daemon swapped its private jobserver pipe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_swaps: Option<u64>,
+    /// Retired helper threads that have not yet confirmed exit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retire_pending: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +127,9 @@ struct QueueState {
     token_wait: Timing,
     token_waits_over_10s: u64,
     running: usize,
+    // Incremented whenever a token wait starts or a compile begins running so
+    // idle-deficit detection resets if any activity occurs between 5 s ticks.
+    busy_seq: u64,
     last_warning: Option<Instant>,
     stages: BTreeMap<CompileStage, Timing>,
     last_stage_warning: BTreeMap<CompileStage, Instant>,
@@ -176,6 +187,40 @@ impl QueueState {
 /// How long compiles may wait with none running before that is logged as an error.
 pub(crate) const STALL_ERROR_AFTER: Duration = Duration::from_secs(60);
 
+/// How long an empty pipe with waiters and nothing running must persist within
+/// one generation before swapping the pool.
+pub(crate) const HARD_STALL_SWAP_AFTER: Duration = Duration::from_secs(120);
+
+/// How long an idle daemon missing at least a quarter of its tokens (by the
+/// same count) must persist within one generation before swapping the pool.
+pub(crate) const IDLE_DEFICIT_SWAP_AFTER: Duration = Duration::from_secs(600);
+
+/// Backoff after a replacement pool creation fails.
+pub(crate) const SWAP_FAILURE_BACKOFF: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SwapTrigger {
+    HardStall { stalled_since: Option<Instant> },
+    IdleDeficit { deficit: usize, busy_seq: u64 },
+}
+
+impl SwapTrigger {
+    fn label(self) -> &'static str {
+        match self {
+            Self::HardStall { .. } => "hard stall",
+            Self::IdleDeficit { .. } => "idle deficit",
+        }
+    }
+}
+
+#[derive(Default)]
+struct SwapWatchState {
+    hard_stall: Option<(u64, Option<Instant>, Instant)>,
+    idle_deficit: Option<(u64, u64, usize, Instant)>,
+    backoff_until: Option<Instant>,
+    retire_cap_logged: bool,
+}
+
 fn log_token_warning(warning: Option<(usize, usize)>) {
     if let Some((waiting, running)) = warning {
         warn!("Compiler token wait exceeded 30 s ({waiting} waiting, {running} running)");
@@ -184,44 +229,59 @@ fn log_token_warning(warning: Option<(usize, usize)>) {
 
 pub(crate) struct CompileQueue {
     capacity: usize,
-    jobserver: Option<jobserver::Client>,
+    pool: Option<Arc<Pool>>,
+    swap_policy: JobserverSwap,
     state: Mutex<QueueState>,
 }
 
 impl CompileQueue {
-    pub(crate) fn new(capacity: usize, jobserver: Option<jobserver::Client>) -> Self {
+    pub(crate) fn new(
+        capacity: usize,
+        pool: Option<Arc<Pool>>,
+        swap_policy: JobserverSwap,
+    ) -> Self {
         Self {
             capacity,
-            jobserver,
+            pool,
+            swap_policy,
             state: Mutex::default(),
         }
     }
 
     pub(crate) fn snapshot(&self) -> CompileQueueStats {
-        let tokens_in_use = self
-            .jobserver
-            .as_ref()
-            .and_then(|client| client.available().ok())
-            .map(|available| self.capacity.saturating_sub(available));
-        let state = self.state.lock().unwrap();
-        let now = Instant::now();
-        CompileQueueStats {
-            token_capacity: self.capacity,
-            tokens_in_use,
-            // The wire carries it after the gauge, so both come or neither.
-            stalled_for: tokens_in_use.map(|_| {
-                state
-                    .stalled_since
-                    .map_or(Duration::ZERO, |since| now - since)
-            }),
-            running: state.running,
-            token_wait: state.token_wait.snapshot(now),
-            token_waits_over_10s: state.token_waits_over_10s,
-            stages: state
-                .stages
-                .iter()
-                .map(|(&stage, timing)| (stage, timing.snapshot(now)))
-                .collect(),
+        let build =
+            |tokens_in_use: Option<usize>, pool_swaps: Option<u64>, retire_pending: Option<u64>| {
+                let state = self.state.lock().unwrap();
+                let now = Instant::now();
+                CompileQueueStats {
+                    token_capacity: self.capacity,
+                    tokens_in_use,
+                    // The wire carries stall and swap fields after the gauge, so
+                    // they are only populated when the gauge is present.
+                    stalled_for: tokens_in_use.map(|_| {
+                        state
+                            .stalled_since
+                            .map_or(Duration::ZERO, |since| now - since)
+                    }),
+                    pool_swaps: tokens_in_use.and(pool_swaps),
+                    retire_pending: tokens_in_use.and(retire_pending),
+                    running: state.running,
+                    token_wait: state.token_wait.snapshot(now),
+                    token_waits_over_10s: state.token_waits_over_10s,
+                    stages: state
+                        .stages
+                        .iter()
+                        .map(|(&stage, timing)| (stage, timing.snapshot(now)))
+                        .collect(),
+                }
+            };
+        if let Some(pool) = &self.pool {
+            pool.with_current(|_, available| {
+                let tokens_in_use = available.map(|avail| self.capacity.saturating_sub(avail));
+                build(tokens_in_use, pool.pool_swaps(), pool.retire_pending())
+            })
+        } else {
+            build(None, None, None)
         }
     }
 
@@ -243,6 +303,7 @@ impl CompileQueue {
 
     pub(crate) fn start_token(self: &Arc<Self>) -> TokenUse {
         let mut state = self.state.lock().unwrap();
+        state.busy_seq = state.busy_seq.wrapping_add(1);
         let start = state.token_wait.start();
         state.note_transition(start);
         TokenUse {
@@ -274,15 +335,201 @@ impl CompileQueue {
         }
     }
 
-    /// Compilers killed while holding tokens from our pipe (their client went
-    /// away, or the OOM killer) never give them back. The pool cannot be
-    /// repaired in place while their descendants may still hold tokens, so
-    /// this only reports the stall; restarting the daemon recovers it.
+    fn is_idle_deficit(&self, in_use: usize) -> bool {
+        in_use > 0 && in_use.saturating_mul(4) >= self.capacity
+    }
+
+    fn evaluate_swap_trigger(
+        &self,
+        pool: &Pool,
+        now: Instant,
+        watch: &mut SwapWatchState,
+    ) -> Option<(u64, SwapTrigger)> {
+        let retire_pending = pool.retire_pending_count();
+        if retire_pending >= MAX_RETIRE_PENDING {
+            watch.hard_stall = None;
+            watch.idle_deficit = None;
+            if !watch.retire_cap_logged {
+                watch.retire_cap_logged = true;
+                error!(
+                    "disabling jobserver pool swaps: {retire_pending} helper retirements pending \
+                     (limit {MAX_RETIRE_PENDING})"
+                );
+            }
+            return None;
+        }
+        watch.retire_cap_logged = false;
+
+        let (gen_id, available, running, waiting, stalled_since, busy_seq) =
+            pool.with_current(|gen_id, available| {
+                let state = self.state.lock().unwrap();
+                (
+                    gen_id,
+                    available,
+                    state.running,
+                    state.token_wait.active,
+                    state.stalled_since,
+                    state.busy_seq,
+                )
+            });
+
+        let Some(available) = available else {
+            watch.hard_stall = None;
+            watch.idle_deficit = None;
+            return None;
+        };
+        let in_use = self.capacity.saturating_sub(available);
+
+        if self.swap_policy.on_stall() && available == 0 && running == 0 && waiting > 0 {
+            match watch.hard_stall {
+                Some((id, prev_stalled, _)) if id == gen_id && prev_stalled == stalled_since => {}
+                _ => watch.hard_stall = Some((gen_id, stalled_since, now)),
+            }
+        } else {
+            watch.hard_stall = None;
+        }
+
+        if self.swap_policy.on_idle()
+            && running == 0
+            && waiting == 0
+            && self.is_idle_deficit(in_use)
+        {
+            match watch.idle_deficit {
+                Some((id, prev_seq, prev_in_use, _))
+                    if id == gen_id && prev_seq == busy_seq && prev_in_use == in_use => {}
+                _ => watch.idle_deficit = Some((gen_id, busy_seq, in_use, now)),
+            }
+        } else {
+            watch.idle_deficit = None;
+        }
+
+        if watch.backoff_until.is_some_and(|until| now < until) {
+            return None;
+        }
+
+        if let Some((id, prev_stalled, since)) = watch.hard_stall
+            && id == gen_id
+            && now - since >= HARD_STALL_SWAP_AFTER
+        {
+            return Some((
+                gen_id,
+                SwapTrigger::HardStall {
+                    stalled_since: prev_stalled,
+                },
+            ));
+        }
+
+        if let Some((id, prev_seq, deficit, since)) = watch.idle_deficit
+            && id == gen_id
+            && now - since >= IDLE_DEFICIT_SWAP_AFTER
+        {
+            return Some((
+                gen_id,
+                SwapTrigger::IdleDeficit {
+                    deficit,
+                    busy_seq: prev_seq,
+                },
+            ));
+        }
+
+        None
+    }
+
+    async fn maybe_swap_pool(&self, now: Instant, watch: &mut SwapWatchState) {
+        if !Pool::supports_swap() || self.swap_policy == JobserverSwap::Off {
+            return;
+        }
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        let Some((snap_id, trigger)) = self.evaluate_swap_trigger(pool, now, watch) else {
+            return;
+        };
+
+        let pool_for_build = pool.clone();
+        let candidate =
+            match tokio::task::spawn_blocking(move || pool_for_build.build_candidate()).await {
+                Ok(Ok(candidate)) => candidate,
+                Ok(Err(err)) => {
+                    error!(
+                        "failed to create replacement jobserver pool: {err}; keeping current pool \
+                     and backing off for {}s",
+                        SWAP_FAILURE_BACKOFF.as_secs()
+                    );
+                    watch.backoff_until = Some(Instant::now() + SWAP_FAILURE_BACKOFF);
+                    return;
+                }
+                Err(err) if err.is_cancelled() => {
+                    debug!("jobserver pool creation task cancelled: {err}");
+                    return;
+                }
+                Err(err) => {
+                    error!("jobserver pool creation task failed: {err}");
+                    watch.backoff_until = Some(Instant::now() + SWAP_FAILURE_BACKOFF);
+                    return;
+                }
+            };
+
+        let publish = pool.try_publish_swap(snap_id, candidate, |available| {
+            let Some(available) = available else {
+                return false;
+            };
+            let state = self.state.lock().unwrap();
+            match trigger {
+                SwapTrigger::HardStall { stalled_since } => {
+                    available == 0
+                        && state.running == 0
+                        && state.token_wait.active > 0
+                        && state.stalled_since == stalled_since
+                }
+                SwapTrigger::IdleDeficit { deficit, busy_seq } => {
+                    let in_use = self.capacity.saturating_sub(available);
+                    state.running == 0
+                        && state.token_wait.active == 0
+                        && state.busy_seq == busy_seq
+                        && in_use == deficit
+                        && self.is_idle_deficit(in_use)
+                }
+            }
+        });
+
+        match publish {
+            Ok(published) => {
+                watch.hard_stall = None;
+                watch.idle_deficit = None;
+                watch.backoff_until = None;
+                let old_in_use = published
+                    .old_in_use
+                    .map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+                error!(
+                    "swapped jobserver pool to generation {} ({}, old tokens_in_use={}/{}, \
+                     generation_age={}s)",
+                    published.new_id,
+                    trigger.label(),
+                    old_in_use,
+                    self.capacity,
+                    published.old_age.as_secs()
+                );
+            }
+            Err(unused) => {
+                watch.hard_stall = None;
+                watch.idle_deficit = None;
+                let _ = tokio::task::spawn_blocking(move || drop(unused)).await;
+            }
+        }
+    }
+
+    /// Watches the compile queue every 5 s: logs errors once a stall lasts
+    /// over [`STALL_ERROR_AFTER`], and on Linux swaps to a fresh private
+    /// jobserver pipe when killed compilers deplete the pool. Never returns.
     pub(crate) async fn log_stalls(self: Arc<Self>) {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
+        let mut watch = SwapWatchState::default();
         loop {
             tick.tick().await;
-            self.check_stall(Instant::now());
+            let now = Instant::now();
+            self.check_stall(now);
+            self.maybe_swap_pool(now, &mut watch).await;
         }
     }
 }
@@ -433,6 +680,7 @@ impl TokenUse {
 
     pub(crate) fn acquired(&mut self) {
         let mut state = self.queue.state.lock().unwrap();
+        state.busy_seq = state.busy_seq.wrapping_add(1);
         let warning = state.finish_token_wait(self.waiting_since.take().unwrap());
         state.running += 1;
         state.note_transition(Instant::now());
@@ -458,10 +706,11 @@ impl Drop for TokenUse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jobserver::Client;
 
     #[tokio::test(start_paused = true)]
     async fn slow_stage_warnings_respect_thresholds_and_rate_limits() {
-        let queue = Arc::new(CompileQueue::new(1, None));
+        let queue = Arc::new(CompileQueue::new(1, None, JobserverSwap::Off));
         let work = StageWork::new(true);
         let hashing = queue.start_stage(CompileStage::Hashing);
         let lookup = queue.start_stage(CompileStage::CacheLookup);
@@ -533,10 +782,15 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stall_is_one_unbroken_stretch_with_waiters_and_nothing_running() {
-        assert_eq!(CompileQueue::new(1, None).snapshot().stalled_for, None);
-        let jobserver = cfg!(unix).then(|| jobserver::Client::new(1).unwrap());
-        let gauged = jobserver.is_some();
-        let queue = Arc::new(CompileQueue::new(1, jobserver));
+        assert_eq!(
+            CompileQueue::new(1, None, JobserverSwap::Off)
+                .snapshot()
+                .stalled_for,
+            None
+        );
+        let client = Client::new_num(1).with_compile_queue_swap(JobserverSwap::Off);
+        let queue = client.compile_queue().unwrap();
+        let gauged = cfg!(unix);
         let stalled_for = || {
             let since = queue.state.lock().unwrap().stalled_since;
             let stalled = since.map_or(Duration::ZERO, |since| Instant::now() - since);
@@ -566,7 +820,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn stall_error_is_logged_after_a_minute_and_at_most_once_a_minute() {
-        let queue = Arc::new(CompileQueue::new(1, None));
+        let queue = Arc::new(CompileQueue::new(1, None, JobserverSwap::Off));
         let logger = tokio::spawn(queue.clone().log_stalls());
         let last_error = || queue.state.lock().unwrap().last_stall_error;
         let mut running = queue.start_token();
@@ -591,7 +845,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancelled_token_wait_is_recorded_and_warnings_are_rate_limited() {
-        let queue = Arc::new(CompileQueue::new(1, None));
+        let queue = Arc::new(CompileQueue::new(1, None, JobserverSwap::Off));
         let first = queue.start_token();
         let second = queue.start_token();
 
@@ -621,5 +875,206 @@ mod tests {
             queue.state.lock().unwrap().last_warning,
             Some(first_warning + Duration::from_secs(60))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn leak_one_token_via_killed_child(client: &Client) {
+        use std::os::unix::process::ExitStatusExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let token = client.acquire_for_command().await.unwrap();
+        let mut cmd = std::process::Command::new("bash");
+        // Wait for "go" on stdin before reading a token from the pipe so we can
+        // drop our admission token first and drain even the last pipe token.
+        cmd.env("LC_ALL", "C").arg("-c").arg(
+            r#"auth=${CARGO_MAKEFLAGS##*--jobserver-auth=}; auth=${auth%% *}
+               read -r _
+               IFS= read -r -n1 -u "${auth%,*}" token || exit 1
+               echo taken
+               read -r _"#,
+        );
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        token.configure(&mut cmd);
+        let mut child = tokio::process::Command::from(cmd)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        // Return the daemon admission token so the child can take any remaining
+        // pipe token (including the final one) before being SIGKILLed.
+        drop(token);
+        stdin.write_all(b"go\n").await.unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert_eq!(line, "taken\n");
+        child.start_kill().unwrap();
+        assert_eq!(child.wait().await.unwrap().signal(), Some(libc::SIGKILL));
+        drop(stdin);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn hard_stall_with_killed_children_recovers_by_swapping() {
+        let client = Client::new_num(2).with_compile_queue_swap(JobserverSwap::Stall);
+        let queue = client.compile_queue().unwrap();
+
+        // Repeatedly leak tokens via real killed children until the pipe is
+        // empty, before starting the paused-clock watchdog.
+        leak_one_token_via_killed_child(&client).await;
+        assert_eq!(queue.snapshot().tokens_in_use, Some(1));
+        leak_one_token_via_killed_child(&client).await;
+        assert_eq!(queue.snapshot().tokens_in_use, Some(2));
+        assert_eq!(queue.snapshot().running, 0);
+
+        let watchdog = tokio::spawn(queue.clone().log_stalls());
+        let waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.acquire_for_command().await.unwrap() }
+        });
+        // Not swapped before 120 s.
+        tokio::time::sleep(HARD_STALL_SWAP_AFTER - Duration::from_secs(10)).await;
+        assert!(!waiter.is_finished());
+        assert_eq!(queue.snapshot().pool_swaps, Some(0));
+
+        // Past 120 s the watchdog swaps and the waiter is admitted.
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let token = waiter.await.unwrap();
+        let stats = queue.snapshot();
+        assert_eq!(stats.pool_swaps, Some(1));
+        assert_eq!(stats.running, 1);
+        assert_eq!(stats.tokens_in_use, Some(1));
+        drop(token);
+        assert_eq!(queue.snapshot().tokens_in_use, Some(0));
+
+        watchdog.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn idle_deficit_swaps_at_idle_and_respects_policy_and_running_compiles() {
+        // Capacity 4: losing 1 token is 25% (triggers idle deficit).
+        let client = Client::new_num(4).with_compile_queue_swap(JobserverSwap::StallAndIdle);
+        let pool = client.pool().unwrap();
+        let queue = client.compile_queue().unwrap();
+
+        leak_one_token_via_killed_child(&client).await;
+        assert_eq!(queue.snapshot().tokens_in_use, Some(1));
+
+        let watchdog = tokio::spawn(queue.clone().log_stalls());
+
+        // While a compile is running, no swap happens even past 10 min.
+        let running = client.acquire_for_command().await.unwrap();
+        tokio::time::sleep(IDLE_DEFICIT_SWAP_AFTER + Duration::from_secs(30)).await;
+        assert_eq!(queue.snapshot().pool_swaps, Some(0));
+        drop(running);
+
+        // Once idle, it waits a full 10 min with the same deficit count.
+        tokio::time::sleep(IDLE_DEFICIT_SWAP_AFTER - Duration::from_secs(15)).await;
+        assert_eq!(queue.snapshot().pool_swaps, Some(0));
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        let stats = queue.snapshot();
+        assert_eq!(stats.pool_swaps, Some(1));
+        assert_eq!(stats.tokens_in_use, Some(0));
+        // Acquiring after a no-waiter idle swap must succeed in one pass.
+        pool.take_acquire_passes();
+        let post_swap = client.acquire_for_command().await.unwrap();
+        assert_eq!(pool.take_acquire_passes(), 1);
+        drop(post_swap);
+        watchdog.abort();
+
+        // With `Stall` policy, idle deficit does not swap.
+        let stall_only = Client::new_num(4).with_compile_queue_swap(JobserverSwap::Stall);
+        let queue2 = stall_only.compile_queue().unwrap();
+        leak_one_token_via_killed_child(&stall_only).await;
+        let watchdog2 = tokio::spawn(queue2.clone().log_stalls());
+        tokio::time::sleep(IDLE_DEFICIT_SWAP_AFTER + Duration::from_secs(60)).await;
+        assert_eq!(queue2.snapshot().pool_swaps, Some(0));
+        assert_eq!(queue2.snapshot().tokens_in_use, Some(1));
+        watchdog2.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn creation_failure_keeps_old_pool_and_backs_off() {
+        let client = Client::new_num(2).with_compile_queue_swap(JobserverSwap::Stall);
+        let pool = client.pool().unwrap();
+        let queue = client.compile_queue().unwrap();
+        let old_pipe = pool.current_pipe_for_test();
+        pool.set_fail_candidate(true);
+
+        leak_one_token_via_killed_child(&client).await;
+        leak_one_token_via_killed_child(&client).await;
+
+        let watchdog = tokio::spawn(queue.clone().log_stalls());
+        let waiter = tokio::spawn({
+            let client = client.clone();
+            async move { client.acquire_for_command().await.unwrap() }
+        });
+
+        // Past 120 s creation fails, old pool stays, watchdog keeps running.
+        tokio::time::sleep(HARD_STALL_SWAP_AFTER + Duration::from_secs(20)).await;
+        assert!(!watchdog.is_finished());
+        assert_eq!(queue.snapshot().pool_swaps, Some(0));
+        assert!(Arc::ptr_eq(&pool.current_pipe_for_test(), &old_pipe));
+
+        // Clear the failure; backoff prevents swapping until 10 min elapses.
+        pool.set_fail_candidate(false);
+        tokio::time::sleep(SWAP_FAILURE_BACKOFF - Duration::from_secs(30)).await;
+        assert_eq!(queue.snapshot().pool_swaps, Some(0));
+
+        // After backoff expires, the next tick swaps and unblocks the waiter.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        let token = waiter.await.unwrap();
+        assert_eq!(queue.snapshot().pool_swaps, Some(1));
+        assert!(!Arc::ptr_eq(&pool.current_pipe_for_test(), &old_pipe));
+        drop(token);
+        watchdog.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_during_swap_preparation_leaves_old_pool_intact() {
+        let client = Client::new_num(2).with_compile_queue_swap(JobserverSwap::Stall);
+        let pool = client.pool().unwrap();
+        let queue = client.compile_queue().unwrap();
+        let old_pipe = pool.current_pipe_for_test();
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        pool.set_candidate_gate(entered_tx, gate_rx);
+
+        leak_one_token_via_killed_child(&client).await;
+        leak_one_token_via_killed_child(&client).await;
+
+        let waiter = queue.start_token();
+        let watchdog = tokio::spawn(queue.clone().log_stalls());
+        // Advance tick by tick until `build_candidate` starts on `spawn_blocking`.
+        let mut entered = false;
+        let mut entered_rx = entered_rx;
+        for _ in 0..30 {
+            tokio::time::advance(Duration::from_secs(5)).await;
+            tokio::task::yield_now().await;
+            if entered_rx.try_recv().is_ok() {
+                entered = true;
+                break;
+            }
+        }
+        if !entered {
+            entered_rx.await.unwrap();
+        }
+
+        // Simulate server shutdown cancelling `log_stalls` mid-preparation.
+        watchdog.abort();
+        let _ = watchdog.await;
+        drop(gate_tx);
+
+        // Candidate is dropped off the runtime without publishing.
+        assert_eq!(queue.snapshot().pool_swaps, Some(0));
+        assert!(Arc::ptr_eq(&pool.current_pipe_for_test(), &old_pipe));
+        drop(waiter);
     }
 }

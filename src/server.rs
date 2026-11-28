@@ -772,7 +772,7 @@ impl<A: crate::net::Acceptor, C: CommandCreatorSync> SccacheServer<A, C> {
         let (tx, rx) = mpsc::channel(1);
         let (wait, info) = WaitUntilZero::new();
         let pool = runtime.handle().clone();
-        let client = client.with_compile_queue();
+        let client = client.with_compile_queue_swap(config.server.jobserver_swap);
         let mut service =
             SccacheService::new(dist_client, storage, cache_mode, &client, pool, tx, info)
                 .with_rust_options(
@@ -2889,6 +2889,15 @@ impl ServerStats {
                     fmt_duration_as_secs(&stalled)
                 ));
             }
+            if let Some(swaps) = queue.pool_swaps.filter(|&swaps| swaps > 0) {
+                writer.write(&format!("{:<33} {:>8}", "Jobserver pool swaps", swaps));
+            }
+            if let Some(pending) = queue.retire_pending.filter(|&pending| pending > 0) {
+                writer.write(&format!(
+                    "{:<33} {:>8}",
+                    "Helper retirements pending", pending
+                ));
+            }
             for (name, value) in [
                 ("Token capacity", queue.token_capacity.to_string()),
                 (
@@ -3750,7 +3759,11 @@ mod tests {
         let log = root.join("misses.jsonl");
         let explainer = Arc::new(MissExplain::new(&root.join("cache"), log.clone()));
         service.miss_explain = Some(explainer.clone());
-        service.compile_queue = Some(Arc::new(CompileQueue::new(1, None)));
+        service.compile_queue = Some(Arc::new(CompileQueue::new(
+            1,
+            None,
+            crate::config::JobserverSwap::Off,
+        )));
         let rustc = PathBuf::from(&compile.exe);
         let (baseline_done, info) = WaitUntilZero::new();
         service.info = info;
@@ -3889,7 +3902,11 @@ mod tests {
             Arc::new(MockStorage::new(None, false)),
             tokio::runtime::Handle::current(),
         );
-        service.compile_queue = Some(Arc::new(CompileQueue::new(1, None)));
+        service.compile_queue = Some(Arc::new(CompileQueue::new(
+            1,
+            None,
+            crate::config::JobserverSwap::Off,
+        )));
         let pending = service.track_cache_write("entry");
         let waiting = service.wait_for_cache_write("entry");
         tokio::pin!(waiting);

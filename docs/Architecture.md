@@ -118,9 +118,14 @@ its client disconnected or the kernel's OOM killer ended it, never returns
 them, so the pool can shrink until no compile can start. Where the gauge of
 tokens in use is reported, the stats also report how long compiles have waited
 with none running, and past 60 seconds the daemon logs an error once a minute.
-Restarting the daemon recovers the pool. It is not repaired in place, because
-the killed compiler's descendants may still hold its tokens and return them
-later.
+On Linux, the daemon recovers by swapping to a fresh jobserver pipe once a hard
+stall (empty pipe, nothing running, compiles waiting) lasts 120 seconds, or
+once the daemon sits idle for 10 minutes missing at least a quarter of its
+tokens (`server.jobserver_swap = "stall,idle"` by default; `"stall"` or
+`"off"`). Waiters move to the new pipe and old tokens drain back to the old
+pipe; unconfirmed helper retirements are bounded (`retire_pending`, capped at
+4) and reported alongside `pool_swaps`. On other platforms, restarting the
+daemon recovers the pool.
 
 On Unix the daemon, unless it runs in the foreground at a terminal, starts
 each compiler in its own process group. It kills that group before reaping the

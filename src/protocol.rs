@@ -254,6 +254,8 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                         stages: queue.stages,
                         tokens_in_use: None,
                         stalled_for: None,
+                        pool_swaps: None,
+                        retire_pending: None,
                     });
                     let queue = info.stats.compile_queue.as_mut().unwrap();
                     // Each later field is appended; older daemons stop sooner.
@@ -264,7 +266,16 @@ pub(crate) fn decode_response(frame: &[u8]) -> bincode::Result<Response> {
                         if !remaining.is_empty() {
                             let (_, remaining) = decode_frame::<u64>(remaining)?;
                             if !remaining.is_empty() {
-                                queue.stalled_for = Some(bincode::deserialize(remaining)?);
+                                let (stalled_for, remaining) = decode_frame(remaining)?;
+                                queue.stalled_for = Some(stalled_for);
+                                if !remaining.is_empty() {
+                                    let (pool_swaps, remaining) = decode_frame(remaining)?;
+                                    queue.pool_swaps = Some(pool_swaps);
+                                    if !remaining.is_empty() {
+                                        queue.retire_pending =
+                                            Some(bincode::deserialize(remaining)?);
+                                    }
+                                }
                             }
                         }
                     }
@@ -358,7 +369,13 @@ fn encode_stats_extension(
             // Older decoders read tokens_in_use as the last field and ignore the rest.
             if let Some(stalled_for) = queue.stalled_for {
                 bincode::serialize_into(&mut *frame, &0_u64)?;
-                bincode::serialize_into(frame, &stalled_for)?;
+                bincode::serialize_into(&mut *frame, &stalled_for)?;
+                if let (Some(pool_swaps), Some(retire_pending)) =
+                    (queue.pool_swaps, queue.retire_pending)
+                {
+                    bincode::serialize_into(&mut *frame, &pool_swaps)?;
+                    bincode::serialize_into(frame, &retire_pending)?;
+                }
             }
         }
     }
@@ -552,6 +569,8 @@ mod tests {
             stages: BTreeMap::from([(CompileStage::CacheLookup, WaitStats::default())]),
             tokens_in_use: None,
             stalled_for: None,
+            pool_swaps: None,
+            retire_pending: None,
         };
         info.stats.compile_queue = Some(queue.clone());
         let old_json = serde_json::to_value(&info).unwrap();
@@ -560,16 +579,34 @@ mod tests {
                 .get("tokens_in_use")
                 .is_none()
         );
+        assert!(
+            old_json["stats"]["compile_queue"]
+                .get("pool_swaps")
+                .is_none()
+        );
+        assert!(
+            old_json["stats"]["compile_queue"]
+                .get("retire_pending")
+                .is_none()
+        );
         let decoded: ServerInfo = serde_json::from_value(old_json).unwrap();
         assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
+        for response in [
+            Response::Stats(Box::new(info.clone())),
+            Response::ShuttingDown(Box::new(info.clone())),
+        ] {
+            let ungauged = encode_response(&response).unwrap();
+            let (Response::Stats(decoded) | Response::ShuttingDown(decoded)) =
+                decode_response(&ungauged).unwrap()
+            else {
+                panic!("expected stats response");
+            };
+            assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
+        }
         let old_queue_frame = encode_response(&Response::Stats(Box::new(info.clone()))).unwrap();
-        let Response::Stats(decoded) = decode_response(&old_queue_frame).unwrap() else {
-            panic!("expected stats response");
-        };
-        assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
 
-        // A -10 daemon: the frame ends at tokens_in_use, and stalled_for
-        // stays absent, also in the JSON that the health report reads.
+        // A -10 daemon: the frame ends at tokens_in_use, and later fields stay
+        // absent, also in the JSON that the health report reads.
         let tens_queue = CompileQueueStats {
             tokens_in_use: Some(8),
             ..queue.clone()
@@ -586,6 +623,11 @@ mod tests {
                 .get("stalled_for")
                 .is_none()
         );
+        assert!(
+            tens_json["stats"]["compile_queue"]
+                .get("pool_swaps")
+                .is_none()
+        );
         // A -11 daemon also sent its restored-token count.
         let mut elevens_frame = tens_frame.clone();
         elevens_frame.extend_from_slice(&3_u64.to_le_bytes());
@@ -594,15 +636,46 @@ mod tests {
         };
         assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&tens_queue));
 
+        // A -12 daemon sent the 0 placeholder and stalled_for, stopping before
+        // pool_swaps and retire_pending.
+        let twelves_queue = CompileQueueStats {
+            tokens_in_use: Some(8),
+            stalled_for: Some(Duration::from_secs(61)),
+            ..queue.clone()
+        };
+        let mut twelves_frame = tens_frame.clone();
+        twelves_frame.extend_from_slice(&0_u64.to_le_bytes());
+        twelves_frame.extend_from_slice(&61_u64.to_le_bytes());
+        twelves_frame.extend_from_slice(&0_u32.to_le_bytes());
+        let Response::Stats(decoded) = decode_response(&twelves_frame).unwrap() else {
+            panic!("expected stats response");
+        };
+        assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&twelves_queue));
+        let twelves_json = serde_json::to_value(&decoded).unwrap();
+        assert!(
+            twelves_json["stats"]["compile_queue"]
+                .get("pool_swaps")
+                .is_none()
+        );
+        assert!(
+            twelves_json["stats"]["compile_queue"]
+                .get("retire_pending")
+                .is_none()
+        );
+
         let queue = CompileQueueStats {
             tokens_in_use: Some(8),
             stalled_for: Some(Duration::from_secs(61)),
+            pool_swaps: Some(3),
+            retire_pending: Some(1),
             ..queue
         };
         info.stats.compile_queue = Some(queue.clone());
         let json = serde_json::to_value(&info).unwrap();
         assert_eq!(json["stats"]["compile_queue"]["token_wait"]["active"], 2);
         assert_eq!(json["stats"]["compile_queue"]["tokens_in_use"], 8);
+        assert_eq!(json["stats"]["compile_queue"]["pool_swaps"], 3);
+        assert_eq!(json["stats"]["compile_queue"]["retire_pending"], 1);
         let decoded: ServerInfo = serde_json::from_value(json).unwrap();
         assert_eq!(decoded.stats.compile_queue.as_ref(), Some(&queue));
 
@@ -620,27 +693,34 @@ mod tests {
             let (_, extension) = decode_frame::<Response>(&frame).unwrap();
             let (_, remaining) = decode_frame::<u64>(extension).unwrap();
             let (_, remaining) = decode_frame::<MissExplainStats>(remaining).unwrap();
-            // The previous decoder read the last field and ignored trailing bytes.
+            // Older decoders read their last field and ignore trailing bytes.
             assert_eq!(bincode::deserialize::<u64>(remaining).unwrap(), 0);
             let (_, remaining) = decode_frame::<u64>(remaining).unwrap();
             let legacy_queue: CompileQueueWire<BTreeMap<CompileStage, WaitStats>> =
                 bincode::deserialize(remaining).unwrap();
             assert_eq!(legacy_queue.running, 7);
             assert_eq!(legacy_queue.stages, queue.stages);
+            let (_, rest) =
+                decode_frame::<CompileQueueWire<BTreeMap<CompileStage, WaitStats>>>(remaining)
+                    .unwrap();
+            // -10 decoder: tokens_in_use last.
+            assert_eq!(bincode::deserialize::<usize>(rest).unwrap(), 8);
+            let (_, rest) = decode_frame::<usize>(rest).unwrap();
+            // -11 decoder: restored-token placeholder (0).
+            assert_eq!(bincode::deserialize::<u64>(rest).unwrap(), 0);
+            let (_, rest) = decode_frame::<u64>(rest).unwrap();
+            // -12 decoder: stalled_for last, ignoring pool_swaps and retire_pending.
+            assert_eq!(
+                bincode::deserialize::<Duration>(rest).unwrap(),
+                Duration::from_secs(61)
+            );
             if matches!(response, Response::Stats(_)) {
-                // -11's restored-token slot, then the stall.
-                let mut stalled = 0_u64.to_le_bytes().to_vec();
-                stalled.extend_from_slice(&61_u64.to_le_bytes());
-                stalled.extend_from_slice(&0_u32.to_le_bytes());
+                let mut suffix = 3_u64.to_le_bytes().to_vec();
+                suffix.extend_from_slice(&1_u64.to_le_bytes());
                 assert_eq!(
-                    frame.strip_suffix(stalled.as_slice()),
-                    Some(tens_frame.as_slice())
+                    frame.strip_suffix(suffix.as_slice()),
+                    Some(twelves_frame.as_slice())
                 );
-                // The previous decoder: tokens_in_use last, the rest ignored.
-                let (_, rest) =
-                    decode_frame::<CompileQueueWire<BTreeMap<CompileStage, WaitStats>>>(remaining)
-                        .unwrap();
-                assert_eq!(bincode::deserialize::<usize>(rest).unwrap(), 8);
             }
         }
 

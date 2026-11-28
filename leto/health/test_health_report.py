@@ -135,6 +135,7 @@ class HealthReportTest(unittest.TestCase):
         parsed = report["server"]["stats"]["compile_queue"]
         self.assertEqual(parsed, {
             "waiting": 2, "running": 0, "capacity": 4, "tokens_in_use": 4, "stalled_seconds": None,
+            "pool_swaps": None, "retire_pending": None,
             "total_wait_seconds": 205,
             "max_wait_seconds": 61.5, "oldest_wait_seconds": 61.5, "waits_over_10s": 5,
             "stages": {"cache_lookup": {"active": 3, "total_seconds": 80, "max_seconds": 42, "oldest_seconds": 10}},
@@ -174,6 +175,30 @@ class HealthReportTest(unittest.TestCase):
         stalled = self.report("--stats-json", str(path))
         self.assertIn("2 waiting for compiler tokens with none running for 90 s "
                       "(stalled daemon; restart it, see the build-bench runbook)", stalled["warnings"])
+
+        # A -14 daemon reports pool_swaps and retire_pending while keeping tokens_in_use visible.
+        queue.update(running=0, tokens_in_use=2, stalled_for=duration(90), pool_swaps=2, retire_pending=1)
+        queue["token_wait"].update(active=2, max=duration(90), oldest=duration(90))
+        path.write_text(json.dumps(stats))
+        swapped = self.report("--stats-json", str(path))
+        self.assertEqual(swapped["server"]["stats"]["compile_queue"]["tokens_in_use"], 2)
+        self.assertEqual(swapped["server"]["stats"]["compile_queue"]["pool_swaps"], 2)
+        self.assertEqual(swapped["server"]["stats"]["compile_queue"]["retire_pending"], 1)
+        self.assertIn("2 waiting for compiler tokens with none running for 90 s "
+                      "(automatic pool swap triggers at 120 s unless jobserver_swap = off)", swapped["warnings"])
+        self.assertIn("Jobserver pool has swapped 2 time(s) since daemon start to recover leaked compiler tokens",
+                      swapped["warnings"])
+        self.assertIn("1 jobserver helper retirement(s) pending", swapped["warnings"])
+
+        queue["stalled_for"] = duration(180)
+        queue["retire_pending"] = 4
+        path.write_text(json.dumps(stats))
+        capped = self.report("--stats-json", str(path))
+        self.assertIn("2 waiting for compiler tokens with none running for 180 s "
+                      "(stalled past automatic 120 s pool swap; restart daemon, see the build-bench runbook)",
+                      capped["warnings"])
+        self.assertIn("4 jobserver helper retirements pending "
+                      "(pool swapping stopped; restart daemon, see the build-bench runbook)", capped["warnings"])
 
     def test_host_aggregates_and_warnings(self):
         report = self.report("--deep")

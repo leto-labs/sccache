@@ -467,6 +467,11 @@ impl RunCommand for AsyncCommand {
     }
     async fn spawn(&mut self) -> Result<Child> {
         let mut inner = self.inner.take().unwrap();
+        // Acquire before configuring so private-pool sharing configures the
+        // exact pipe generation that issued our admission token. The token is
+        // acquired either way: it rate-limits how many children *we* run, which
+        // is separate from whether the child can acquire tokens of its own.
+        let token = self.jobserver.acquire_for_command().await?;
         // If the build that asked for this compile named its jobserver by
         // path, the child keeps it and opens it the way it would have without
         // sccache, so it stays within that build's (or a system-wide) limit
@@ -482,13 +487,10 @@ impl RunCommand for AsyncCommand {
             // probes and C/C++ compilers all ignore it -- so the default is
             // not to share, and the callers that spawn `rustc` ask for it.
             if self.share_jobserver {
-                self.jobserver.configure(&mut inner);
+                token.configure(&mut inner);
             }
         }
 
-        // The token is acquired either way: it rate-limits how many children
-        // *we* run, which is separate from whether the child can acquire
-        // tokens of its own.
         // Compiles run by a client stay in its group, so that a Ctrl-C at the
         // terminal still reaches them.
         let own_group = self.jobserver.process_groups;
@@ -498,7 +500,6 @@ impl RunCommand for AsyncCommand {
             inner.process_group(0);
         }
 
-        let token = self.jobserver.acquire_for_command().await?;
         let mut inner = tokio::process::Command::from(inner);
         let child = {
             let _spawning = crate::util::spawn_guard();
@@ -1211,5 +1212,106 @@ mod test {
         settle().await;
         // Outside the daemon only the leader is killed, as before.
         assert!(marker("client").exists());
+    }
+
+    /// After a pool swap, a child spawned with `share_jobserver` receives the
+    /// new pipe's fds and can acquire and return tokens on it. Also verifies
+    /// that `spawn_guard` is not held while waiting for a jobserver token.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn child_after_swap_uses_new_pipe_and_token_wait_does_not_hold_spawn_guard() {
+        use std::time::Duration;
+
+        let client = Client::new_num(2).with_compile_queue();
+        let pool = client.pool().unwrap();
+        let queue = client.compile_queue().unwrap();
+        let old_pipe = pool.current_pipe_for_test();
+
+        // Hold both tokens on gen 0 so a spawn blocks waiting for a token.
+        let held1 = client.acquire_for_command().await.unwrap();
+        let held2 = client.acquire_for_command().await.unwrap();
+        let mut waiting_cmd =
+            <ProcessCommandCreator as CommandCreatorSync>::new(&client).new_command_sync("bash");
+        waiting_cmd
+            .arg("-c")
+            .arg(
+                r#"auth=${CARGO_MAKEFLAGS##*--jobserver-auth=}; auth=${auth%% *}
+                   IFS= read -r -n1 -u "${auth%,*}" token || exit 1
+                   printf %s "$token" >&"${auth#*,}"
+                   printf ok"#,
+            )
+            .stdout(Stdio::piped())
+            .share_jobserver();
+
+        let waiter = tokio::spawn(async move {
+            let child = waiting_cmd.spawn().await.unwrap();
+            child.wait_with_output().await.unwrap()
+        });
+
+        // Wait until the spawn task is waiting for a token.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while queue.snapshot().token_wait.active == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.snapshot().token_wait.active, 1);
+
+        // `spawn_guard` must not be held while waiting for a token, so
+        // `wait_for_inflight_spawns` returns immediately.
+        let guard_check = tokio::task::spawn_blocking(crate::util::wait_for_inflight_spawns);
+        tokio::time::timeout(Duration::from_millis(500), guard_check)
+            .await
+            .expect("wait_for_inflight_spawns blocked on a token waiter")
+            .unwrap();
+
+        // Swap the pool while old tokens are still held on `old_pipe`: the
+        // waiting spawn must be admitted on the new pipe and its child must
+        // read and return a token from the new pipe's advertised fds.
+        pool.force_swap_for_test().unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("post-swap child timed out (configured with stale pipe?)")
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, b"ok");
+        assert_eq!(old_pipe.available().unwrap(), 0);
+        assert_eq!(pool.current_pipe_for_test().available().unwrap(), 2);
+
+        drop((held1, held2));
+        assert_eq!(old_pipe.available().unwrap(), 2);
+
+        // Forwarded `fifo:` jobservers still take a daemon admission token
+        // while keeping the caller's `--jobserver-auth=fifo:...` intact.
+        let held1 = client.acquire_for_command().await.unwrap();
+        let held2 = client.acquire_for_command().await.unwrap();
+        let fifo_flags = "-j8 --jobserver-auth=fifo:/tmp/GMfifo-test";
+        let mut fifo_cmd =
+            <ProcessCommandCreator as CommandCreatorSync>::new(&client).new_command_sync("bash");
+        fifo_cmd
+            .args(&["-c", "printf '%s|%s' \"$MAKEFLAGS\" \"$CARGO_MAKEFLAGS\""])
+            .env_clear()
+            .env("MAKEFLAGS", fifo_flags)
+            .stdout(Stdio::piped())
+            .share_jobserver();
+        let fifo_waiter = tokio::spawn(async move {
+            let child = fifo_cmd.spawn().await.unwrap();
+            child.wait_with_output().await.unwrap()
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while queue.snapshot().token_wait.active == 0 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(queue.snapshot().token_wait.active, 1);
+        assert!(!fifo_waiter.is_finished());
+        drop(held1);
+        let output = tokio::time::timeout(Duration::from_secs(5), fifo_waiter)
+            .await
+            .expect("forwarded fifo child timed out after token release")
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{fifo_flags}|")
+        );
+        drop(held2);
     }
 }

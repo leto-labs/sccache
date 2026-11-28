@@ -896,6 +896,36 @@ pub(crate) const fn default_incremental_prune_days() -> u64 {
     7
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, Eq, PartialEq)]
+pub enum JobserverSwap {
+    #[default]
+    #[serde(rename = "stall,idle")]
+    StallAndIdle,
+    #[serde(rename = "stall")]
+    Stall,
+    #[serde(rename = "off")]
+    Off,
+}
+
+impl JobserverSwap {
+    fn from_env_str(value: &str) -> Result<Self> {
+        match value {
+            "stall,idle" => Ok(Self::StallAndIdle),
+            "stall" => Ok(Self::Stall),
+            "off" => Ok(Self::Off),
+            _ => bail!("SCCACHE_SERVER_JOBSERVER_SWAP must be stall,idle, stall, or off"),
+        }
+    }
+
+    pub(crate) fn on_stall(self) -> bool {
+        matches!(self, Self::StallAndIdle | Self::Stall)
+    }
+
+    pub(crate) fn on_idle(self) -> bool {
+        matches!(self, Self::StallAndIdle)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -906,6 +936,9 @@ pub struct ServerConfig {
     /// When false, `--stop-server` and other shutdown requests over the socket
     /// are refused; only a signal (SIGTERM from systemd) stops the daemon.
     pub allow_client_shutdown: bool,
+    /// When to swap the daemon's private jobserver pipe on Linux after killed
+    /// compilers leak tokens: `"stall,idle"`, `"stall"`, or `"off"`.
+    pub jobserver_swap: JobserverSwap,
 }
 
 impl Default for ServerConfig {
@@ -916,6 +949,7 @@ impl Default for ServerConfig {
             connect_wait_secs: 30,
             put_raw_max_in_flight_bytes: 1024 * 1024 * 1024,
             allow_client_shutdown: true,
+            jobserver_swap: JobserverSwap::default(),
         }
     }
 }
@@ -927,6 +961,7 @@ struct ServerEnvConfig {
     connect_wait_secs: Option<u64>,
     put_raw_max_in_flight_bytes: Option<u64>,
     allow_client_shutdown: Option<bool>,
+    jobserver_swap: Option<JobserverSwap>,
 }
 
 // TODO: fields only pub for tests
@@ -982,7 +1017,7 @@ pub fn try_read_config_file<T: DeserializeOwned>(path: &Path) -> Result<Option<T
     Ok(Some(res))
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct EnvConfig {
     cache: CacheConfigs,
     server: ServerEnvConfig,
@@ -1506,6 +1541,12 @@ fn config_from_env() -> Result<EnvConfig> {
         Err(err) => return Err(err).context("Invalid SCCACHE_INCREMENTAL_PRUNE_DAYS"),
     };
 
+    let jobserver_swap = match env::var("SCCACHE_SERVER_JOBSERVER_SWAP") {
+        Ok(value) => Some(JobserverSwap::from_env_str(&value)?),
+        Err(env::VarError::NotPresent) => None,
+        Err(err) => return Err(err).context("Invalid SCCACHE_SERVER_JOBSERVER_SWAP"),
+    };
+
     Ok(EnvConfig {
         server: ServerEnvConfig {
             shutdown_drain_secs: number_from_env_var("SCCACHE_SHUTDOWN_DRAIN_SECS").transpose()?,
@@ -1517,6 +1558,7 @@ fn config_from_env() -> Result<EnvConfig> {
             )
             .transpose()?,
             allow_client_shutdown: bool_from_env_var("SCCACHE_SERVER_ALLOW_CLIENT_SHUTDOWN")?,
+            jobserver_swap,
         },
         miss_explain: env::var_os("SCCACHE_MISS_EXPLAIN").map(PathBuf::from),
         rust_incremental,
@@ -1721,6 +1763,9 @@ impl Config {
             allow_client_shutdown: env_server
                 .allow_client_shutdown
                 .unwrap_or(file_server.allow_client_shutdown),
+            jobserver_swap: env_server
+                .jobserver_swap
+                .unwrap_or(file_server.jobserver_swap),
         };
         let miss_explain = match env_miss_explain {
             Some(path) if path.as_os_str().is_empty() => None,
@@ -4533,4 +4578,45 @@ fn test_cache_type_by_name_matches_features() {
             }
         }
     }
+}
+
+#[test]
+fn test_server_jobserver_swap_config() {
+    let default: FileConfig = toml::from_str("").unwrap();
+    assert_eq!(default.server.jobserver_swap, JobserverSwap::StallAndIdle);
+
+    for (raw, expected) in [
+        ("stall,idle", JobserverSwap::StallAndIdle),
+        ("stall", JobserverSwap::Stall),
+        ("off", JobserverSwap::Off),
+    ] {
+        let parsed: FileConfig =
+            toml::from_str(&format!("[server]\njobserver_swap = \"{raw}\"\n")).unwrap();
+        assert_eq!(parsed.server.jobserver_swap, expected);
+        assert_eq!(JobserverSwap::from_env_str(raw).unwrap(), expected);
+    }
+
+    assert!(toml::from_str::<FileConfig>("[server]\njobserver_swap = \"idle\"\n").is_err());
+    assert!(JobserverSwap::from_env_str("idle").is_err());
+    assert!(JobserverSwap::from_env_str("").is_err());
+
+    let file = FileConfig {
+        server: ServerConfig {
+            jobserver_swap: JobserverSwap::Off,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let merged = Config::from_env_and_file_configs(
+        EnvConfig {
+            server: ServerEnvConfig {
+                jobserver_swap: Some(JobserverSwap::Stall),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        file,
+    )
+    .unwrap();
+    assert_eq!(merged.server.jobserver_swap, JobserverSwap::Stall);
 }

@@ -141,17 +141,41 @@ def compile_queue_report(queue, warnings):
     # Daemons from -12 time the stall themselves. For older ones a
     # sample with waiters and none running is the best sign, though it can fall in a gap
     # between compiles.
+    pool_swaps = queue.get("pool_swaps")
+    retire_pending = queue.get("retire_pending")
     if "stalled_for" in queue:
         stalled = duration_seconds(queue["stalled_for"])
         if stalled > 60:
-            warnings.append(f"{waiting} waiting for compiler tokens with none running for {stalled:.0f} s "
-                            "(stalled daemon; restart it, see the build-bench runbook)")
+            if pool_swaps is not None:
+                if stalled > 150:
+                    warnings.append(
+                        f"{waiting} waiting for compiler tokens with none running for {stalled:.0f} s "
+                        "(stalled past automatic 120 s pool swap; restart daemon, see the build-bench runbook)"
+                    )
+                else:
+                    warnings.append(
+                        f"{waiting} waiting for compiler tokens with none running for {stalled:.0f} s "
+                        "(automatic pool swap triggers at 120 s unless jobserver_swap = off)"
+                    )
+            else:
+                warnings.append(f"{waiting} waiting for compiler tokens with none running for {stalled:.0f} s "
+                                "(stalled daemon; restart it, see the build-bench runbook)")
     else:
         stalled = None
         if waiting > 0 and running == 0:
             warnings.append(f"{waiting} waiting for compiler tokens with none running (possible stuck daemon)")
+    if pool_swaps:
+        warnings.append(f"Jobserver pool has swapped {pool_swaps} time(s) since daemon start to recover leaked compiler tokens")
+    if retire_pending:
+        # Matches MAX_RETIRE_PENDING in src/jobserver.rs.
+        if retire_pending >= 4:
+            warnings.append(f"{retire_pending} jobserver helper retirements pending "
+                            "(pool swapping stopped; restart daemon, see the build-bench runbook)")
+        else:
+            warnings.append(f"{retire_pending} jobserver helper retirement(s) pending")
     return {"waiting": waiting, "running": running, "capacity": queue["token_capacity"],
             "tokens_in_use": queue.get("tokens_in_use"), "stalled_seconds": stalled,
+            "pool_swaps": pool_swaps, "retire_pending": retire_pending,
             "total_wait_seconds": duration_seconds(wait["total"]),
             "max_wait_seconds": maximum, "oldest_wait_seconds": oldest,
             "waits_over_10s": queue["token_waits_over_10s"],
