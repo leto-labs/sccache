@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
+const RELEASE_ON_CONSECUTIVE_ERRORS: u32 = 3;
+
 #[derive(Clone, Debug)]
 pub struct PsiConfig {
     pub enabled: bool,
@@ -82,6 +84,7 @@ pub struct PsiSnapshot {
     pub step: usize,
     pub max_withhold_fraction: f64,
     pub withhold_cap: usize,
+    pub consecutive_errors: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -98,6 +101,7 @@ pub struct PsiGovernor {
     last_io: Option<f64>,
     last_smoothed: Option<f64>,
     last_memory: Option<f64>,
+    consecutive_errors: u32,
 }
 
 impl PsiGovernor {
@@ -110,6 +114,7 @@ impl PsiGovernor {
             last_io: None,
             last_smoothed: None,
             last_memory: None,
+            consecutive_errors: 0,
         }
     }
 
@@ -127,13 +132,36 @@ impl PsiGovernor {
         }
     }
 
-    pub fn sample_from_disk(&mut self, capacity: usize) -> Result<PsiAction, String> {
+    /// Samples PSI from disk. On repeated read failures, releases withheld
+    /// tokens step-by-step so a broken PSI source never leaves the pool frozen.
+    pub fn sample_from_disk(&mut self, capacity: usize) -> (PsiAction, Option<String>) {
         if !self.config.enabled {
-            return Ok(PsiAction::Unchanged);
+            return (PsiAction::Unchanged, None);
         }
-        let io = read_avg10(&self.config.psi_dir.join("io"), "full")?;
-        let memory = read_avg10(&self.config.psi_dir.join("memory"), "some").ok();
-        Ok(self.record_sample(io, memory, capacity))
+        match read_avg10(&self.config.psi_dir.join("io"), "full") {
+            Ok(io) => {
+                self.consecutive_errors = 0;
+                let memory = read_avg10(&self.config.psi_dir.join("memory"), "some").ok();
+                (self.record_sample(io, memory, capacity), None)
+            }
+            Err(err) => {
+                self.consecutive_errors = self.consecutive_errors.saturating_add(1);
+                let action = if self.consecutive_errors >= RELEASE_ON_CONSECUTIVE_ERRORS
+                    && self.withheld > 0
+                {
+                    let target = self.withheld.saturating_sub(self.config.step);
+                    let delta = self.withheld - target;
+                    self.withheld = target;
+                    PsiAction::Released {
+                        delta,
+                        new_withheld: self.withheld,
+                    }
+                } else {
+                    PsiAction::Unchanged
+                };
+                (action, Some(err))
+            }
+        }
     }
 
     pub fn record_sample(
@@ -200,6 +228,7 @@ impl PsiGovernor {
             step: self.config.step,
             max_withhold_fraction: self.config.max_withhold_fraction,
             withhold_cap: self.config.withhold_cap(capacity),
+            consecutive_errors: self.consecutive_errors,
         }
     }
 }
@@ -258,10 +287,8 @@ mod tests {
         assert_eq!(cfg.withhold_cap(1), 0);
 
         let mut gov = PsiGovernor::new(cfg);
-        // Warmup: first 2 samples never act.
         assert_eq!(gov.record_sample(30.0, Some(1.0), 10), PsiAction::Unchanged);
         assert_eq!(gov.record_sample(30.0, Some(1.0), 10), PsiAction::Unchanged);
-        // 3rd sample -> smoothed 30 > 20 -> withhold 4 (cap 7).
         assert_eq!(
             gov.record_sample(30.0, Some(2.0), 10),
             PsiAction::Withheld {
@@ -269,7 +296,6 @@ mod tests {
                 new_withheld: 4
             }
         );
-        // Still high -> withhold remaining 3 up to cap 7.
         assert_eq!(
             gov.record_sample(25.0, Some(2.0), 10),
             PsiAction::Withheld {
@@ -277,12 +303,9 @@ mod tests {
                 new_withheld: 7
             }
         );
-        // At cap -> unchanged.
         assert_eq!(gov.record_sample(50.0, Some(2.0), 10), PsiAction::Unchanged);
-        // Hysteresis band (between 8 and 20) -> unchanged.
-        assert_eq!(gov.record_sample(0.0, Some(0.0), 10), PsiAction::Unchanged); // (25+50+0)/3=25 still >20 but at cap
-        assert_eq!(gov.record_sample(0.0, Some(0.0), 10), PsiAction::Unchanged); // (50+0+0)/3=16.67 in [8,20]
-        // Drop below low=8 -> smoothed=0 -> release 4 (7 -> 3).
+        assert_eq!(gov.record_sample(0.0, Some(0.0), 10), PsiAction::Unchanged);
+        assert_eq!(gov.record_sample(0.0, Some(0.0), 10), PsiAction::Unchanged);
         assert_eq!(
             gov.record_sample(0.0, Some(0.0), 10),
             PsiAction::Released {
@@ -290,7 +313,6 @@ mod tests {
                 new_withheld: 3
             }
         );
-        // Release remaining 3 (3 -> 0).
         assert_eq!(
             gov.record_sample(0.0, Some(0.0), 10),
             PsiAction::Released {
@@ -311,5 +333,30 @@ mod tests {
         assert_eq!(gov.withheld(), 8);
         assert!(gov.clamp_to_capacity(8));
         assert_eq!(gov.withheld(), 6);
+    }
+
+    #[test]
+    fn repeated_read_errors_release_withheld_tokens() {
+        let cfg = PsiConfig {
+            enabled: true,
+            psi_dir: PathBuf::from("/nonexistent/psi-dir"),
+            step: 4,
+            ..Default::default()
+        };
+        let mut gov = PsiGovernor::new(cfg);
+        gov.record_sample(40.0, None, 16);
+        gov.record_sample(40.0, None, 16);
+        gov.record_sample(40.0, None, 16);
+        assert_eq!(gov.withheld(), 4);
+        assert_eq!(gov.sample_from_disk(16).0, PsiAction::Unchanged);
+        assert_eq!(gov.sample_from_disk(16).0, PsiAction::Unchanged);
+        assert_eq!(
+            gov.sample_from_disk(16).0,
+            PsiAction::Released {
+                delta: 4,
+                new_withheld: 0
+            }
+        );
+        assert_eq!(gov.withheld(), 0);
     }
 }

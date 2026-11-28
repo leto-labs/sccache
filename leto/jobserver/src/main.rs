@@ -5,19 +5,36 @@ mod state;
 
 use std::env;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::mem::{self, MaybeUninit};
 use std::os::unix::fs::symlink;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-use crate::control::ControlServer;
+use crate::control::{ControlServer, InstanceLock};
 use crate::fuse_abi::*;
-use crate::psi::{PsiAction, PsiConfig, PsiGovernor};
-use crate::state::{Effect, JobserverState, resolve_owner_metadata};
+use crate::psi::{PsiAction, PsiConfig, PsiGovernor, read_avg10};
+use crate::state::{Effect, JobserverState, resolve_open_identity};
+
+const LOG_RATE_LIMIT: Duration = Duration::from_secs(60);
+
+fn log_line(msg: &str) {
+    let mut stderr = io::stderr().lock();
+    let _ = writeln!(stderr, "{msg}");
+}
+
+fn make_stderr_nonblocking() {
+    unsafe {
+        let flags = libc::fcntl(libc::STDERR_FILENO, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(libc::STDERR_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
+    }
+}
 
 fn runtime_dir() -> PathBuf {
     env::var_os("XDG_RUNTIME_DIR")
@@ -31,11 +48,12 @@ struct ServeArgs {
     path: Option<PathBuf>,
     socket: PathBuf,
     max_per_owner: usize,
+    drain_timeout_secs: u64,
     psi: PsiConfig,
 }
 
 fn usage() -> ! {
-    eprintln!(
+    log_line(
         "Usage:
   leto-jobserver serve [options]
     --tokens N                       Pool capacity (1..=4096, default: nproc)
@@ -43,6 +61,7 @@ fn usage() -> ! {
     --path SYMLINK                   Optional symlink pointing to <mount-dir>/tokens
     --socket PATH                    Control/status Unix socket (default: $XDG_RUNTIME_DIR/leto-jobserver.sock)
     --max-per-owner N                Per-TGID token cap, 0=unlimited (default: 0)
+    --drain-timeout-secs N           Max seconds to drain open handles on SIGTERM (default: 300)
     --psi-disabled                   Disable built-in PSI I/O throttling
     --psi-dir DIR                    PSI directory (default: /proc/pressure)
     --psi-interval-ms MS             PSI sample interval in ms (default: 1000)
@@ -54,7 +73,7 @@ fn usage() -> ! {
 
   leto-jobserver status [--socket PATH] [--json]
   leto-jobserver resize N [--socket PATH]
-  leto-jobserver set-cap N [--socket PATH]"
+  leto-jobserver set-cap N [--socket PATH]",
     );
     std::process::exit(2);
 }
@@ -62,7 +81,7 @@ fn usage() -> ! {
 fn next_arg(args: &[String], i: &mut usize, flag: &str) -> String {
     *i += 1;
     args.get(*i).cloned().unwrap_or_else(|| {
-        eprintln!("leto-jobserver: missing value for {flag}");
+        log_line(&format!("leto-jobserver: missing value for {flag}"));
         std::process::exit(2);
     })
 }
@@ -78,6 +97,7 @@ fn parse_serve(args: &[String]) -> ServeArgs {
         path: None,
         socket: rt.join("leto-jobserver.sock"),
         max_per_owner: 0,
+        drain_timeout_secs: 300,
         psi: PsiConfig::default(),
     };
     let mut i = 0;
@@ -93,6 +113,11 @@ fn parse_serve(args: &[String]) -> ServeArgs {
             "--socket" => cfg.socket = PathBuf::from(next_arg(args, &mut i, "--socket")),
             "--max-per-owner" => {
                 cfg.max_per_owner = next_arg(args, &mut i, "--max-per-owner")
+                    .parse()
+                    .unwrap_or_else(|_| usage());
+            }
+            "--drain-timeout-secs" => {
+                cfg.drain_timeout_secs = next_arg(args, &mut i, "--drain-timeout-secs")
                     .parse()
                     .unwrap_or_else(|_| usage());
             }
@@ -131,22 +156,22 @@ fn parse_serve(args: &[String]) -> ServeArgs {
             }
             "-h" | "--help" => usage(),
             other => {
-                eprintln!("leto-jobserver: unknown option {other}");
+                log_line(&format!("leto-jobserver: unknown option {other}"));
                 usage();
             }
         }
         i += 1;
     }
     if !(1..=4096).contains(&cfg.tokens) {
-        eprintln!("leto-jobserver: --tokens must be between 1 and 4096");
+        log_line("leto-jobserver: --tokens must be between 1 and 4096");
         std::process::exit(2);
     }
     if cfg.max_per_owner > 4096 {
-        eprintln!("leto-jobserver: --max-per-owner must be between 0 and 4096");
+        log_line("leto-jobserver: --max-per-owner must be between 0 and 4096");
         std::process::exit(2);
     }
     if let Err(err) = cfg.psi.validate() {
-        eprintln!("leto-jobserver: {err}");
+        log_line(&format!("leto-jobserver: {err}"));
         std::process::exit(2);
     }
     cfg
@@ -158,6 +183,8 @@ fn setup_signalfd() -> io::Result<OwnedFd> {
         libc::sigemptyset(&mut mask);
         libc::sigaddset(&mut mask, libc::SIGTERM);
         libc::sigaddset(&mut mask, libc::SIGINT);
+        libc::sigaddset(&mut mask, libc::SIGHUP);
+        libc::sigaddset(&mut mask, libc::SIGQUIT);
         if libc::pthread_sigmask(libc::SIG_BLOCK, &mask, ptr::null_mut()) != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -231,13 +258,45 @@ fn cleanup_symlink(link: &Path, expected_target: &Path) {
     }
 }
 
-fn apply_effects(fuse_fd: RawFd, effects: Vec<Effect>) {
-    for eff in effects {
-        match eff {
-            Effect::ReplyByte { unique } => write_reply(fuse_fd, unique, 0, b"+"),
-            Effect::ReplyError { unique, errno } => write_reply(fuse_fd, unique, errno, &[]),
-            Effect::NotifyPoll { kh } => notify_poll(fuse_fd, kh),
+fn apply_effects(fuse_fd: RawFd, state: &mut JobserverState, initial: Vec<Effect>, now: Instant) {
+    let mut pending = initial;
+    while !pending.is_empty() {
+        let mut followups = Vec::new();
+        for eff in pending {
+            match eff {
+                Effect::ReplyByte { unique, owner } => {
+                    if let Err(errno) = write_reply(fuse_fd, unique, 0, b"+") {
+                        if errno != libc::ENOENT {
+                            log_line(&format!(
+                                "leto-jobserver: writev(unique={unique}) failed errno={errno}"
+                            ));
+                        }
+                        // Request was aborted/interrupted before delivery; roll back
+                        // the grant immediately so the token is not stranded.
+                        followups.extend(state.rollback_grant(owner, now));
+                    }
+                }
+                Effect::ReplyError { unique, errno } => {
+                    if let Err(e) = write_reply(fuse_fd, unique, errno, &[])
+                        && e != libc::ENOENT
+                    {
+                        log_line(&format!(
+                            "leto-jobserver: writev(unique={unique}, err={errno}) failed errno={e}"
+                        ));
+                    }
+                }
+                Effect::NotifyPoll { kh } => {
+                    if let Err(e) = notify_poll(fuse_fd, kh)
+                        && e != libc::ENOENT
+                    {
+                        log_line(&format!(
+                            "leto-jobserver: notify_poll(kh={kh}) failed errno={e}"
+                        ));
+                    }
+                }
+            }
         }
+        pending = followups;
     }
 }
 
@@ -267,6 +326,18 @@ fn file_attr(uid: u32, gid: u32) -> FuseAttr {
     }
 }
 
+fn check_fuse_request_timeout() {
+    if let Ok(text) = fs::read_to_string("/proc/sys/fs/fuse/default_request_timeout")
+        && let Ok(val) = text.trim().parse::<u64>()
+        && val > 0
+    {
+        log_line(&format!(
+            "leto-jobserver: warning: fs.fuse.default_request_timeout={val}s may abort long-parked FUSE_READ waiters"
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_fuse_request(
     fuse_fd: RawFd,
     uid: u32,
@@ -274,10 +345,21 @@ fn handle_fuse_request(
     state: &mut JobserverState,
     hdr: FuseInHeader,
     body: &[u8],
+    now: Instant,
+    last_excess_log: &mut Option<Instant>,
 ) -> bool {
     match hdr.opcode {
         FUSE_INIT => {
             let init_in = read_struct::<FuseInitIn>(body).unwrap_or_default();
+            if init_in.major != FUSE_KERNEL_VERSION {
+                // Reply with our major version only so the kernel can renegotiate.
+                let out = FuseInitOut {
+                    major: FUSE_KERNEL_VERSION,
+                    ..Default::default()
+                };
+                let _ = write_reply(fuse_fd, hdr.unique, 0, &as_bytes(&out)[..8]);
+                return false;
+            }
             let wanted = FUSE_ASYNC_READ | FUSE_PARALLEL_DIROPS;
             let init_out = FuseInitOut {
                 major: FUSE_KERNEL_VERSION,
@@ -290,7 +372,7 @@ fn handle_fuse_request(
                 time_gran: 1,
                 ..Default::default()
             };
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&init_out));
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&init_out));
         }
         FUSE_LOOKUP => {
             let name = body.split(|&b| b == 0).next().unwrap_or(&[]);
@@ -303,9 +385,9 @@ fn handle_fuse_request(
                     attr: file_attr(uid, gid),
                     ..Default::default()
                 };
-                write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+                let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
             } else {
-                write_reply(fuse_fd, hdr.unique, -libc::ENOENT, &[]);
+                let _ = write_reply(fuse_fd, hdr.unique, -libc::ENOENT, &[]);
             }
         }
         FUSE_GETATTR => {
@@ -313,7 +395,7 @@ fn handle_fuse_request(
                 FUSE_ROOT_ID => dir_attr(uid, gid),
                 TOKENS_INO => file_attr(uid, gid),
                 _ => {
-                    write_reply(fuse_fd, hdr.unique, -libc::ENOENT, &[]);
+                    let _ = write_reply(fuse_fd, hdr.unique, -libc::ENOENT, &[]);
                     return false;
                 }
             };
@@ -322,7 +404,7 @@ fn handle_fuse_request(
                 attr,
                 ..Default::default()
             };
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
         }
         FUSE_SETATTR => {
             let attr = if hdr.nodeid == TOKENS_INO {
@@ -335,9 +417,11 @@ fn handle_fuse_request(
                 attr,
                 ..Default::default()
             };
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
         }
-        FUSE_ACCESS => write_reply(fuse_fd, hdr.unique, 0, &[]),
+        FUSE_ACCESS => {
+            let _ = write_reply(fuse_fd, hdr.unique, 0, &[]);
+        }
         FUSE_STATFS => {
             let st = FuseKstatfs {
                 bsize: 4096,
@@ -345,11 +429,11 @@ fn handle_fuse_request(
                 frsize: 4096,
                 ..Default::default()
             };
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&st));
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&st));
         }
         FUSE_OPENDIR => {
             let out = FuseOpenOut::default();
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
         }
         FUSE_READDIR => {
             let read_in = read_struct::<FuseReadIn>(body).unwrap_or_default();
@@ -381,17 +465,19 @@ fn handle_fuse_request(
                     0,
                 );
             }
-            write_reply(fuse_fd, hdr.unique, 0, &buf);
+            let _ = write_reply(fuse_fd, hdr.unique, 0, &buf);
         }
-        FUSE_RELEASEDIR => write_reply(fuse_fd, hdr.unique, 0, &[]),
+        FUSE_RELEASEDIR => {
+            let _ = write_reply(fuse_fd, hdr.unique, 0, &[]);
+        }
         FUSE_OPEN => {
             if hdr.nodeid != TOKENS_INO {
-                write_reply(fuse_fd, hdr.unique, -libc::EISDIR, &[]);
+                let _ = write_reply(fuse_fd, hdr.unique, -libc::EISDIR, &[]);
                 return false;
             }
             let _open_in = read_struct::<FuseOpenIn>(body).unwrap_or_default();
-            let (tgid, comm, cmdline) = resolve_owner_metadata(hdr.pid);
-            let fh = state.on_open(tgid, comm, cmdline);
+            let (pid_info, comm) = resolve_open_identity(hdr.pid);
+            let fh = state.on_open(pid_info, comm);
             let out = FuseOpenOut {
                 fh,
                 open_flags: FOPEN_DIRECT_IO
@@ -400,83 +486,111 @@ fn handle_fuse_request(
                     | FOPEN_PARALLEL_DIRECT_WRITES,
                 backing_id: 0,
             };
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
         }
         FUSE_READ => {
             let Some(read_in) = read_struct::<FuseReadIn>(body) else {
-                write_reply(fuse_fd, hdr.unique, -libc::EINVAL, &[]);
+                let _ = write_reply(fuse_fd, hdr.unique, -libc::EINVAL, &[]);
                 return false;
             };
             let nonblock = (read_in.flags & (libc::O_NONBLOCK as u32)) != 0;
-            if let Some(eff) = state.on_read(hdr.unique, read_in.fh, read_in.size, nonblock) {
-                apply_effects(fuse_fd, vec![eff]);
-            }
+            let effects = state.on_read(hdr.unique, read_in.fh, read_in.size, nonblock, now);
+            apply_effects(fuse_fd, state, effects, now);
         }
         FUSE_WRITE => {
             let Some(write_in) = read_struct::<FuseWriteIn>(body) else {
-                write_reply(fuse_fd, hdr.unique, -libc::EINVAL, &[]);
+                let _ = write_reply(fuse_fd, hdr.unique, -libc::EINVAL, &[]);
                 return false;
             };
-            let (written, effects) = state.on_write(write_in.fh, write_in.size as usize);
+            let (written, excess, effects) =
+                state.on_write(write_in.fh, write_in.size as usize, now);
+            if excess > 0 && last_excess_log.is_none_or(|t| now.duration_since(t) >= LOG_RATE_LIMIT)
+            {
+                *last_excess_log = Some(now);
+                log_line(&format!(
+                    "leto-jobserver: ignored {excess} excess token write(s) from pid={} (total excess={})",
+                    hdr.pid,
+                    state.status().excess_writes_total
+                ));
+            }
             let out = FuseWriteOut {
                 size: written as u32,
                 padding: 0,
             };
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
-            apply_effects(fuse_fd, effects);
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+            apply_effects(fuse_fd, state, effects, now);
         }
         FUSE_POLL => {
             let Some(poll_in) = read_struct::<FusePollIn>(body) else {
-                write_reply(fuse_fd, hdr.unique, -libc::EINVAL, &[]);
+                let _ = write_reply(fuse_fd, hdr.unique, -libc::EINVAL, &[]);
                 return false;
             };
             let schedule = (poll_in.flags & FUSE_POLL_SCHEDULE_NOTIFY) != 0;
-            let revents = state.on_poll(poll_in.fh, poll_in.kh, schedule, poll_in.events);
+            let revents = state.on_poll(poll_in.fh, poll_in.kh, schedule, poll_in.events, now);
             let out = FusePollOut {
                 revents,
                 padding: 0,
             };
-            write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
+            let _ = write_reply(fuse_fd, hdr.unique, 0, as_bytes(&out));
         }
         FUSE_INTERRUPT => {
             if let Some(int_in) = read_struct::<FuseInterruptIn>(body)
                 && let Some(eff) = state.on_interrupt(int_in.unique)
             {
-                apply_effects(fuse_fd, vec![eff]);
+                apply_effects(fuse_fd, state, vec![eff], now);
             }
         }
-        FUSE_FLUSH => write_reply(fuse_fd, hdr.unique, 0, &[]),
+        FUSE_FLUSH => {
+            let _ = write_reply(fuse_fd, hdr.unique, 0, &[]);
+        }
         FUSE_RELEASE => {
             let effects = if let Some(rel_in) = read_struct::<FuseReleaseIn>(body) {
-                let (reclaimed, info, effects) = state.on_release(rel_in.fh);
+                let (reclaimed, info, effects) = state.on_release(rel_in.fh, now);
                 if reclaimed > 0
                     && let Some((tgid, comm)) = info
                 {
-                    eprintln!(
+                    log_line(&format!(
                         "leto-jobserver: reclaimed {reclaimed} token(s) from exited tgid={tgid} comm={comm} (available={}/{})",
                         state.available(),
                         state.effective_capacity()
-                    );
+                    ));
                 }
                 effects
             } else {
                 Vec::new()
             };
-            write_reply(fuse_fd, hdr.unique, 0, &[]);
-            apply_effects(fuse_fd, effects);
+            let _ = write_reply(fuse_fd, hdr.unique, 0, &[]);
+            apply_effects(fuse_fd, state, effects, now);
         }
         FUSE_FORGET | FUSE_BATCH_FORGET => {}
-        FUSE_LSEEK => write_reply(fuse_fd, hdr.unique, -libc::ESPIPE, &[]),
+        FUSE_LSEEK => {
+            let _ = write_reply(fuse_fd, hdr.unique, -libc::ESPIPE, &[]);
+        }
         FUSE_DESTROY => {
-            write_reply(fuse_fd, hdr.unique, 0, &[]);
+            let _ = write_reply(fuse_fd, hdr.unique, 0, &[]);
             return true;
         }
-        _ => write_reply(fuse_fd, hdr.unique, -libc::ENOSYS, &[]),
+        _ => {
+            let _ = write_reply(fuse_fd, hdr.unique, -libc::ENOSYS, &[]);
+        }
     }
     false
 }
 
-fn run_serve(cfg: ServeArgs) -> io::Result<()> {
+fn run_serve(mut cfg: ServeArgs) -> io::Result<()> {
+    make_stderr_nonblocking();
+    check_fuse_request_timeout();
+    let _instance_lock = InstanceLock::acquire(&cfg.socket)?;
+
+    if cfg.psi.enabled
+        && let Err(err) = read_avg10(&cfg.psi.psi_dir.join("io"), "full")
+    {
+        log_line(&format!(
+            "leto-jobserver: PSI unavailable at startup ({err}); disabling PSI throttling"
+        ));
+        cfg.psi.enabled = false;
+    }
+
     cleanup_stale_mount(&cfg.mount_dir);
     fs::create_dir_all(&cfg.mount_dir)?;
     let sig_fd = setup_signalfd()?;
@@ -509,6 +623,7 @@ fn run_serve(cfg: ServeArgs) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     let psi_enabled = cfg.psi.enabled;
+    let drain_timeout = Duration::from_secs(cfg.drain_timeout_secs);
     let mut state = JobserverState::new(
         cfg.tokens,
         cfg.max_per_owner,
@@ -519,23 +634,41 @@ fn run_serve(cfg: ServeArgs) -> io::Result<()> {
             .map(|p| p.display().to_string())
             .or_else(|| Some(tokens_target.display().to_string())),
     );
-    eprintln!(
-        "leto-jobserver: ready tokens={} max_per_owner={} psi={} mount={} socket={}",
+    log_line(&format!(
+        "leto-jobserver: ready tokens={} max_per_owner={} psi={} drain={}s mount={} socket={}",
         cfg.tokens,
         cfg.max_per_owner,
         psi_enabled,
+        cfg.drain_timeout_secs,
         cfg.mount_dir.display(),
         cfg.socket.display()
-    );
+    ));
 
     let fuse_raw = fuse_fd.as_raw_fd();
     let sig_raw = sig_fd.as_raw_fd();
-    let ctl_raw = ctl.listener_fd();
     let timer_raw = timer_fd.as_ref().map(|f| f.as_raw_fd());
     let mut buf = vec![0u8; 65536];
     let mut pollfds: Vec<libc::pollfd> = Vec::with_capacity(32);
+    let mut drain_deadline: Option<Instant> = None;
+    let mut last_psi_err_log: Option<Instant> = None;
+    let mut last_excess_log: Option<Instant> = None;
 
     'event_loop: loop {
+        let now = Instant::now();
+        if let Some(deadline) = drain_deadline {
+            if state.open_fhs() == 0 {
+                log_line("leto-jobserver: drain complete (0 open handles)");
+                break 'event_loop;
+            }
+            if now >= deadline {
+                log_line(&format!(
+                    "leto-jobserver: drain timeout expired with {} open handle(s)",
+                    state.open_fhs()
+                ));
+                break 'event_loop;
+            }
+        }
+
         pollfds.clear();
         pollfds.push(libc::pollfd {
             fd: fuse_raw,
@@ -547,18 +680,28 @@ fn run_serve(cfg: ServeArgs) -> io::Result<()> {
             events: libc::POLLIN,
             revents: 0,
         });
-        pollfds.push(libc::pollfd {
-            fd: ctl_raw,
-            events: libc::POLLIN,
-            revents: 0,
-        });
-        if let Some(tfd) = timer_raw {
+        let ctl_idx = if let Some(cfd) = ctl.listener_fd(now) {
+            let idx = pollfds.len();
+            pollfds.push(libc::pollfd {
+                fd: cfd,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            Some(idx)
+        } else {
+            None
+        };
+        let timer_idx = if let Some(tfd) = timer_raw {
+            let idx = pollfds.len();
             pollfds.push(libc::pollfd {
                 fd: tfd,
                 events: libc::POLLIN,
                 revents: 0,
             });
-        }
+            Some(idx)
+        } else {
+            None
+        };
         let client_start = pollfds.len();
         for (cfd, events) in ctl.client_pollfds() {
             pollfds.push(libc::pollfd {
@@ -568,11 +711,21 @@ fn run_serve(cfg: ServeArgs) -> io::Result<()> {
             });
         }
 
-        let timeout_ms = if pollfds.len() > client_start {
-            1000
-        } else {
-            -1
-        };
+        let mut timeout_ms: i32 = -1;
+        if state.has_reservations() {
+            timeout_ms = 25;
+        } else if pollfds.len() > client_start || ctl.has_backoff(now) {
+            timeout_ms = 500;
+        }
+        if let Some(deadline) = drain_deadline {
+            let rem = deadline.saturating_duration_since(now).as_millis().min(500) as i32;
+            timeout_ms = if timeout_ms < 0 {
+                rem.max(1)
+            } else {
+                timeout_ms.min(rem.max(1))
+            };
+        }
+
         let rc = unsafe {
             libc::poll(
                 pollfds.as_mut_ptr(),
@@ -585,92 +738,146 @@ fn run_serve(cfg: ServeArgs) -> io::Result<()> {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            eprintln!("leto-jobserver: poll error: {err}");
+            log_line(&format!("leto-jobserver: poll error: {err}"));
             break;
         }
 
+        let now = Instant::now();
+        let expired = state.expire_reservations(now);
+        apply_effects(fuse_raw, &mut state, expired, now);
+
         if (pollfds[1].revents & libc::POLLIN) != 0 {
             let mut info: libc::signalfd_siginfo = unsafe { MaybeUninit::zeroed().assume_init() };
-            let _ = unsafe {
+            let n = unsafe {
                 libc::read(
                     sig_raw,
                     (&mut info as *mut libc::signalfd_siginfo).cast(),
                     mem::size_of::<libc::signalfd_siginfo>(),
                 )
             };
-            break 'event_loop;
+            if n == mem::size_of::<libc::signalfd_siginfo>() as isize {
+                let sig = info.ssi_signo as libc::c_int;
+                match sig {
+                    libc::SIGHUP => {
+                        log_line("leto-jobserver: ignored SIGHUP");
+                    }
+                    libc::SIGQUIT => {
+                        log_line("leto-jobserver: immediate shutdown on SIGQUIT");
+                        break 'event_loop;
+                    }
+                    libc::SIGTERM | libc::SIGINT => {
+                        if drain_deadline.is_some()
+                            || state.open_fhs() == 0
+                            || drain_timeout.is_zero()
+                        {
+                            log_line(&format!(
+                                "leto-jobserver: shutting down (open_fhs={})",
+                                state.open_fhs()
+                            ));
+                            break 'event_loop;
+                        }
+                        state.set_draining();
+                        if let Some(link) = &cfg.path {
+                            cleanup_symlink(link, &tokens_target);
+                        }
+                        drain_deadline = Some(now + drain_timeout);
+                        log_line(&format!(
+                            "leto-jobserver: draining {} open handle(s) for up to {}s (second signal forces exit)",
+                            state.open_fhs(),
+                            cfg.drain_timeout_secs
+                        ));
+                    }
+                    _ => {}
+                }
+            }
         }
 
         if (pollfds[0].revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP)) != 0 {
-            let n = unsafe { libc::read(fuse_raw, buf.as_mut_ptr().cast(), buf.len()) };
-            if n < 0 {
-                let err = io::Error::last_os_error();
-                match err.raw_os_error() {
-                    Some(libc::EINTR) | Some(libc::ENOENT) => {}
-                    Some(libc::ENODEV) => break 'event_loop,
-                    _ => {
-                        eprintln!("leto-jobserver: read(/dev/fuse) error: {err}");
+            loop {
+                let n = unsafe { libc::read(fuse_raw, buf.as_mut_ptr().cast(), buf.len()) };
+                if n < 0 {
+                    let err = io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EAGAIN) | Some(libc::EINTR) => break,
+                        Some(libc::ENOENT) => continue,
+                        Some(libc::ENODEV) => break 'event_loop,
+                        _ => {
+                            log_line(&format!("leto-jobserver: read(/dev/fuse) error: {err}"));
+                            break 'event_loop;
+                        }
+                    }
+                }
+                let n = n as usize;
+                if n >= mem::size_of::<FuseInHeader>() {
+                    let hdr = read_struct::<FuseInHeader>(&buf[..n]).unwrap();
+                    let body = &buf[mem::size_of::<FuseInHeader>()..n];
+                    if handle_fuse_request(
+                        fuse_raw,
+                        uid,
+                        gid,
+                        &mut state,
+                        hdr,
+                        body,
+                        now,
+                        &mut last_excess_log,
+                    ) {
                         break 'event_loop;
                     }
                 }
-            } else if (n as usize) >= mem::size_of::<FuseInHeader>() {
-                let n = n as usize;
-                let hdr = read_struct::<FuseInHeader>(&buf[..n]).unwrap();
-                let body = &buf[mem::size_of::<FuseInHeader>()..n];
-                if handle_fuse_request(fuse_raw, uid, gid, &mut state, hdr, body) {
-                    break 'event_loop;
-                }
             }
         }
 
-        if (pollfds[2].revents & libc::POLLIN) != 0 {
-            ctl.accept_ready();
+        if let Some(idx) = ctl_idx
+            && (pollfds[idx].revents & libc::POLLIN) != 0
+        {
+            ctl.accept_ready(now);
         }
 
-        if let Some(tfd) = timer_raw
-            && (pollfds[3].revents & libc::POLLIN) != 0
+        if let Some(idx) = timer_idx
+            && (pollfds[idx].revents & libc::POLLIN) != 0
         {
             let mut expirations: u64 = 0;
-            let _ = unsafe { libc::read(tfd, (&mut expirations as *mut u64).cast(), 8) };
-            match state.tick_psi() {
-                Ok((action, effects)) => {
-                    match action {
-                        PsiAction::Withheld {
-                            delta,
-                            new_withheld,
-                        } => {
-                            let snap = state.status();
-                            eprintln!(
-                                "leto-jobserver: PSI withheld {delta} token(s) (withheld={new_withheld}, effective={}/{}, io={:.2}, smoothed={:.2}, mem={:.2})",
-                                snap.effective_capacity,
-                                snap.capacity,
-                                snap.psi.io_full_avg10.unwrap_or(-1.0),
-                                snap.psi.io_smoothed.unwrap_or(-1.0),
-                                snap.psi.memory_some_avg10.unwrap_or(-1.0),
-                            );
-                        }
-                        PsiAction::Released {
-                            delta,
-                            new_withheld,
-                        } => {
-                            let snap = state.status();
-                            eprintln!(
-                                "leto-jobserver: PSI released {delta} token(s) (withheld={new_withheld}, effective={}/{}, io={:.2}, smoothed={:.2}, mem={:.2})",
-                                snap.effective_capacity,
-                                snap.capacity,
-                                snap.psi.io_full_avg10.unwrap_or(-1.0),
-                                snap.psi.io_smoothed.unwrap_or(-1.0),
-                                snap.psi.memory_some_avg10.unwrap_or(-1.0),
-                            );
-                        }
-                        PsiAction::Unchanged => {}
-                    }
-                    apply_effects(fuse_raw, effects);
-                }
-                Err(err) => {
-                    eprintln!("leto-jobserver: PSI sample error: {err}");
-                }
+            let _ =
+                unsafe { libc::read(timer_raw.unwrap(), (&mut expirations as *mut u64).cast(), 8) };
+            let (action, err, effects) = state.tick_psi(now);
+            if let Some(err) = err
+                && last_psi_err_log.is_none_or(|t| now.duration_since(t) >= LOG_RATE_LIMIT)
+            {
+                last_psi_err_log = Some(now);
+                log_line(&format!("leto-jobserver: PSI sample error: {err}"));
             }
+            match action {
+                PsiAction::Withheld {
+                    delta,
+                    new_withheld,
+                } => {
+                    let snap = state.status();
+                    log_line(&format!(
+                        "leto-jobserver: PSI withheld {delta} token(s) (withheld={new_withheld}, effective={}/{}, io={:.2}, smoothed={:.2}, mem={:.2})",
+                        snap.effective_capacity,
+                        snap.capacity,
+                        snap.psi.io_full_avg10.unwrap_or(-1.0),
+                        snap.psi.io_smoothed.unwrap_or(-1.0),
+                        snap.psi.memory_some_avg10.unwrap_or(-1.0),
+                    ));
+                }
+                PsiAction::Released {
+                    delta,
+                    new_withheld,
+                } => {
+                    let snap = state.status();
+                    log_line(&format!(
+                        "leto-jobserver: PSI released {delta} token(s) (withheld={new_withheld}, effective={}/{}, io={:.2}, smoothed={:.2}, mem={:.2})",
+                        snap.effective_capacity,
+                        snap.capacity,
+                        snap.psi.io_full_avg10.unwrap_or(-1.0),
+                        snap.psi.io_smoothed.unwrap_or(-1.0),
+                        snap.psi.memory_some_avg10.unwrap_or(-1.0),
+                    ));
+                }
+                PsiAction::Unchanged => {}
+            }
+            apply_effects(fuse_raw, &mut state, effects, now);
         }
 
         let ready_clients: Vec<(RawFd, i16)> = pollfds[client_start..]
@@ -679,10 +886,10 @@ fn run_serve(cfg: ServeArgs) -> io::Result<()> {
             .map(|p| (p.fd, p.revents))
             .collect();
         for (cfd, revents) in ready_clients {
-            let effects = ctl.handle_client_fd(cfd, revents, &mut state);
-            apply_effects(fuse_raw, effects);
+            let effects = ctl.handle_client_fd(cfd, revents, &mut state, now);
+            apply_effects(fuse_raw, &mut state, effects, now);
         }
-        ctl.expire_idle();
+        ctl.expire_idle(now);
     }
 
     ctl.cleanup();
@@ -704,7 +911,7 @@ fn parse_client_socket(args: &[String]) -> (PathBuf, bool) {
             "--json" => as_json = true,
             "-h" | "--help" => usage(),
             other => {
-                eprintln!("leto-jobserver: unknown option {other}");
+                log_line(&format!("leto-jobserver: unknown option {other}"));
                 usage();
             }
         }
@@ -715,9 +922,10 @@ fn parse_client_socket(args: &[String]) -> (PathBuf, bool) {
 
 fn print_human_status(v: &serde_json::Value) {
     println!(
-        "leto-jobserver pid={} uptime={}s capacity={} withheld={} effective={} held={} available={} max_per_owner={} waiters={} pollers={} reclaimed={}",
+        "leto-jobserver pid={} uptime={}s draining={} capacity={} withheld={} effective={} held={} available={} max_per_owner={} waiters={} pollers={} reclaimed={}",
         v["pid"],
         v["uptime_secs"],
+        v["draining"],
         v["capacity"],
         v["withheld"],
         v["effective_capacity"],
@@ -779,7 +987,7 @@ fn main() {
             control::send_request(&socket, &json!({ "cmd": "resize", "capacity": capacity })).map(
                 |v| {
                     if v["ok"].as_bool() != Some(true) {
-                        eprintln!("leto-jobserver: {}", v["error"]);
+                        log_line(&format!("leto-jobserver: {}", v["error"]));
                         std::process::exit(1);
                     }
                     print_human_status(&v);
@@ -798,7 +1006,7 @@ fn main() {
             )
             .map(|v| {
                 if v["ok"].as_bool() != Some(true) {
-                    eprintln!("leto-jobserver: {}", v["error"]);
+                    log_line(&format!("leto-jobserver: {}", v["error"]));
                     std::process::exit(1);
                 }
                 print_human_status(&v);
@@ -807,7 +1015,7 @@ fn main() {
         _ => usage(),
     };
     if let Err(err) = res {
-        eprintln!("leto-jobserver: {err}");
+        log_line(&format!("leto-jobserver: {err}"));
         std::process::exit(1);
     }
 }

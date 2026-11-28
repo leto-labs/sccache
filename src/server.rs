@@ -519,16 +519,32 @@ pub fn start_server(config: &Config, addr: &crate::net::SocketAddr) -> Result<()
     }));
     let client = match &config.server.jobserver_fifo {
         Some(path) => {
-            if path.exists() {
-                info!(
-                    "using host jobserver FIFO {} for compiler children",
-                    path.display()
-                );
-            } else {
-                warn!(
-                    "configured server.jobserver_fifo {} does not exist yet; compilers will forward it anyway",
-                    path.display()
-                );
+            match std::fs::metadata(path) {
+                Ok(meta) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::FileTypeExt;
+                        if meta.file_type().is_fifo() {
+                            warn!(
+                                "server.jobserver_fifo {} is a plain FIFO rather than a FUSE stream jobserver; killed compilers can leak tokens in a plain FIFO",
+                                path.display()
+                            );
+                        }
+                    }
+                    info!(
+                        "using host jobserver FIFO {} for compiler children",
+                        path.display()
+                    );
+                }
+                Err(err) => {
+                    warn!(
+                        "configured server.jobserver_fifo {} is not reachable yet ({err}); compiles will omit CARGO_MAKEFLAGS until it is available",
+                        path.display()
+                    );
+                }
+            }
+            if config.server.jobserver_swap != crate::config::JobserverSwap::Off {
+                info!("server.jobserver_swap is unused when server.jobserver_fifo is configured");
             }
             Client::new_host_fifo(util::num_cpus(), path.clone())
         }

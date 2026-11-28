@@ -1780,6 +1780,11 @@ impl Config {
             },
         };
         if let Some(path) = &server.jobserver_fifo {
+            if !cfg!(unix) {
+                bail!(
+                    "server.jobserver_fifo (SCCACHE_SERVER_JOBSERVER_FIFO) is only supported on Unix"
+                );
+            }
             if !path.is_absolute() {
                 bail!(
                     "server.jobserver_fifo (SCCACHE_SERVER_JOBSERVER_FIFO) must be an absolute path: {path:?}"
@@ -4675,6 +4680,19 @@ fn test_server_jobserver_fifo_config() {
     )
     .unwrap();
     assert_eq!(cleared.server.jobserver_fifo, None);
+
+    // Valid absolute path accepted on Unix, rejected on non-Unix.
+    let valid_res = Config::from_env_and_file_configs(
+        EnvConfig::default(),
+        FileConfig {
+            server: ServerConfig {
+                jobserver_fifo: Some(PathBuf::from(abs)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert_eq!(valid_res.is_ok(), cfg!(unix));
 
     // Relative path rejected.
     let rel = Config::from_env_and_file_configs(

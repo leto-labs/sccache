@@ -346,3 +346,144 @@ fn rustc_parallel_codegen_sigkill_reclaims_tokens() {
     });
     assert_eq!(st["owners"], 0);
 }
+
+#[test]
+fn sigterm_drains_parked_reader_without_aborting() {
+    let mut d = TestDaemon::start(1, 0, false);
+    let mut holder = open_rw(&d.link_path, false);
+    let mut b = [0u8; 1];
+    assert_eq!(holder.read(&mut b).unwrap(), 1);
+
+    let token_path = d.link_path.clone();
+    let reader = std::thread::spawn(move || {
+        let mut r = open_rw(&token_path, false);
+        let mut buf = [0u8; 1];
+        let n = r
+            .read(&mut buf)
+            .expect("parked reader must succeed during drain");
+        assert_eq!(n, 1);
+        assert_eq!(buf[0], b'+');
+        assert_eq!(r.write(b"+").unwrap(), 1);
+    });
+    d.wait_status("reader parked", |s| s["waiters"] == 1);
+
+    // Send SIGTERM: daemon must enter drain mode, remove symlink, and keep serving
+    // open handles rather than aborting with ECONNABORTED.
+    unsafe {
+        libc::kill(d.child.id() as libc::pid_t, libc::SIGTERM);
+    }
+    d.wait_status("draining", |s| s["draining"] == true);
+    assert!(
+        !d.link_path.exists(),
+        "symlink should be removed when draining"
+    );
+
+    // Return token; parked reader wakes and succeeds cleanly.
+    assert_eq!(holder.write(b"+").unwrap(), 1);
+    reader.join().unwrap();
+    drop(holder);
+
+    // Once open_fhs hits 0, daemon exits cleanly with status 0.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = loop {
+        if let Some(st) = d.child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(Instant::now() < deadline, "daemon did not exit after drain");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "daemon exit status: {status}");
+}
+
+#[test]
+fn mixed_poll_and_blocking_readers_share_tokens_fairly() {
+    let d = TestDaemon::start(1, 0, false);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut blocking_handles = Vec::new();
+    for _ in 0..3 {
+        let path = d.link_path.clone();
+        let stop = stop.clone();
+        blocking_handles.push(std::thread::spawn(move || {
+            let mut r = open_rw(&path, false);
+            let mut w = open_rw(&path, false);
+            let mut count = 0u64;
+            let mut buf = [0u8; 1];
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if r.read(&mut buf).is_ok() {
+                    count += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                    let _ = w.write(b"+");
+                }
+            }
+            count
+        }));
+    }
+
+    let path = d.link_path.clone();
+    let stop_p = stop.clone();
+    let poller = std::thread::spawn(move || {
+        let mut r = open_rw(&path, true);
+        let mut w = open_rw(&path, false);
+        let mut count = 0u64;
+        let mut buf = [0u8; 1];
+        while !stop_p.load(std::sync::atomic::Ordering::Relaxed) {
+            match r.read(&mut buf) {
+                Ok(1) => {
+                    count += 1;
+                    std::thread::sleep(Duration::from_millis(5));
+                    let _ = w.write(b"+");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    let mut pfd = libc::pollfd {
+                        fd: r.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    };
+                    let _ = unsafe { libc::poll(&mut pfd, 1, 100) };
+                }
+                _ => break,
+            }
+        }
+        count
+    });
+
+    std::thread::sleep(Duration::from_millis(1200));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let poll_count = poller.join().unwrap();
+    let block_counts: Vec<u64> = blocking_handles
+        .into_iter()
+        .map(|h| h.join().unwrap())
+        .collect();
+    let avg_block = block_counts.iter().sum::<u64>() / block_counts.len() as u64;
+    assert!(
+        poll_count >= avg_block / 3 && poll_count >= 10,
+        "poller starved: poll={poll_count} blocking={block_counts:?}"
+    );
+}
+
+#[test]
+fn second_instance_cannot_hijack_socket() {
+    let d = TestDaemon::start(2, 0, false);
+    let mount2 = d.work.join("mnt2");
+    let out = Command::new(bin())
+        .args([
+            "serve",
+            "--tokens",
+            "2",
+            "--mount-dir",
+            mount2.to_str().unwrap(),
+            "--socket",
+            d.socket_path.to_str().unwrap(),
+            "--psi-disabled",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "second daemon must fail instance lock"
+    );
+    assert!(
+        d.status().is_ok(),
+        "original daemon socket must stay healthy"
+    );
+}

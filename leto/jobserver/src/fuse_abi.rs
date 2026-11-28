@@ -259,7 +259,9 @@ pub fn as_bytes<T>(val: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts((val as *const T).cast::<u8>(), mem::size_of::<T>()) }
 }
 
-pub fn write_reply(fuse_fd: RawFd, unique: u64, error: i32, payload: &[u8]) {
+/// Writes a FUSE reply to `/dev/fuse`. Returns `Err(errno)` on failure (such as
+/// `ENOENT` when the kernel already aborted or interrupted the request).
+pub fn write_reply(fuse_fd: RawFd, unique: u64, error: i32, payload: &[u8]) -> Result<(), i32> {
     let hdr = FuseOutHeader {
         len: (mem::size_of::<FuseOutHeader>() + payload.len()) as u32,
         error,
@@ -278,17 +280,17 @@ pub fn write_reply(fuse_fd: RawFd, unique: u64, error: i32, payload: &[u8]) {
     let n = if payload.is_empty() { 1 } else { 2 };
     let ret = unsafe { libc::writev(fuse_fd, iovs.as_ptr(), n) };
     if ret < 0 {
-        let err = io::Error::last_os_error();
-        // ENOENT is normal when a blocked request was interrupted or aborted.
-        if err.raw_os_error() != Some(libc::ENOENT) {
-            eprintln!("leto-jobserver: writev(unique={unique}, err={error}) failed: {err}");
-        }
+        let errno = io::Error::last_os_error()
+            .raw_os_error()
+            .unwrap_or(libc::EIO);
+        return Err(errno);
     }
+    Ok(())
 }
 
-pub fn notify_poll(fuse_fd: RawFd, kh: u64) {
+pub fn notify_poll(fuse_fd: RawFd, kh: u64) -> Result<(), i32> {
     let body = FuseNotifyPollWakeupOut { kh };
-    write_reply(fuse_fd, 0, FUSE_NOTIFY_POLL, as_bytes(&body));
+    write_reply(fuse_fd, 0, FUSE_NOTIFY_POLL, as_bytes(&body))
 }
 
 fn find_fusermount3() -> &'static str {
@@ -309,15 +311,26 @@ pub fn cleanup_stale_mount(mountpoint: &Path) {
     }
 }
 
+#[repr(C, align(8))]
+struct CmsgBuf([u8; 128]);
+
 pub fn mount_fusermount3(mountpoint: &Path) -> io::Result<OwnedFd> {
     let mut sv = [0 as RawFd; 2];
-    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sv.as_mut_ptr()) } < 0 {
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+            0,
+            sv.as_mut_ptr(),
+        )
+    } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     let parent_fd = unsafe { OwnedFd::from_raw_fd(sv[0]) };
     let child_fd = unsafe { OwnedFd::from_raw_fd(sv[1]) };
+    // Clear CLOEXEC only on the child end passed via _FUSE_COMMFD.
     unsafe {
-        libc::fcntl(parent_fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
         libc::fcntl(child_fd.as_raw_fd(), libc::F_SETFD, 0);
     }
 
@@ -336,20 +349,28 @@ pub fn mount_fusermount3(mountpoint: &Path) -> io::Result<OwnedFd> {
         iov_base: dummy.as_mut_ptr().cast(),
         iov_len: 1,
     };
-    let mut cmsg_buf = [0u8; 64];
+    let mut cmsg_buf = CmsgBuf([0u8; 128]);
     let mut msg: libc::msghdr = unsafe { MaybeUninit::zeroed().assume_init() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_buf.len();
+    msg.msg_control = cmsg_buf.0.as_mut_ptr().cast();
+    msg.msg_controllen = cmsg_buf.0.len();
 
-    let n = unsafe { libc::recvmsg(parent_fd.as_raw_fd(), &mut msg, 0) };
+    let n = unsafe { libc::recvmsg(parent_fd.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+    let recv_err = if n < 0 {
+        Some(io::Error::last_os_error())
+    } else {
+        None
+    };
     let status = child.wait()?;
-    if n < 0 {
-        return Err(io::Error::last_os_error());
+    if let Some(err) = recv_err {
+        return Err(err);
     }
     if !status.success() {
         return Err(io::Error::other(format!("fusermount3 exited {status}")));
+    }
+    if (msg.msg_flags & libc::MSG_CTRUNC) != 0 {
+        return Err(io::Error::other("fusermount3 control message truncated"));
     }
 
     let mut received: Option<RawFd> = None;
@@ -357,16 +378,31 @@ pub fn mount_fusermount3(mountpoint: &Path) -> io::Result<OwnedFd> {
         let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
         while !cmsg.is_null() {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let fd = ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<RawFd>());
-                received = Some(fd);
-                break;
+                let data_len =
+                    ((*cmsg).cmsg_len as usize).saturating_sub(libc::CMSG_LEN(0) as usize);
+                let count = data_len / mem::size_of::<RawFd>();
+                let base = libc::CMSG_DATA(cmsg);
+                for i in 0..count {
+                    let fd =
+                        ptr::read_unaligned(base.add(i * mem::size_of::<RawFd>()).cast::<RawFd>());
+                    if received.is_none() {
+                        received = Some(fd);
+                    } else {
+                        libc::close(fd);
+                    }
+                }
             }
             cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
     }
     let fd = received.ok_or_else(|| io::Error::other("fusermount3 sent no /dev/fuse fd"))?;
+    // Set O_NONBLOCK so a cancelled FUSE request between poll() and read() can
+    // never block the single-threaded event loop.
     unsafe {
-        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+        }
     }
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }

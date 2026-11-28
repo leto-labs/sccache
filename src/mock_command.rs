@@ -1319,12 +1319,14 @@ mod test {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_fifo_uses_semaphore_admission_and_forwards_fifo_path() {
         use std::time::Duration;
-        let host_path = std::path::PathBuf::from("/run/user/1000/nonexistent-host-jobserver");
+        let temp = tempfile::tempdir().unwrap();
+        let host_path = temp.path().join("tokens");
+        std::fs::File::create(&host_path).unwrap();
         let client = Client::new_host_fifo(1, host_path.clone()).with_compile_queue();
         let queue = client.compile_queue().unwrap();
 
-        // Admission succeeds even when the host FIFO path does not exist (never
-        // opens or acquires from the host FIFO, avoiding cargo<->sccache deadlock).
+        // Admission succeeds via the in-process semaphore without reading the
+        // host file (avoiding cargo<->sccache deadlock).
         let held = client.acquire_for_command().await.unwrap();
         let snap = queue.snapshot();
         assert_eq!(snap.token_capacity, 1);
@@ -1363,6 +1365,29 @@ mod test {
         );
         assert_eq!(queue.snapshot().tokens_in_use, Some(0));
 
+        // Caller-supplied `fifo:` jobserver takes precedence over server.jobserver_fifo.
+        let caller_flags = "-j8 --jobserver-auth=fifo:/tmp/caller-fifo";
+        let mut caller_cmd =
+            <ProcessCommandCreator as CommandCreatorSync>::new(&client).new_command_sync("bash");
+        caller_cmd
+            .args(&["-c", "printf '%s|%s' \"$MAKEFLAGS\" \"$CARGO_MAKEFLAGS\""])
+            .env_clear()
+            .env("MAKEFLAGS", caller_flags)
+            .stdout(Stdio::piped())
+            .share_jobserver();
+        let output = caller_cmd
+            .spawn()
+            .await
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            format!("{caller_flags}|")
+        );
+
         // Without share_jobserver(), flags are still stripped.
         let mut no_share =
             <ProcessCommandCreator as CommandCreatorSync>::new(&client).new_command_sync("bash");
@@ -1372,6 +1397,27 @@ mod test {
             .env("CARGO_MAKEFLAGS", "-j8 --jobserver-auth=99,100")
             .stdout(Stdio::piped());
         let output = no_share
+            .spawn()
+            .await
+            .unwrap()
+            .wait_with_output()
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"|");
+
+        // When host_path is missing/unreachable, CARGO_MAKEFLAGS is omitted so
+        // rustc does not emit a cacheable "failed to connect to jobserver" warning.
+        let missing =
+            Client::new_host_fifo(1, temp.path().join("missing-tokens")).with_compile_queue();
+        let mut missing_cmd =
+            <ProcessCommandCreator as CommandCreatorSync>::new(&missing).new_command_sync("bash");
+        missing_cmd
+            .args(&["-c", "printf '%s|%s' \"$MAKEFLAGS\" \"$CARGO_MAKEFLAGS\""])
+            .env_clear()
+            .stdout(Stdio::piped())
+            .share_jobserver();
+        let output = missing_cmd
             .spawn()
             .await
             .unwrap()

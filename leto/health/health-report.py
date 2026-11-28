@@ -91,6 +91,7 @@ def load_config(args, warnings):
         "autostart": server.get("autostart", True),
         "shutdown_drain_secs": server.get("shutdown_drain_secs", 10),
         "connect_wait_secs": server.get("connect_wait_secs", 30),
+        "jobserver_fifo": server.get("jobserver_fifo"),
     }
 
 
@@ -806,9 +807,14 @@ def rotate_misses(path):
         os.close(directory)
 
 
-def jobserver_report(args, warnings):
+def jobserver_report(args, config, warnings):
     sock_path = getattr(args, "jobserver_socket", None)
     if sock_path is None or not sock_path.exists():
+        if isinstance(config, dict) and config.get("jobserver_fifo"):
+            warnings.append(
+                f"sccache configures server.jobserver_fifo={config['jobserver_fifo']} "
+                f"but host jobserver socket is missing at {sock_path}"
+            )
         return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
@@ -849,7 +855,7 @@ def make_report(args, *, now=None):
     warnings = []
     config = load_config(args, warnings)
     server, info = server_report(args, now, warnings)
-    jobserver = jobserver_report(args, warnings)
+    jobserver = jobserver_report(args, config, warnings)
     cache = cache_report(config, info, warnings, deep=args.deep)
     misses, log = miss_log_report(Path(config["miss_explain"]), now, args.hours, warnings,
                                   max_bytes=None if args.deep else args.miss_log_tail)
@@ -925,7 +931,7 @@ def markdown(report):
         holders = jobserver.get("holders") or []
         top_holders = ", ".join(
             f"{h.get('comm') or 'pid'}:{h.get('tgid')} ({h.get('held')})"
-            for h in holders[:5] if h.get("held", 0) > 0
+            for h in holders[:5] if (h.get("held") or 0) > 0
         ) or None
         jobserver_sections = [
             "## Jobserver",

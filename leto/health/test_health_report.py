@@ -553,8 +553,12 @@ class JobserverSocketTest(unittest.TestCase):
         with TemporaryDirectory() as temp:
             args = types.SimpleNamespace(jobserver_socket=Path(temp) / "absent.sock")
             warnings = []
-            self.assertIsNone(REPORT["jobserver_report"](args, warnings))
+            self.assertIsNone(REPORT["jobserver_report"](args, {}, warnings))
             self.assertEqual(warnings, [])
+            # Missing socket warns when sccache configures server.jobserver_fifo.
+            REPORT["jobserver_report"](args, {"jobserver_fifo": "/run/user/1000/build-jobserver"}, warnings)
+            self.assertEqual(len(warnings), 1)
+            self.assertIn("jobserver_fifo", warnings[0])
 
     def test_status_query_and_markdown_rendering(self):
         import socket as sock_mod
@@ -595,7 +599,7 @@ class JobserverSocketTest(unittest.TestCase):
             t.start()
             args = types.SimpleNamespace(jobserver_socket=sock_path)
             warnings = []
-            got = REPORT["jobserver_report"](args, warnings)
+            got = REPORT["jobserver_report"](args, {}, warnings)
             t.join(timeout=5)
             self.assertEqual(warnings, [])
             self.assertEqual(got["effective_capacity"], 44)

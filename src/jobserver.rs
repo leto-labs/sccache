@@ -570,13 +570,89 @@ impl Pool {
     }
 }
 
+struct HostFifoProbe {
+    path: PathBuf,
+    // Cached `(checked_at, reachable, last_warn)` so we probe at most once per
+    // second and avoid spamming logs or injecting a broken `--jobserver-auth`
+    // that would cache `rustc`'s "failed to connect to jobserver" warning.
+    state: Mutex<(Option<StdInstant>, bool, Option<StdInstant>)>,
+}
+
+impl HostFifoProbe {
+    const CACHE_TTL: Duration = Duration::from_secs(1);
+    const WARN_INTERVAL: Duration = Duration::from_secs(60);
+
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            state: Mutex::new((None, false, None)),
+        }
+    }
+
+    fn is_reachable(&self) -> bool {
+        let now = StdInstant::now();
+        {
+            let guard = self.state.lock().unwrap();
+            if let (Some(checked), ok, _) = *guard
+                && now.saturating_duration_since(checked) < Self::CACHE_TTL
+            {
+                return ok;
+            }
+        }
+        let probe_res = probe_host_fifo(&self.path);
+        let ok = probe_res.is_ok();
+        let mut should_warn = None;
+        {
+            let mut guard = self.state.lock().unwrap();
+            guard.0 = Some(now);
+            guard.1 = ok;
+            if let Err(err) = probe_res
+                && guard
+                    .2
+                    .is_none_or(|last| now.saturating_duration_since(last) >= Self::WARN_INTERVAL)
+            {
+                guard.2 = Some(now);
+                should_warn = Some(err);
+            }
+        }
+        if let Some(err) = should_warn {
+            warn!(
+                "host jobserver_fifo {} is unreachable ({err}); omitting CARGO_MAKEFLAGS for child compilers",
+                self.path.display()
+            );
+        }
+        ok
+    }
+}
+
+fn probe_host_fifo(path: &std::path::Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let _file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "jobserver_fifo is only supported on Unix",
+        ))
+    }
+}
+
 #[derive(Clone)]
 enum ClientKind {
     Fifo(Arc<Pipe>),
     Pool(Arc<Pool>),
     HostFifo {
         semaphore: Arc<Semaphore>,
-        fifo_path: Arc<PathBuf>,
+        probe: Arc<HostFifoProbe>,
     },
 }
 
@@ -592,7 +668,7 @@ pub struct Client {
 
 enum TokenTarget {
     Pipe(Arc<Pipe>),
-    HostFifo(Arc<PathBuf>),
+    HostFifo(Arc<HostFifoProbe>),
 }
 
 pub struct Acquired {
@@ -601,7 +677,7 @@ pub struct Acquired {
     target: TokenTarget,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Acquired {
     fn pipe(&self) -> Option<&Arc<Pipe>> {
         match &self.target {
@@ -620,10 +696,12 @@ impl CommandToken {
     pub(crate) fn configure(&self, cmd: &mut Command) {
         match &self.token.target {
             TokenTarget::Pipe(pipe) => pipe.configure(cmd),
-            TokenTarget::HostFifo(path) => {
-                let mut flags = OsString::from("-j --jobserver-auth=fifo:");
-                flags.push(path.as_os_str());
-                cmd.env("CARGO_MAKEFLAGS", flags);
+            TokenTarget::HostFifo(probe) => {
+                if probe.is_reachable() {
+                    let mut flags = OsString::from("-j --jobserver-auth=fifo:");
+                    flags.push(probe.path.as_os_str());
+                    cmd.env("CARGO_MAKEFLAGS", flags);
+                }
             }
         }
     }
@@ -681,7 +759,7 @@ impl Client {
         Client {
             kind: ClientKind::HostFifo {
                 semaphore: Arc::new(Semaphore::new(capacity)),
-                fifo_path: Arc::new(fifo_path),
+                probe: Arc::new(HostFifoProbe::new(fifo_path)),
             },
             capacity,
             compile_queue: None,
@@ -743,10 +821,7 @@ impl Client {
                 })
             }
             ClientKind::Pool(pool) => pool.acquire_inner(self.compile_queue.as_ref()).await,
-            ClientKind::HostFifo {
-                semaphore,
-                fifo_path,
-            } => {
+            ClientKind::HostFifo { semaphore, probe } => {
                 let mut usage = self.compile_queue.as_ref().map(|q| q.start_token());
                 let mut warn_sleep = usage
                     .as_ref()
@@ -778,7 +853,7 @@ impl Client {
                     token: Acquired {
                         _token: None,
                         _permit: Some(permit),
-                        target: TokenTarget::HostFifo(fifo_path.clone()),
+                        target: TokenTarget::HostFifo(probe.clone()),
                     },
                 })
             }
@@ -804,10 +879,7 @@ impl Client {
                 target: TokenTarget::Pipe(pipe.clone()),
             }),
             ClientKind::Pool(pool) => Ok(pool.acquire_inner(None).await?.token),
-            ClientKind::HostFifo {
-                semaphore,
-                fifo_path,
-            } => {
+            ClientKind::HostFifo { semaphore, probe } => {
                 let permit = semaphore
                     .clone()
                     .acquire_owned()
@@ -816,7 +888,7 @@ impl Client {
                 Ok(Acquired {
                     _token: None,
                     _permit: Some(permit),
-                    target: TokenTarget::HostFifo(fifo_path.clone()),
+                    target: TokenTarget::HostFifo(probe.clone()),
                 })
             }
         }
