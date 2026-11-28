@@ -154,7 +154,28 @@ fn build_inner(
     let write_memo = stage_one.unwrap_or(true);
     let binary_digest = store::digest(root, &binary, stamp, now, write_memo)?;
     let loader_env = loader_environment(std::env::vars_os());
-    let libraries = closure(root, &binary, binary_digest, &cwd, &loader_env, write_memo)?;
+    let preloads = preload_objects(&cwd)?;
+    if stage_one.is_some() && !preloads.is_empty() {
+        return Err(io::Error::other(
+            "cannot run stage-one cache with LD_PRELOAD",
+        ));
+    }
+    let mut library_set: BTreeSet<PathBuf> =
+        closure(root, &binary, binary_digest, &cwd, &loader_env, write_memo)?
+            .into_iter()
+            .collect();
+    let mut preload_entries = Vec::with_capacity(preloads.len());
+    let mut preload_digests = Vec::with_capacity(preloads.len());
+    for path in &preloads {
+        let preload_stamp = Stamp::read(path)?;
+        let preload_digest = store::digest(root, path, preload_stamp, now, write_memo)?;
+        for dep in preload_closure(root, path, preload_digest, &cwd, &loader_env, write_memo)? {
+            library_set.insert(dep);
+        }
+        preload_entries.push((path.clone(), preload_stamp));
+        preload_digests.push(preload_digest);
+    }
+    let libraries: Vec<PathBuf> = library_set.into_iter().collect();
     let configured = std::env::var("LETO_TEST_CACHE_ENV").unwrap_or_default();
     let mut bases = vec![normalized(checkout)];
     if let Some(value) = std::env::var_os("SCCACHE_BASEDIRS") {
@@ -198,12 +219,20 @@ fn build_inner(
         profile.finalize(),
         binary_digest,
         &linked,
+        &preload_digests,
         args,
         &environment,
         kernel,
     );
     if Stamp::read(&binary)? != stamp {
         return Err(io::Error::other("test binary changed while computing key"));
+    }
+    for (path, preload_stamp) in &preload_entries {
+        if Stamp::read(path)? != *preload_stamp {
+            return Err(io::Error::other(
+                "LD_PRELOAD object changed while computing key",
+            ));
+        }
     }
     let stage = if stage_one.is_some() {
         let execution = filtered_env(std::env::vars_os(), &configured, &[]).0;
@@ -242,12 +271,18 @@ fn build_inner(
     } else {
         None
     };
+    let mut observer_libraries = libraries;
+    for path in preloads {
+        if !observer_libraries.contains(&path) {
+            observer_libraries.push(path);
+        }
+    }
     Ok((
         Identity {
             key,
             binary_digest,
             mtime: stamp.mtime,
-            libraries,
+            libraries: observer_libraries,
         },
         stage,
     ))
@@ -257,6 +292,7 @@ fn compose(
     profile: blake3::Hash,
     binary: blake3::Hash,
     libraries: &[(&PathBuf, blake3::Hash)],
+    preloads: &[blake3::Hash],
     args: &[OsString],
     env: &(BTreeMap<OsString, OsString>, usize),
     kernel: &[u8],
@@ -282,14 +318,47 @@ fn compose(
     field(&mut hash, &(env.1 as u64).to_le_bytes());
     field(&mut hash, kernel);
     field(&mut hash, std::env::consts::ARCH.as_bytes());
+    if !preloads.is_empty() {
+        field(&mut hash, b"ld-preload-v1");
+        field(&mut hash, &(preloads.len() as u64).to_le_bytes());
+        for digest in preloads {
+            field(&mut hash, digest.as_bytes());
+        }
+    }
     hash.finalize()
 }
 
-fn loader(binary: &Path) -> io::Result<bool> {
+fn preload_objects(cwd: &Path) -> io::Result<Vec<PathBuf>> {
+    let Some(value) = std::env::var_os("LD_PRELOAD") else {
+        return Ok(Vec::new());
+    };
+    parse_ld_preload(&value, cwd)
+}
+
+fn parse_ld_preload(value: &OsStr, cwd: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in value
+        .as_bytes()
+        .split(|&b| matches!(b, b':' | b' ' | b'\t'))
+        .filter(|s| !s.is_empty())
+    {
+        if entry.contains(&b'$') || !entry.contains(&b'/') {
+            return Err(io::Error::other(
+                "unsupported LD_PRELOAD entry (must be a concrete file path)",
+            ));
+        }
+        let path = fs::canonicalize(cwd.join(OsStr::from_bytes(entry)))?;
+        validate_elf(&path, false)?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+fn validate_elf(binary: &Path, require_interp: bool) -> io::Result<bool> {
     let unsupported = || io::Error::other("unsupported test harness ELF or loader");
     let file = File::open(binary)?;
     let metadata = file.metadata()?;
-    if metadata.mode() & 0o6000 != 0 {
+    if !metadata.is_file() || metadata.mode() & 0o6000 != 0 {
         return Err(unsupported());
     }
     let mut header = [0; 64];
@@ -336,11 +405,18 @@ fn loader(binary: &Path) -> io::Result<bool> {
                         _ => {}
                     }
                 }
+                if !require_interp {
+                    dynamic = true;
+                }
             }
             _ => {}
         }
     }
     Ok(dynamic)
+}
+
+fn loader(binary: &Path) -> io::Result<bool> {
+    validate_elf(binary, true)
 }
 
 fn u16_at(bytes: &[u8], offset: usize) -> u16 {
@@ -372,6 +448,30 @@ fn loader_environment(
         .collect()
 }
 
+fn check_loader_restrictions() -> io::Result<()> {
+    if std::env::var_os("LD_AUDIT").is_some_and(|v| !v.is_empty())
+        || fs::metadata("/etc/ld.so.preload").is_ok_and(|m| m.len() != 0)
+    {
+        return Err(io::Error::other(
+            "cannot shadow with loader audit or system preload",
+        ));
+    }
+    Ok(())
+}
+
+fn preload_closure(
+    root: &Path,
+    object: &Path,
+    digest: blake3::Hash,
+    cwd: &Path,
+    loader_env: &BTreeMap<OsString, OsString>,
+    write_memo: bool,
+) -> io::Result<Vec<PathBuf>> {
+    // Key the memo by content digest (not the object's ephemeral path) so
+    // identical preload shims built into per-run temp dirs reuse one closure.
+    resolve_closure(root, object, digest, cwd, loader_env, write_memo, true)
+}
+
 fn closure(
     root: &Path,
     binary: &Path,
@@ -380,21 +480,34 @@ fn closure(
     loader_env: &BTreeMap<OsString, OsString>,
     write_memo: bool,
 ) -> io::Result<Vec<PathBuf>> {
+    resolve_closure(root, binary, digest, cwd, loader_env, write_memo, false)
+}
+
+fn resolve_closure(
+    root: &Path,
+    binary: &Path,
+    digest: blake3::Hash,
+    cwd: &Path,
+    loader_env: &BTreeMap<OsString, OsString>,
+    write_memo: bool,
+    is_preload: bool,
+) -> io::Result<Vec<PathBuf>> {
     // Let the system loader resolve transitive RUNPATH, hwcaps and the cache in its normal order.
-    if ["LD_AUDIT", "LD_PRELOAD"]
-        .iter()
-        .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
-        || fs::metadata("/etc/ld.so.preload").is_ok_and(|m| m.len() != 0)
-    {
-        return Err(io::Error::other(
-            "cannot shadow with loader audit or preload",
-        ));
-    }
+    check_loader_restrictions()?;
     let mut context = blake3::Hasher::new();
-    field(&mut context, b"loader-list-v1");
+    field(
+        &mut context,
+        if is_preload {
+            b"preload-loader-list-v1"
+        } else {
+            b"loader-list-v1"
+        },
+    );
     field(&mut context, digest.as_bytes());
-    field(&mut context, binary.as_os_str().as_bytes());
-    field(&mut context, cwd.as_os_str().as_bytes());
+    if !is_preload {
+        field(&mut context, binary.as_os_str().as_bytes());
+        field(&mut context, cwd.as_os_str().as_bytes());
+    }
     for (name, value) in loader_env {
         field(&mut context, name.as_bytes());
         field(&mut context, value.as_bytes());
@@ -423,7 +536,7 @@ fn closure(
             .collect());
     }
 
-    if !loader(binary)? {
+    if !is_preload && !loader(binary)? {
         return Ok(Vec::new());
     }
     let meta = fs::metadata(LOADER)?;
@@ -450,7 +563,10 @@ fn closure(
     let mut watched = BTreeSet::new();
     for line in output.stdout.split(|&b| b == b'\n') {
         let line = line.trim_ascii();
-        if line.is_empty() || line.starts_with(b"linux-vdso.so.") {
+        if line.is_empty()
+            || line.starts_with(b"linux-vdso.so.")
+            || (is_preload && line == b"statically linked")
+        {
             continue;
         }
         let end = line
@@ -463,14 +579,19 @@ fn closure(
             .position(|w| w == b" => ")
             .map_or(name, |i| &name[i + 4..]);
         let path = cwd.join(OsStr::from_bytes(name));
+        if is_preload && fs::canonicalize(&path).ok().as_deref() == Some(binary) {
+            continue;
+        }
         objects.insert(path);
     }
+    let preload_dir = is_preload.then(|| binary.parent()).flatten();
     for line in output.stderr.split(|&b| b == b'\n') {
         if let Some(i) = line.windows(12).position(|w| w == b"trying file=") {
             let candidate = cwd.join(OsStr::from_bytes(line[i + 12..].trim_ascii_end()));
             if let Some(dir) = candidate
                 .parent()
                 .and_then(|dir| dir.ancestors().find(|p| p.is_dir()))
+                && preload_dir != Some(dir)
             {
                 watched.insert(dir.to_path_buf());
             }
@@ -537,13 +658,14 @@ mod tests {
         let path = PathBuf::from("/lib/libc.so");
         let libraries = [(&path, blake3::hash(b"library"))];
         let args = [OsString::from_vec(vec![b'a', 0xff]), "bc".into()];
-        let key = compose(profile, binary, &libraries, &args, &en, b"kernel");
+        let key = compose(profile, binary, &libraries, &[], &args, &en, b"kernel");
         assert_ne!(
             key,
             compose(
                 profile,
                 binary,
                 &libraries,
+                &[],
                 &["a".into(), OsString::from_vec(vec![0xff, b'b', b'c'])],
                 &en,
                 b"kernel"
@@ -551,22 +673,63 @@ mod tests {
         );
         assert_ne!(
             key,
-            compose(profile, binary, &libraries, &args, &en, b"other")
-        );
-        assert_ne!(key, compose(profile, binary, &[], &args, &en, b"kernel"));
-        assert_ne!(
-            key,
-            compose(binary, binary, &libraries, &args, &en, b"kernel")
+            compose(profile, binary, &libraries, &[], &args, &en, b"other")
         );
         assert_ne!(
             key,
-            compose(profile, profile, &libraries, &args, &en, b"kernel")
+            compose(profile, binary, &[], &[], &args, &en, b"kernel")
+        );
+        assert_ne!(
+            key,
+            compose(binary, binary, &libraries, &[], &args, &en, b"kernel")
+        );
+        assert_ne!(
+            key,
+            compose(profile, profile, &libraries, &[], &args, &en, b"kernel")
         );
         let mut changed = en.clone();
         changed.0.insert("FAIRFILL_FOO".into(), "new".into());
         assert_ne!(
             key,
-            compose(profile, binary, &libraries, &args, &changed, b"kernel")
+            compose(profile, binary, &libraries, &[], &args, &changed, b"kernel")
         );
+
+        let p1 = blake3::hash(b"shim-a");
+        let p2 = blake3::hash(b"shim-b");
+        let with_p1 = compose(profile, binary, &libraries, &[p1], &args, &en, b"kernel");
+        assert_ne!(key, with_p1);
+        assert_ne!(
+            with_p1,
+            compose(profile, binary, &libraries, &[p2], &args, &en, b"kernel")
+        );
+        assert_ne!(
+            compose(
+                profile,
+                binary,
+                &libraries,
+                &[p1, p2],
+                &args,
+                &en,
+                b"kernel"
+            ),
+            compose(
+                profile,
+                binary,
+                &libraries,
+                &[p2, p1],
+                &args,
+                &en,
+                b"kernel"
+            )
+        );
+
+        assert!(
+            parse_ld_preload(OsStr::new(""), Path::new("/"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_ld_preload(OsStr::new("libc.so.6"), Path::new("/")).is_err());
+        assert!(parse_ld_preload(OsStr::new("$ORIGIN/a.so"), Path::new("/")).is_err());
+        assert!(parse_ld_preload(OsStr::new("/nonexistent/shim.so"), Path::new("/")).is_err());
     }
 }

@@ -845,3 +845,105 @@ fn gate_refuses_to_store_without_landlock_and_replay_still_works() {
     assert_eq!(replayed.stdout, saved.stdout);
     assert_eq!(replayed.stderr, saved.stderr);
 }
+
+#[test]
+fn shadow_hashes_ld_preload_by_content_digest_and_allows_preload_reads() {
+    let scratch = Scratch::create();
+    let root = &scratch.0;
+    let build = cargo(root)
+        .args(["test", "--no-run", "--offline"])
+        .output()
+        .unwrap();
+    assert!(build.status.success(), "{}", details(&build));
+    let binary = harness(root);
+    let test = "tests::pure";
+
+    let compile_shim = |dir: &Path, body: &str| -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        let src = dir.join("shim.c");
+        let so = dir.join("shim.so");
+        fs::write(&src, body).unwrap();
+        let out = Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&so)
+            .arg(&src)
+            .arg("-ldl")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", details(&out));
+        so
+    };
+
+    // Place the preload objects outside both the checkout (`root`) and `TMPDIR`
+    // so the test proves the observer allows preloaded objects via `libraries`.
+    let preload_root = Scratch::create();
+    let test_tmp = root.join("test-tmp");
+    fs::create_dir_all(&test_tmp).unwrap();
+    let dir_a = preload_root.0.join("preload-a");
+    let dir_b = preload_root.0.join("preload-b");
+    let dir_c = preload_root.0.join("preload-c");
+    let so_a = compile_shim(&dir_a, "int leto_shim_v(void) { return 1; }\n");
+    let so_b = compile_shim(&dir_b, "int leto_shim_v(void) { return 1; }\n");
+    let so_c = compile_shim(
+        &dir_c,
+        "#include <unistd.h>\nint leto_shim_v(void) { return (int)getpid(); }\n",
+    );
+    assert_eq!(fs::read(&so_a).unwrap(), fs::read(&so_b).unwrap());
+    assert_ne!(fs::read(&so_a).unwrap(), fs::read(&so_c).unwrap());
+
+    let run_shadow = |preload: Option<&Path>| {
+        let mut cmd = Command::new(RUNNER);
+        configure(&mut cmd, root, test);
+        cmd.env_remove("TERM")
+            .env_remove("LD_PRELOAD")
+            .env("TMPDIR", &test_tmp);
+        if let Some(so) = preload {
+            cmd.env("LD_PRELOAD", so);
+        }
+        cmd.arg(&binary)
+            .args(["--exact", test, "--nocapture", "--include-ignored"]);
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{}", details(&out));
+    };
+
+    run_shadow(None);
+    run_shadow(Some(&so_a));
+    run_shadow(Some(&so_b));
+    run_shadow(Some(&so_c));
+
+    let rows = records(root);
+    let errs = fs::read_dir(root.join("logs/errors"))
+        .ok()
+        .map(|d| {
+            d.map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(rows.len(), 4, "errors: {errs:?}");
+    let (plain, first, second, modified) = (&rows[0], &rows[1], &rows[2], &rows[3]);
+    // Same shim content in different temp dirs produces the exact same key,
+    // differs from no preload and modified content, and stays pure.
+    assert_ne!(plain["key"], first["key"]);
+    assert_eq!(first["key"], second["key"]);
+    assert_ne!(first["key"], modified["key"]);
+    for row in [first, second, modified] {
+        assert_eq!(row["observer"]["class"], "pure", "{row}");
+        assert!(row["observer"]["reason"].is_null(), "{row}");
+        assert_eq!(
+            row["observer"]["other_reads"],
+            serde_json::json!([]),
+            "{row}"
+        );
+    }
+
+    // Stage-one cache modes still reject LD_PRELOAD cleanly and run the test.
+    let mut gate = stage_command(root, &binary, test, "gate", "with-preload");
+    gate.env("LD_PRELOAD", &so_a);
+    let out = gate.output().unwrap();
+    assert!(out.status.success(), "{}", details(&out));
+    assert!(details(&out).contains("LD_PRELOAD"));
+    assert_eq!(
+        stage_records(root).pop().unwrap()["cache"]["action"],
+        "bypassed"
+    );
+}
